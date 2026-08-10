@@ -17,7 +17,7 @@ For a decision index ``t`` the historical price window is
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -37,6 +37,12 @@ class PortfolioContextConfig:
     transaction_cost_bps: float = 0.0
     factor_names: Tuple[str, ...] = DEFAULT_FACTOR_NAMES
     cross_sectional_zscore: bool = True
+    factor_lower: Optional[Union[float, Sequence[float]]] = None
+    factor_upper: Optional[Union[float, Sequence[float]]] = None
+    industry_exposure: Optional[np.ndarray] = None
+    industry_names: Tuple[str, ...] = ()
+    industry_lower: Optional[Union[float, Sequence[float]]] = None
+    industry_upper: Optional[Union[float, Sequence[float]]] = None
 
     def __post_init__(self) -> None:
         if self.covariance_epsilon <= 0:
@@ -48,6 +54,31 @@ class PortfolioContextConfig:
                 "stage-2 price-only exposures must be exactly "
                 f"{DEFAULT_FACTOR_NAMES}"
             )
+        for name, bound in (
+            ("factor_lower", self.factor_lower),
+            ("factor_upper", self.factor_upper),
+            ("industry_lower", self.industry_lower),
+            ("industry_upper", self.industry_upper),
+        ):
+            if bound is not None and np.isnan(np.asarray(bound, dtype=np.float64)).any():
+                raise ValueError(f"{name} cannot contain NaN")
+        if self.industry_exposure is not None:
+            exposure = np.asarray(self.industry_exposure, dtype=np.float64)
+            if exposure.ndim != 2 or exposure.shape[0] != self.problem.num_assets:
+                raise ValueError("industry_exposure must have shape (num_assets, num_industries)")
+            if not np.isfinite(exposure).all():
+                raise ValueError("industry_exposure must be finite")
+            if exposure.shape[1] == 0:
+                raise ValueError("industry_exposure must contain at least one industry")
+            object.__setattr__(self, "industry_exposure", exposure.astype(np.float32))
+            if self.industry_names and len(self.industry_names) != exposure.shape[1]:
+                raise ValueError("industry_names must match industry_exposure columns")
+            if not self.industry_names:
+                object.__setattr__(
+                    self,
+                    "industry_names",
+                    tuple(f"industry_{i}" for i in range(exposure.shape[1])),
+                )
 
     @property
     def transaction_cost_rate(self) -> float:
@@ -188,6 +219,68 @@ def _equal_weight(num_assets: int) -> np.ndarray:
     return np.full(num_assets, 1.0 / num_assets, dtype=np.float32)
 
 
+def _normalise_bound_vector(
+    value: Optional[Union[float, Sequence[float]]],
+    size: int,
+    name: str,
+) -> Optional[np.ndarray]:
+    if value is None:
+        return None
+    array = np.asarray(value, dtype=np.float32)
+    if array.ndim == 0:
+        array = np.full(size, float(array), dtype=np.float32)
+    elif array.ndim == 1 and array.shape[0] == size:
+        array = array.astype(np.float32)
+    else:
+        raise ValueError(f"{name} must be scalar or have length {size}")
+    if np.isnan(array).any():
+        raise ValueError(f"{name} cannot contain NaN")
+    return array
+
+
+def load_industry_exposure(
+    path: Union[str, Path], asset_names: Sequence[str]
+) -> Tuple[np.ndarray, Tuple[str, ...]]:
+    """Load an industry one-hot matrix from ``.npy`` or a simple CSV.
+
+    CSV mappings may contain ``asset`` and ``industry`` columns.  A numeric
+    matrix with one row per asset is also accepted.
+    """
+
+    path = Path(path)
+    asset_names = list(asset_names)
+    if path.suffix.lower() == ".npy":
+        exposure = np.load(path)
+        if exposure.ndim != 2 or exposure.shape[0] != len(asset_names):
+            raise ValueError("industry .npy must have shape (num_assets, num_industries)")
+        return np.asarray(exposure, dtype=np.float32), tuple(
+            f"industry_{i}" for i in range(exposure.shape[1])
+        )
+
+    mapping = pd.read_csv(path)
+    lower_columns = {str(column).lower(): column for column in mapping.columns}
+    asset_column = lower_columns.get("asset") or lower_columns.get("symbol")
+    industry_column = lower_columns.get("industry") or lower_columns.get("sector")
+    if asset_column is None or industry_column is None:
+        numeric = mapping.select_dtypes(include=[np.number]).to_numpy(dtype=np.float32)
+        if numeric.shape[0] != len(asset_names) or numeric.ndim != 2 or numeric.shape[1] == 0:
+            raise ValueError("industry CSV must have asset/industry columns or a numeric matrix")
+        return numeric, tuple(str(column) for column in mapping.select_dtypes(include=[np.number]).columns)
+
+    categories = sorted(mapping[industry_column].astype(str).unique().tolist())
+    category_index = {category: index for index, category in enumerate(categories)}
+    asset_index = {str(asset): index for index, asset in enumerate(asset_names)}
+    exposure = np.zeros((len(asset_names), len(categories)), dtype=np.float32)
+    for _, row in mapping.iterrows():
+        asset = str(row[asset_column])
+        if asset not in asset_index:
+            raise ValueError(f"industry mapping contains unknown asset {asset!r}")
+        exposure[asset_index[asset], category_index[str(row[industry_column])]] = 1.0
+    if (exposure.sum(axis=1) == 0).any():
+        raise ValueError("every asset must have an industry mapping")
+    return exposure, tuple(categories)
+
+
 def _build_context_at_frame(
     frame: pd.DataFrame,
     decision_index: int,
@@ -222,7 +315,14 @@ def _build_context_at_frame(
     future_prices = values[decision_index : decision_index + H + 1]
     historical_log_returns = _log_returns(historical_prices).astype(np.float32)
 
-    return {
+    factor_lower = _normalise_bound_vector(
+        config.factor_lower, len(config.factor_names), "factor_lower"
+    )
+    factor_upper = _normalise_bound_vector(
+        config.factor_upper, len(config.factor_names), "factor_upper"
+    )
+
+    result = {
         "market_window": historical_log_returns[..., None],  # (W, N, 1)
         "future_returns": _future_simple_returns(future_prices),  # (H, N)
         "Sigma": estimate_covariance(
@@ -236,12 +336,34 @@ def _build_context_at_frame(
         "decision_date": np.datetime64(frame.index[decision_index], "ns"),
         "future_dates": frame.index[decision_index + 1 : decision_index + H + 1]
         .to_numpy(dtype="datetime64[ns]"),
-        "lower_bounds": np.zeros(n_assets, dtype=np.float32),
+        "lower_bounds": np.asarray(config.problem.lower_bounds, dtype=np.float32),
         "upper_bounds": np.asarray(config.problem.upper_bounds, dtype=np.float32),
-        "budget_target": np.float32(1.0),
+        "budget_target": np.float32(config.problem.budget_target),
         "transaction_cost_rate": np.float32(config.transaction_cost_rate),
         "factor_names": np.asarray(config.factor_names),
     }
+    if factor_lower is not None:
+        result["factor_lower"] = factor_lower
+    if factor_upper is not None:
+        result["factor_upper"] = factor_upper
+    if config.industry_exposure is not None:
+        result["industry_exposure"] = np.asarray(config.industry_exposure, dtype=np.float32)
+        result["industry_names"] = np.asarray(config.industry_names)
+        industry_lower = _normalise_bound_vector(
+            config.industry_lower,
+            result["industry_exposure"].shape[1],
+            "industry_lower",
+        )
+        industry_upper = _normalise_bound_vector(
+            config.industry_upper,
+            result["industry_exposure"].shape[1],
+            "industry_upper",
+        )
+        if industry_lower is not None:
+            result["industry_lower"] = industry_lower
+        if industry_upper is not None:
+            result["industry_upper"] = industry_upper
+    return result
 
 
 def build_context_at(
@@ -326,6 +448,16 @@ def build_contexts(
         samples[0]["transaction_cost_rate"], dtype=np.float32
     )
     context["factor_names"] = samples[0]["factor_names"]
+    for key in (
+        "factor_lower",
+        "factor_upper",
+        "industry_exposure",
+        "industry_names",
+        "industry_lower",
+        "industry_upper",
+    ):
+        if key in samples[0]:
+            context[key] = samples[0][key]
     return context
 
 

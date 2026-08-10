@@ -39,12 +39,25 @@ class EXP_KKT(Exp_Basic):
             rebalance_frequency=args.rebalance_frequency,
             eta=args.eta,
             upper_bound=args.upper_bound,
+            lower_bound=getattr(args, "lower_bound", 0.0),
+            budget_target=getattr(args, "budget_target", 1.0),
         )
         self.portfolio_optimizer = DifferentiablePortfolioOptimizer(
             self.problem,
             num_iterations=args.optimizer_iterations,
             bisection_steps=args.projection_iterations,
+            constraint_projection_iterations=getattr(
+                args, "constraint_projection_iterations", 20
+            ),
         )
+        self.turnover_penalty = float(getattr(args, "turnover_penalty", 0.0))
+        self.transaction_cost_smoothing = float(
+            getattr(args, "transaction_cost_smoothing", 1e-4)
+        )
+        self.max_turnover = getattr(args, "max_turnover", None)
+        self.gross_exposure_limit = getattr(args, "gross_exposure_limit", None)
+        self.sequential_state = bool(getattr(args, "sequential_state", False))
+        self._sequential_previous = None
         self.loss_mode = str(getattr(args, "loss_mode", "prediction")).lower()
         if self.loss_mode not in {
             "prediction",
@@ -76,19 +89,77 @@ class EXP_KKT(Exp_Basic):
     def _get_data(self, flag):
         return data_provider_kkt(self.args, flag)
 
-    def _forward_batch(self, batch):
+    @staticmethod
+    def _parse_bound(value):
+        if value is None or value == "":
+            return None
+        if isinstance(value, (float, int)):
+            return float(value)
+        pieces = [piece.strip() for piece in str(value).split(",") if piece.strip()]
+        if len(pieces) == 1:
+            return float(pieces[0])
+        return tuple(float(piece) for piece in pieces)
+
+    def _constraint_inputs(self, batch):
+        return {
+            "factor_exposure": batch["factor_exposure"].to(
+                self.device, non_blocking=True
+            ),
+            "factor_lower": (
+                batch["factor_lower"].to(self.device, non_blocking=True)
+                if "factor_lower" in batch
+                else self._parse_bound(getattr(self.args, "factor_lower", ""))
+            ),
+            "factor_upper": (
+                batch["factor_upper"].to(self.device, non_blocking=True)
+                if "factor_upper" in batch
+                else self._parse_bound(getattr(self.args, "factor_upper", ""))
+            ),
+            "industry_exposure": (
+                batch["industry_exposure"].to(self.device, non_blocking=True)
+                if "industry_exposure" in batch
+                else None
+            ),
+            "industry_lower": (
+                batch["industry_lower"].to(self.device, non_blocking=True)
+                if "industry_lower" in batch
+                else self._parse_bound(getattr(self.args, "industry_lower", ""))
+            ),
+            "industry_upper": (
+                batch["industry_upper"].to(self.device, non_blocking=True)
+                if "industry_upper" in batch
+                else self._parse_bound(getattr(self.args, "industry_upper", ""))
+            ),
+        }
+
+    def _forward_batch(self, batch, w_prev_override=None):
         market_window = batch["market_window"].to(self.device, non_blocking=True)
         future_returns = batch["future_returns"].to(self.device, non_blocking=True)
         sigma = batch["Sigma"].to(self.device, non_blocking=True)
-        upper_bounds = batch["upper_bounds"].to(self.device, non_blocking=True)
-        w_prev = batch["w_prev"].to(self.device, non_blocking=True)
+        w_prev = (
+            w_prev_override.to(self.device, non_blocking=True)
+            if w_prev_override is not None
+            else batch["w_prev"].to(self.device, non_blocking=True)
+        )
         transaction_cost_rate = batch["transaction_cost_rate"].to(
             self.device, non_blocking=True
         )
 
-        factor_exposure = batch["factor_exposure"].to(
-            self.device, non_blocking=True
-        )
+        constraint_inputs = self._constraint_inputs(batch)
+        lower_bounds = batch["lower_bounds"].to(self.device, non_blocking=True)
+        upper_bounds = batch["upper_bounds"].to(self.device, non_blocking=True)
+
+        optimizer_kwargs = {
+            **constraint_inputs,
+            "w_prev": w_prev,
+            "lower_bounds": lower_bounds,
+            "upper_bounds": upper_bounds,
+            "turnover_penalty": self.turnover_penalty,
+            "transaction_cost_rate": transaction_cost_rate,
+            "transaction_cost_smoothing": self.transaction_cost_smoothing,
+            "max_turnover": self.max_turnover,
+            "gross_exposure_limit": self.gross_exposure_limit,
+        }
 
         model_core = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         if self.feedback_mode == "none":
@@ -99,7 +170,7 @@ class EXP_KKT(Exp_Basic):
             probe_weights, probe_state = self.portfolio_optimizer(
                 mu_hat=mu0,
                 sigma=sigma,
-                upper_bounds=upper_bounds,
+                **optimizer_kwargs,
             )
             kkt_state = compute_kkt_state(
                 mu_hat=mu0,
@@ -107,6 +178,7 @@ class EXP_KKT(Exp_Basic):
                 weights=probe_weights,
                 upper_bounds=upper_bounds,
                 problem=self.problem,
+                lower_bounds=lower_bounds,
                 active_tolerance=float(
                     getattr(self.args, "active_tolerance", 1e-5)
                 ),
@@ -114,13 +186,13 @@ class EXP_KKT(Exp_Basic):
             _, mu_hat = model_core.refine(
                 hidden0,
                 kkt_state,
-                factor_exposure=factor_exposure,
+                factor_exposure=constraint_inputs["factor_exposure"],
             )
 
         weights, state = self.portfolio_optimizer(
             mu_hat=mu_hat,
             sigma=sigma,
-            upper_bounds=upper_bounds,
+            **optimizer_kwargs,
         )
         target_mu = self.problem.aggregate_future_returns(future_returns)
         if str(getattr(self.args, "prediction_loss", "MSE")).upper() == "HUBER":
@@ -135,6 +207,8 @@ class EXP_KKT(Exp_Basic):
             problem=self.problem,
             w_prev=w_prev,
             transaction_cost_rate=transaction_cost_rate,
+            turnover_penalty=self.turnover_penalty,
+            transaction_cost_smoothing=self.transaction_cost_smoothing,
         )
         utility_loss = utility_batch.mean()
 
@@ -147,6 +221,8 @@ class EXP_KKT(Exp_Basic):
             ),
             w_prev=w_prev,
             transaction_cost_rate=transaction_cost_rate,
+            turnover_penalty=self.turnover_penalty,
+            transaction_cost_smoothing=self.transaction_cost_smoothing,
         )
         cvar_loss = cvar_batch.mean()
 
@@ -157,7 +233,7 @@ class EXP_KKT(Exp_Basic):
                 oracle_weights, _ = self.portfolio_optimizer(
                     mu_hat=target_mu,
                     sigma=sigma,
-                    upper_bounds=upper_bounds,
+                    **optimizer_kwargs,
                 )
             regret_batch, regret_components = decision_regret_loss(
                 predicted_weights=weights,
@@ -167,6 +243,8 @@ class EXP_KKT(Exp_Basic):
                 problem=self.problem,
                 w_prev=w_prev,
                 transaction_cost_rate=transaction_cost_rate,
+                turnover_penalty=self.turnover_penalty,
+                transaction_cost_smoothing=self.transaction_cost_smoothing,
             )
             regret_loss = regret_batch.mean()
         else:
@@ -200,16 +278,37 @@ class EXP_KKT(Exp_Basic):
             "cvar_var": cvar_components["var"].mean(),
             "oracle_objective": regret_components["oracle_objective"].mean(),
             "feedback_mode": self.feedback_mode,
+            "turnover": utility_components["turnover"].mean(),
+            "smooth_transaction_cost": utility_components[
+                "smooth_transaction_cost"
+            ].mean(),
         }
+        for key in (
+            "active_constraint_ratio",
+            "turnover_violation",
+            "gross_exposure_violation",
+            "factor_lower_violation",
+            "factor_upper_violation",
+            "industry_lower_violation",
+            "industry_upper_violation",
+        ):
+            if key in state:
+                details[key] = state[key].detach().mean()
         return total_loss, mu_hat, weights, state, target_mu, details
 
     def _validation_loss(self, loader) -> float:
         self.model.eval()
         losses = []
+        self._sequential_previous = None
         with torch.no_grad():
             for batch in loader:
-                _, _, _, _, _, details = self._forward_batch(batch)
+                previous = self._sequential_previous if self.sequential_state else None
+                _, _, weights, _, _, details = self._forward_batch(
+                    batch, w_prev_override=previous
+                )
                 losses.append(float(details["total_loss"].item()))
+                if self.sequential_state:
+                    self._sequential_previous = weights.detach()
         if not losses:
             raise RuntimeError("validation loader is empty")
         return float(np.mean(losses))
@@ -231,6 +330,7 @@ class EXP_KKT(Exp_Basic):
 
         for epoch in range(self.args.train_epochs):
             self.model.train()
+            self._sequential_previous = None
             train_losses = []
             prediction_losses = []
             utility_losses = []
@@ -238,10 +338,15 @@ class EXP_KKT(Exp_Basic):
             regret_losses = []
             for batch in train_loader:
                 model_optimizer.zero_grad(set_to_none=True)
-                loss, _, _, _, _, details = self._forward_batch(batch)
+                previous = self._sequential_previous if self.sequential_state else None
+                loss, _, weights, _, _, details = self._forward_batch(
+                    batch, w_prev_override=previous
+                )
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 model_optimizer.step()
+                if self.sequential_state:
+                    self._sequential_previous = weights.detach()
                 train_losses.append(float(loss.item()))
                 prediction_losses.append(float(details["prediction_loss"].item()))
                 utility_losses.append(float(details["utility_loss"].item()))
@@ -330,15 +435,31 @@ class EXP_KKT(Exp_Basic):
         budget_errors = []
         lower_violations = []
         upper_violations = []
+        factor_violations = []
+        industry_violations = []
+        turnover_violations = []
+        gross_violations = []
+        active_constraint_ratios = []
+        transaction_costs = []
+        net_exposures = []
+        gross_exposures = []
+        factor_exposure_values = []
+        industry_exposure_values = []
         total_losses = []
         utility_losses = []
         cvar_losses = []
         regret_losses = []
         asset_names = [f"asset_{i}" for i in range(self.args.data_pool)]
+        self._sequential_previous = None
 
         with torch.no_grad():
             for batch in test_loader:
-                _, _, weights, state, _, details = self._forward_batch(batch)
+                previous = self._sequential_previous if self.sequential_state else None
+                _, _, weights, state, _, details = self._forward_batch(
+                    batch, w_prev_override=previous
+                )
+                if self.sequential_state:
+                    self._sequential_previous = weights.detach()
                 total_losses.append(float(details["total_loss"].item()))
                 prediction_losses.append(float(details["prediction_loss"].item()))
                 utility_losses.append(float(details["utility_loss"].item()))
@@ -346,7 +467,14 @@ class EXP_KKT(Exp_Basic):
                 regret_losses.append(float(details["regret_loss"].item()))
                 weights_np = weights.detach().cpu().numpy()
                 future_np = batch["future_returns"].numpy()
-                previous_np = batch["w_prev"].numpy()
+                transaction_cost_np = (
+                    state["transaction_cost"].detach().cpu().numpy().reshape(-1)
+                )
+                previous_np = (
+                    previous.detach().cpu().numpy()
+                    if previous is not None
+                    else batch["w_prev"].numpy()
+                )
                 decision_dates = self._decode_dates(batch["decision_date"])
                 future_dates = batch["future_dates"]
 
@@ -359,6 +487,44 @@ class EXP_KKT(Exp_Basic):
                 upper_violations.append(
                     float(state["upper_violation"].detach().cpu().numpy().max())
                 )
+                transaction_costs.extend(
+                    state["transaction_cost"].detach().cpu().numpy().reshape(-1).tolist()
+                )
+                net_exposures.extend(
+                    state["net_exposure"].detach().cpu().numpy().reshape(-1).tolist()
+                )
+                gross_exposures.extend(
+                    state["gross_exposure"].detach().cpu().numpy().reshape(-1).tolist()
+                )
+                active_constraint_ratios.extend(
+                    state["active_constraint_ratio"].detach().cpu().numpy().reshape(-1).tolist()
+                )
+                if "turnover_violation" in state:
+                    turnover_violations.extend(
+                        state["turnover_violation"].detach().cpu().numpy().reshape(-1).tolist()
+                    )
+                if "gross_exposure_violation" in state:
+                    gross_violations.extend(
+                        state["gross_exposure_violation"].detach().cpu().numpy().reshape(-1).tolist()
+                    )
+                for key in ("factor_lower_violation", "factor_upper_violation"):
+                    if key in state:
+                        factor_violations.append(
+                            float(state[key].detach().cpu().numpy().max())
+                        )
+                if "factor_exposure" in state:
+                    factor_exposure_values.append(
+                        float(np.abs(state["factor_exposure"].detach().cpu().numpy()).max())
+                    )
+                for key in ("industry_lower_violation", "industry_upper_violation"):
+                    if key in state:
+                        industry_violations.append(
+                            float(state[key].detach().cpu().numpy().max())
+                        )
+                if "industry_exposure" in state:
+                    industry_exposure_values.append(
+                        float(np.abs(state["industry_exposure"].detach().cpu().numpy()).max())
+                    )
 
                 for row_index, weight in enumerate(weights_np):
                     decision_date = decision_dates[row_index]
@@ -376,6 +542,11 @@ class EXP_KKT(Exp_Basic):
                     else:
                         dates_for_sample = self._decode_dates(future_dates)
                     realized = future_np[row_index].dot(weight)
+                    # Charge the rebalance cost on the first holding day so
+                    # the reported equity curve uses the same convention as
+                    # the training objective and optimizer diagnostics.
+                    realized = realized.copy()
+                    realized[0] -= transaction_cost_np[row_index]
                     for date, value in zip(dates_for_sample, realized):
                         daily_return_rows.append((str(date), float(value)))
 
@@ -408,6 +579,23 @@ class EXP_KKT(Exp_Basic):
                 "MaxAbsBudgetResidual": float(np.max(np.abs(budget_errors))),
                 "MaxLowerViolation": float(np.max(lower_violations)),
                 "MaxUpperViolation": float(np.max(upper_violations)),
+                "MeanTransactionCost": float(np.mean(transaction_costs)),
+                "MeanNetExposure": float(np.mean(net_exposures)),
+                "MeanGrossExposure": float(np.mean(gross_exposures)),
+                "MeanActiveConstraintRatio": float(np.mean(active_constraint_ratios)),
+                "MaxTurnoverViolation": float(np.max(turnover_violations))
+                if turnover_violations else 0.0,
+                "MaxGrossExposureViolation": float(np.max(gross_violations))
+                if gross_violations else 0.0,
+                "MaxFactorExposureViolation": float(np.max(factor_violations))
+                if factor_violations else 0.0,
+                "MaxIndustryExposureViolation": float(np.max(industry_violations))
+                if industry_violations else 0.0,
+                "MaxFactorExposure": float(np.max(factor_exposure_values))
+                if factor_exposure_values else 0.0,
+                "MaxIndustryExposure": float(np.max(industry_exposure_values))
+                if industry_exposure_values else 0.0,
+                "SequentialState": bool(self.sequential_state),
             }
         )
         pd.DataFrame([metrics]).to_csv(result_dir / "test_metrics.csv", index=False)

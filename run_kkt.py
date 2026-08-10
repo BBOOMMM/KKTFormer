@@ -22,9 +22,25 @@ def parse_args():
     parser.add_argument("--horizon", type=int, default=20)
     parser.add_argument("--rebalance_frequency", type=int, default=20)
     parser.add_argument("--upper_bound", type=float, default=1.0)
+    parser.add_argument("--lower_bound", type=float, default=0.0)
+    parser.add_argument("--budget_target", type=float, default=1.0)
     parser.add_argument("--eta", type=float, default=1e-3)
     parser.add_argument("--covariance_epsilon", type=float, default=1e-6)
     parser.add_argument("--transaction_cost_bps", type=float, default=0.0)
+    parser.add_argument("--transaction_cost_smoothing", type=float, default=1e-4)
+    parser.add_argument("--turnover_penalty", type=float, default=0.0)
+    parser.add_argument("--max_turnover", type=float, default=None)
+    parser.add_argument("--gross_exposure_limit", type=float, default=None)
+    parser.add_argument("--factor_lower", type=str, default="")
+    parser.add_argument("--factor_upper", type=str, default="")
+    parser.add_argument("--industry_exposure_path", type=str, default="")
+    parser.add_argument("--industry_lower", type=str, default="")
+    parser.add_argument("--industry_upper", type=str, default="")
+    parser.add_argument(
+        "--sequential_state",
+        action="store_true",
+        help="consume decisions chronologically and feed generated w_prev forward",
+    )
 
     parser.add_argument("--input_dim", type=int, default=1)
     parser.add_argument("--factor_dim", type=int, default=3)
@@ -44,6 +60,7 @@ def parse_args():
 
     parser.add_argument("--optimizer_iterations", type=int, default=100)
     parser.add_argument("--projection_iterations", type=int, default=64)
+    parser.add_argument("--constraint_projection_iterations", type=int, default=20)
     parser.add_argument(
         "--loss_mode",
         type=str,
@@ -96,7 +113,7 @@ def main():
             f"_nh{args.n_heads}_nl{args.num_layers}"
             f"_oi{args.optimizer_iterations}_fb{args.feedback_mode}"
             f"_lm{args.loss_mode}"
-            f"_pw{args.prediction_weight}_{iteration}"
+            f"_pw{args.prediction_weight}_seq{int(args.sequential_state)}_{iteration}"
         )
         print(f">>>>>>> start training: {setting} >>>>>>>>>")
         experiment = EXP_KKT(args)

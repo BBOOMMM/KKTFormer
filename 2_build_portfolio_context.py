@@ -16,6 +16,7 @@ import argparse
 from portfolio.context_builder import (
     PortfolioContextConfig,
     build_context_cache_from_csv,
+    load_industry_exposure,
 )
 from portfolio.problem import MinimalPortfolioProblem
 
@@ -42,13 +43,28 @@ def parse_args():
     parser.add_argument("--rebalance_frequency", type=int, default=20)
     parser.add_argument("--eta", type=float, default=1e-3)
     parser.add_argument("--upper_bound", type=float, default=1.0)
+    parser.add_argument("--lower_bound", type=float, default=0.0)
+    parser.add_argument("--budget_target", type=float, default=1.0)
     parser.add_argument("--covariance_epsilon", type=float, default=1e-6)
     parser.add_argument("--transaction_cost_bps", type=float, default=0.0)
+    parser.add_argument("--factor_lower", type=str, default="")
+    parser.add_argument("--factor_upper", type=str, default="")
+    parser.add_argument("--industry_exposure_path", type=str, default="")
+    parser.add_argument("--industry_lower", type=str, default="")
+    parser.add_argument("--industry_upper", type=str, default="")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    def parse_bound(value):
+        if not value:
+            return None
+        pieces = [piece.strip() for piece in value.split(",") if piece.strip()]
+        if len(pieces) == 1:
+            return float(pieces[0])
+        return tuple(float(piece) for piece in pieces)
+
     problem = MinimalPortfolioProblem(
         num_assets=args.data_pool,
         lookback_window=args.lookback_window,
@@ -56,11 +72,29 @@ def main():
         rebalance_frequency=args.rebalance_frequency,
         eta=args.eta,
         upper_bound=args.upper_bound,
+        lower_bound=args.lower_bound,
+        budget_target=args.budget_target,
     )
+    industry_exposure = None
+    industry_names = ()
+    if args.industry_exposure_path:
+        import pandas as pd
+
+        frame = pd.read_csv(args.data_path, parse_dates=["Date"])
+        industry_exposure, industry_names = load_industry_exposure(
+            args.industry_exposure_path,
+            frame.columns.drop("Date"),
+        )
     config = PortfolioContextConfig(
         problem=problem,
         covariance_epsilon=args.covariance_epsilon,
         transaction_cost_bps=args.transaction_cost_bps,
+        factor_lower=parse_bound(args.factor_lower),
+        factor_upper=parse_bound(args.factor_upper),
+        industry_exposure=industry_exposure,
+        industry_names=industry_names,
+        industry_lower=parse_bound(args.industry_lower),
+        industry_upper=parse_bound(args.industry_upper),
     )
     output_paths = build_context_cache_from_csv(
         csv_path=args.data_path,

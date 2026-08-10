@@ -1,6 +1,11 @@
 """Portfolio problem components used by KKTFormer."""
 
-from .optimizer_layer import DifferentiablePortfolioOptimizer, project_capped_simplex
+from .optimizer_layer import (
+    DifferentiablePortfolioOptimizer,
+    project_bounded_simplex,
+    project_capped_simplex,
+    project_l1_ball,
+)
 from .losses import (
     decision_regret_loss,
     portfolio_cvar_loss,
@@ -17,4 +22,6 @@ __all__ = [
     "portfolio_cvar_loss",
     "portfolio_objective_loss",
     "project_capped_simplex",
+    "project_bounded_simplex",
+    "project_l1_ball",
 ]

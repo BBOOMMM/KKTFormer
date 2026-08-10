@@ -21,6 +21,7 @@ def compute_kkt_state(
     weights: torch.Tensor,
     upper_bounds: torch.Tensor,
     problem: MinimalPortfolioProblem,
+    lower_bounds: torch.Tensor = None,
     active_tolerance: float = 1e-5,
 ) -> Dict[str, torch.Tensor]:
     """Extract box-constraint dual pressure and local decision sensitivity.
@@ -51,6 +52,16 @@ def compute_kkt_state(
         upper = upper_bounds
     else:
         raise ValueError("upper_bounds must have shape (N,) or (B, N)")
+    if lower_bounds is None:
+        lower_bounds = torch.as_tensor(
+            problem.lower_bounds, dtype=weights.dtype, device=weights.device
+        )
+    if lower_bounds.ndim == 1:
+        lower = lower_bounds.unsqueeze(0).expand_as(weights)
+    elif lower_bounds.shape == weights.shape:
+        lower = lower_bounds
+    else:
+        raise ValueError("lower_bounds must have shape (N,) or (B, N)")
 
     batch_size, num_assets = weights.shape
     sigma_batch = _batch_sigma(sigma, batch_size, num_assets)
@@ -59,7 +70,7 @@ def compute_kkt_state(
     q = q + problem.eta * eye.unsqueeze(0)
     gradient = torch.bmm(q, weights.unsqueeze(-1)).squeeze(-1) - mu_hat
 
-    active_lower = weights <= active_tolerance
+    active_lower = weights <= lower + active_tolerance
     active_upper = weights >= upper - active_tolerance
     free = ~(active_lower | active_upper)
     free_count = free.sum(dim=-1, keepdim=True).to(weights.dtype)

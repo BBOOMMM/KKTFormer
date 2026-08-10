@@ -35,15 +35,16 @@ def portfolio_objective_loss(
     problem: MinimalPortfolioProblem,
     w_prev: Optional[torch.Tensor] = None,
     transaction_cost_rate: Optional[torch.Tensor] = None,
+    turnover_penalty: float = 0.0,
+    transaction_cost_smoothing: float = 1e-4,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Evaluate the realized portfolio objective for one decision.
 
     The return target is the same ``H``-period aggregation used by the
     optimizer oracle.  The risk term is exactly the stage-1 quadratic
-    objective, and transaction cost is an optional realized penalty.  The
-    optimizer layer in stage 3 does not yet optimize turnover internally, so
-    transaction cost is set to zero by default until the sequential state is
-    implemented.
+    objective.  When supplied, quadratic turnover and smooth transaction cost
+    use the same convention as the stage-7 optimizer; the reported
+    ``transaction_cost`` component remains the actual L1 cost.
 
     Returns:
         loss: Tensor with shape ``(B,)``.
@@ -66,10 +67,12 @@ def portfolio_objective_loss(
     flat_weights = weights.reshape(batch_size, problem.num_assets)
     if w_prev is None:
         turnover = torch.zeros(batch_size, dtype=weights.dtype, device=weights.device)
+        delta = torch.zeros_like(flat_weights)
     else:
         if w_prev.shape != weights.shape:
             raise ValueError("w_prev must have the same shape as weights")
-        turnover = (weights - w_prev).abs().sum(dim=-1).reshape(batch_size)
+        delta = (weights - w_prev).reshape(batch_size, problem.num_assets)
+        turnover = delta.abs().sum(dim=-1)
     cost_rate = _broadcast_batch_vector(
         transaction_cost_rate,
         batch_size=batch_size,
@@ -77,13 +80,24 @@ def portfolio_objective_loss(
         device=weights.device,
         name="transaction_cost_rate",
     )
-    cost = turnover * cost_rate
-    total = objective_without_cost.reshape(batch_size) + cost
+    if turnover_penalty < 0:
+        raise ValueError("turnover_penalty cannot be negative")
+    if transaction_cost_smoothing <= 0:
+        raise ValueError("transaction_cost_smoothing must be positive")
+    quadratic_turnover = 0.5 * float(turnover_penalty) * delta.square().sum(dim=-1)
+    smooth_transaction_cost = cost_rate * (
+        torch.sqrt(delta.square() + transaction_cost_smoothing**2)
+        - transaction_cost_smoothing
+    ).sum(dim=-1)
+    cost = cost_rate * turnover
+    total = objective_without_cost.reshape(batch_size) + quadratic_turnover + smooth_transaction_cost
     components = {
         "return_loss": return_loss.reshape(batch_size),
         "risk_loss": risk_loss.reshape(batch_size),
         "turnover": turnover,
         "transaction_cost": cost,
+        "smooth_transaction_cost": smooth_transaction_cost,
+        "turnover_penalty": quadratic_turnover,
         "total_loss": total,
     }
     return total, components
@@ -97,6 +111,8 @@ def decision_regret_loss(
     problem: MinimalPortfolioProblem,
     w_prev: Optional[torch.Tensor] = None,
     transaction_cost_rate: Optional[torch.Tensor] = None,
+    turnover_penalty: float = 0.0,
+    transaction_cost_smoothing: float = 1e-4,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Compute predicted-vs-oracle realized portfolio objective regret.
 
@@ -113,6 +129,8 @@ def decision_regret_loss(
         problem,
         w_prev=w_prev,
         transaction_cost_rate=transaction_cost_rate,
+        turnover_penalty=turnover_penalty,
+        transaction_cost_smoothing=transaction_cost_smoothing,
     )
     with torch.no_grad():
         oracle_loss, oracle_components = portfolio_objective_loss(
@@ -122,6 +140,8 @@ def decision_regret_loss(
             problem,
             w_prev=w_prev,
             transaction_cost_rate=transaction_cost_rate,
+            turnover_penalty=turnover_penalty,
+            transaction_cost_smoothing=transaction_cost_smoothing,
         )
     regret = predicted_loss - oracle_loss.detach()
     components = {
@@ -141,6 +161,8 @@ def portfolio_cvar_loss(
     smooth_temperature: float = 1e-3,
     w_prev: Optional[torch.Tensor] = None,
     transaction_cost_rate: Optional[torch.Tensor] = None,
+    turnover_penalty: float = 0.0,
+    transaction_cost_smoothing: float = 1e-4,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Compute a differentiable CVaR loss over the future return path.
 
@@ -170,10 +192,12 @@ def portfolio_cvar_loss(
     batch_size = int(weights.numel() // weights.shape[-1])
     if w_prev is None:
         turnover = torch.zeros(batch_size, dtype=weights.dtype, device=weights.device)
+        delta = torch.zeros_like(weights).reshape(batch_size, weights.shape[-1])
     else:
         if w_prev.shape != weights.shape:
             raise ValueError("w_prev must have the same shape as weights")
-        turnover = (weights - w_prev).abs().sum(dim=-1).reshape(batch_size)
+        delta = (weights - w_prev).reshape(batch_size, weights.shape[-1])
+        turnover = delta.abs().sum(dim=-1)
     cost_rate = _broadcast_batch_vector(
         transaction_cost_rate,
         batch_size=batch_size,
@@ -181,13 +205,24 @@ def portfolio_cvar_loss(
         device=weights.device,
         name="transaction_cost_rate",
     )
+    if turnover_penalty < 0:
+        raise ValueError("turnover_penalty cannot be negative")
+    if transaction_cost_smoothing <= 0:
+        raise ValueError("transaction_cost_smoothing must be positive")
     transaction_cost = turnover * cost_rate
-    total = cvar.reshape(batch_size) + transaction_cost
+    smooth_transaction_cost = cost_rate * (
+        torch.sqrt(delta.square() + transaction_cost_smoothing**2)
+        - transaction_cost_smoothing
+    ).sum(dim=-1)
+    quadratic_turnover = 0.5 * float(turnover_penalty) * delta.square().sum(dim=-1)
+    total = cvar.reshape(batch_size) + smooth_transaction_cost + quadratic_turnover
     components = {
         "var": var.reshape(batch_size),
         "cvar": cvar.reshape(batch_size),
         "turnover": turnover,
         "transaction_cost": transaction_cost,
+        "smooth_transaction_cost": smooth_transaction_cost,
+        "turnover_penalty": quadratic_turnover,
         "total_loss": total,
     }
     return total, components

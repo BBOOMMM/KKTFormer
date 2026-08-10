@@ -87,7 +87,7 @@ class Dataset_PortfolioContext(Dataset):
             pd.Timestamp(date).strftime("%Y-%m-%d")
             for date in context["future_dates"][index]
         ]
-        return {
+        item = {
             "market_window": torch.from_numpy(
                 np.asarray(context["market_window"][index], dtype=np.float32)
             ),
@@ -118,3 +118,18 @@ class Dataset_PortfolioContext(Dataset):
             "decision_date": decision_date,
             "future_dates": future_dates,
         }
+        optional_tensor_fields = (
+            "factor_lower",
+            "factor_upper",
+            "industry_exposure",
+            "industry_lower",
+            "industry_upper",
+        )
+        for field in optional_tensor_fields:
+            if field in context:
+                item[field] = torch.from_numpy(
+                    np.asarray(context[field], dtype=np.float32)
+                )
+        if "industry_names" in context:
+            item["industry_names"] = [str(name) for name in context["industry_names"]]
+        return item
