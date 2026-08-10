@@ -27,6 +27,15 @@ def parse_args():
     parser.add_argument("--transaction_cost_bps", type=float, default=0.0)
 
     parser.add_argument("--input_dim", type=int, default=1)
+    parser.add_argument("--factor_dim", type=int, default=3)
+    parser.add_argument(
+        "--feedback_mode",
+        type=str,
+        choices=["none", "dual", "jacobian"],
+        default="none",
+        help="stage-6 optimizer feedback variant",
+    )
+    parser.add_argument("--active_tolerance", type=float, default=1e-5)
     parser.add_argument("--d_model", type=int, default=32)
     parser.add_argument("--n_heads", type=int, default=4)
     parser.add_argument("--num_layers", type=int, default=1)
@@ -85,7 +94,8 @@ def main():
             f"_w{args.window_size}_h{args.horizon}"
             f"_rb{args.rebalance_frequency}_dm{args.d_model}"
             f"_nh{args.n_heads}_nl{args.num_layers}"
-            f"_oi{args.optimizer_iterations}_lm{args.loss_mode}"
+            f"_oi{args.optimizer_iterations}_fb{args.feedback_mode}"
+            f"_lm{args.loss_mode}"
             f"_pw{args.prediction_weight}_{iteration}"
         )
         print(f">>>>>>> start training: {setting} >>>>>>>>>")

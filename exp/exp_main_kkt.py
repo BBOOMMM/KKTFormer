@@ -19,6 +19,7 @@ from portfolio import (
     decision_regret_loss,
     portfolio_cvar_loss,
     portfolio_objective_loss,
+    compute_kkt_state,
 )
 from utils.tools import EarlyStopping, adjust_learning_rate
 
@@ -27,6 +28,9 @@ class EXP_KKT(Exp_Basic):
     """KKTFormer-v0 experiment: prediction loss + constrained allocation."""
 
     def __init__(self, args):
+        self.feedback_mode = str(getattr(args, "feedback_mode", "none")).lower()
+        if self.feedback_mode not in {"none", "dual", "jacobian"}:
+            raise ValueError("feedback_mode must be one of none, dual, jacobian")
         super().__init__(args)
         self.problem = MinimalPortfolioProblem(
             num_assets=args.data_pool,
@@ -57,7 +61,14 @@ class EXP_KKT(Exp_Basic):
         )
 
     def _build_model(self):
-        model = self.model_dict["KKTFormer"].Model(self.args).float()
+        model_module = self.model_dict["KKTFormer"]
+        if self.feedback_mode == "none":
+            model = model_module.Model(self.args).float()
+        else:
+            model = model_module.DecisionAwareModel(
+                self.args,
+                feedback_mode=self.feedback_mode,
+            ).float()
         if self.args.use_multi_gpu and self.args.use_gpu:
             model = nn.DataParallel(model, device_ids=self.args.device_ids)
         return model
@@ -75,7 +86,37 @@ class EXP_KKT(Exp_Basic):
             self.device, non_blocking=True
         )
 
-        _, mu_hat = self.model(market_window)
+        factor_exposure = batch["factor_exposure"].to(
+            self.device, non_blocking=True
+        )
+
+        model_core = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        if self.feedback_mode == "none":
+            _, mu_hat = self.model(market_window)
+            probe_state = None
+        else:
+            hidden0, mu0 = model_core.initial_forward(market_window)
+            probe_weights, probe_state = self.portfolio_optimizer(
+                mu_hat=mu0,
+                sigma=sigma,
+                upper_bounds=upper_bounds,
+            )
+            kkt_state = compute_kkt_state(
+                mu_hat=mu0,
+                sigma=sigma,
+                weights=probe_weights,
+                upper_bounds=upper_bounds,
+                problem=self.problem,
+                active_tolerance=float(
+                    getattr(self.args, "active_tolerance", 1e-5)
+                ),
+            )
+            _, mu_hat = model_core.refine(
+                hidden0,
+                kkt_state,
+                factor_exposure=factor_exposure,
+            )
+
         weights, state = self.portfolio_optimizer(
             mu_hat=mu_hat,
             sigma=sigma,
@@ -158,6 +199,7 @@ class EXP_KKT(Exp_Basic):
             "transaction_cost": utility_components["transaction_cost"].mean(),
             "cvar_var": cvar_components["var"].mean(),
             "oracle_objective": regret_components["oracle_objective"].mean(),
+            "feedback_mode": self.feedback_mode,
         }
         return total_loss, mu_hat, weights, state, target_mu, details
 
