@@ -13,7 +13,13 @@ from torch import nn, optim
 
 from data_provider.data_factory_kkt import data_provider_kkt
 from exp.exp_basic import Exp_Basic
-from portfolio import DifferentiablePortfolioOptimizer, MinimalPortfolioProblem
+from portfolio import (
+    DifferentiablePortfolioOptimizer,
+    MinimalPortfolioProblem,
+    decision_regret_loss,
+    portfolio_cvar_loss,
+    portfolio_objective_loss,
+)
 from utils.tools import EarlyStopping, adjust_learning_rate
 
 
@@ -35,6 +41,20 @@ class EXP_KKT(Exp_Basic):
             num_iterations=args.optimizer_iterations,
             bisection_steps=args.projection_iterations,
         )
+        self.loss_mode = str(getattr(args, "loss_mode", "prediction")).lower()
+        if self.loss_mode not in {
+            "prediction",
+            "utility",
+            "cvar",
+            "regret",
+            "hybrid",
+        }:
+            raise ValueError(
+                "loss_mode must be one of prediction, utility, cvar, regret, hybrid"
+            )
+        self.prediction_weight = float(
+            getattr(args, "prediction_weight", 0.1)
+        )
 
     def _build_model(self):
         model = self.model_dict["KKTFormer"].Model(self.args).float()
@@ -50,6 +70,10 @@ class EXP_KKT(Exp_Basic):
         future_returns = batch["future_returns"].to(self.device, non_blocking=True)
         sigma = batch["Sigma"].to(self.device, non_blocking=True)
         upper_bounds = batch["upper_bounds"].to(self.device, non_blocking=True)
+        w_prev = batch["w_prev"].to(self.device, non_blocking=True)
+        transaction_cost_rate = batch["transaction_cost_rate"].to(
+            self.device, non_blocking=True
+        )
 
         _, mu_hat = self.model(market_window)
         weights, state = self.portfolio_optimizer(
@@ -62,15 +86,88 @@ class EXP_KKT(Exp_Basic):
             prediction_loss = F.smooth_l1_loss(mu_hat, target_mu)
         else:
             prediction_loss = F.mse_loss(mu_hat, target_mu)
-        return prediction_loss, mu_hat, weights, state, target_mu
+
+        utility_batch, utility_components = portfolio_objective_loss(
+            weights=weights,
+            future_returns=future_returns,
+            sigma=sigma,
+            problem=self.problem,
+            w_prev=w_prev,
+            transaction_cost_rate=transaction_cost_rate,
+        )
+        utility_loss = utility_batch.mean()
+
+        cvar_batch, cvar_components = portfolio_cvar_loss(
+            weights=weights,
+            future_returns=future_returns,
+            alpha=float(getattr(self.args, "cvar_alpha", 0.95)),
+            smooth_temperature=float(
+                getattr(self.args, "cvar_temperature", 1e-3)
+            ),
+            w_prev=w_prev,
+            transaction_cost_rate=transaction_cost_rate,
+        )
+        cvar_loss = cvar_batch.mean()
+
+        if self.loss_mode in {"regret", "hybrid"}:
+            # The oracle uses the same optimizer, risk matrix and constraints;
+            # future returns enter only through the oracle target and loss.
+            with torch.no_grad():
+                oracle_weights, _ = self.portfolio_optimizer(
+                    mu_hat=target_mu,
+                    sigma=sigma,
+                    upper_bounds=upper_bounds,
+                )
+            regret_batch, regret_components = decision_regret_loss(
+                predicted_weights=weights,
+                oracle_weights=oracle_weights,
+                future_returns=future_returns,
+                sigma=sigma,
+                problem=self.problem,
+                w_prev=w_prev,
+                transaction_cost_rate=transaction_cost_rate,
+            )
+            regret_loss = regret_batch.mean()
+        else:
+            regret_loss = prediction_loss.detach() * 0.0
+            regret_components = {
+                "predicted_objective": utility_batch.detach(),
+                "oracle_objective": utility_batch.detach(),
+                "regret": utility_batch.detach() * 0.0,
+            }
+
+        if self.loss_mode == "prediction":
+            total_loss = prediction_loss
+        elif self.loss_mode == "utility":
+            total_loss = utility_loss
+        elif self.loss_mode == "cvar":
+            total_loss = cvar_loss
+        elif self.loss_mode == "regret":
+            total_loss = regret_loss
+        else:
+            total_loss = regret_loss + self.prediction_weight * prediction_loss
+
+        details = {
+            "total_loss": total_loss,
+            "prediction_loss": prediction_loss,
+            "utility_loss": utility_loss,
+            "cvar_loss": cvar_loss,
+            "regret_loss": regret_loss,
+            "mean_return_loss": utility_components["return_loss"].mean(),
+            "risk_loss": utility_components["risk_loss"].mean(),
+            "transaction_cost": utility_components["transaction_cost"].mean(),
+            "cvar_var": cvar_components["var"].mean(),
+            "oracle_objective": regret_components["oracle_objective"].mean(),
+        }
+        return total_loss, mu_hat, weights, state, target_mu, details
 
     def _validation_loss(self, loader) -> float:
         self.model.eval()
         losses = []
         with torch.no_grad():
             for batch in loader:
-                loss, _, _, _, _ = self._forward_batch(batch)
-                losses.append(float(loss.item()))
+                _, _, _, _, _, details = self._forward_batch(batch)
+                losses.append(float(details["total_loss"].item()))
         if not losses:
             raise RuntimeError("validation loader is empty")
         return float(np.mean(losses))
@@ -93,19 +190,32 @@ class EXP_KKT(Exp_Basic):
         for epoch in range(self.args.train_epochs):
             self.model.train()
             train_losses = []
+            prediction_losses = []
+            utility_losses = []
+            cvar_losses = []
+            regret_losses = []
             for batch in train_loader:
                 model_optimizer.zero_grad(set_to_none=True)
-                loss, _, _, _, _ = self._forward_batch(batch)
+                loss, _, _, _, _, details = self._forward_batch(batch)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 model_optimizer.step()
                 train_losses.append(float(loss.item()))
+                prediction_losses.append(float(details["prediction_loss"].item()))
+                utility_losses.append(float(details["utility_loss"].item()))
+                cvar_losses.append(float(details["cvar_loss"].item()))
+                regret_losses.append(float(details["regret_loss"].item()))
 
             val_loss = self._validation_loss(val_loader)
             train_loss = float(np.mean(train_losses)) if train_losses else math.nan
             print(
-                f"[Epoch {epoch + 1}] train_prediction_loss={train_loss:.8f} "
-                f"val_prediction_loss={val_loss:.8f}"
+                f"[Epoch {epoch + 1}] mode={self.loss_mode} "
+                f"train_loss={train_loss:.8f} "
+                f"train_prediction={np.mean(prediction_losses):.8f} "
+                f"train_utility={np.mean(utility_losses):.8f} "
+                f"train_cvar={np.mean(cvar_losses):.8f} "
+                f"train_regret={np.mean(regret_losses):.8f} "
+                f"val_loss={val_loss:.8f}"
             )
             early_stopping(val_loss, self.model, str(checkpoint_dir))
             if early_stopping.early_stop:
@@ -178,12 +288,20 @@ class EXP_KKT(Exp_Basic):
         budget_errors = []
         lower_violations = []
         upper_violations = []
+        total_losses = []
+        utility_losses = []
+        cvar_losses = []
+        regret_losses = []
         asset_names = [f"asset_{i}" for i in range(self.args.data_pool)]
 
         with torch.no_grad():
             for batch in test_loader:
-                loss, _, weights, state, _ = self._forward_batch(batch)
-                prediction_losses.append(float(loss.item()))
+                _, _, weights, state, _, details = self._forward_batch(batch)
+                total_losses.append(float(details["total_loss"].item()))
+                prediction_losses.append(float(details["prediction_loss"].item()))
+                utility_losses.append(float(details["utility_loss"].item()))
+                cvar_losses.append(float(details["cvar_loss"].item()))
+                regret_losses.append(float(details["regret_loss"].item()))
                 weights_np = weights.detach().cpu().numpy()
                 future_np = batch["future_returns"].numpy()
                 previous_np = batch["w_prev"].numpy()
@@ -238,7 +356,12 @@ class EXP_KKT(Exp_Basic):
         metrics = self._portfolio_metrics(daily_series)
         metrics.update(
             {
+                "LossMode": self.loss_mode,
+                "TestLoss": float(np.mean(total_losses)),
                 "PredictionLoss": float(np.mean(prediction_losses)),
+                "UtilityLoss": float(np.mean(utility_losses)),
+                "CVaRLoss": float(np.mean(cvar_losses)),
+                "DecisionRegret": float(np.mean(regret_losses)),
                 "MeanTurnover": float(np.mean(turnover_values)),
                 "MaxAbsBudgetResidual": float(np.max(np.abs(budget_errors))),
                 "MaxLowerViolation": float(np.max(lower_violations)),

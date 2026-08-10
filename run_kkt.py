@@ -35,7 +35,22 @@ def parse_args():
 
     parser.add_argument("--optimizer_iterations", type=int, default=100)
     parser.add_argument("--projection_iterations", type=int, default=64)
+    parser.add_argument(
+        "--loss_mode",
+        type=str,
+        choices=["prediction", "utility", "cvar", "regret", "hybrid"],
+        default="prediction",
+        help="stage-5 training objective",
+    )
     parser.add_argument("--prediction_loss", type=str, default="MSE")
+    parser.add_argument("--cvar_alpha", type=float, default=0.95)
+    parser.add_argument("--cvar_temperature", type=float, default=1e-3)
+    parser.add_argument(
+        "--prediction_weight",
+        type=float,
+        default=0.1,
+        help="prediction-loss weight for hybrid regret training",
+    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--lradj", type=str, default="type1")
@@ -70,7 +85,8 @@ def main():
             f"_w{args.window_size}_h{args.horizon}"
             f"_rb{args.rebalance_frequency}_dm{args.d_model}"
             f"_nh{args.n_heads}_nl{args.num_layers}"
-            f"_oi{args.optimizer_iterations}_{iteration}"
+            f"_oi{args.optimizer_iterations}_lm{args.loss_mode}"
+            f"_pw{args.prediction_weight}_{iteration}"
         )
         print(f">>>>>>> start training: {setting} >>>>>>>>>")
         experiment = EXP_KKT(args)
