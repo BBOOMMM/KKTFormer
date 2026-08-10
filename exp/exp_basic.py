@@ -1,6 +1,7 @@
 import os
 import torch
 from model import SIT
+from model import KKTFormer
 
 
 class Exp_Basic(object):
@@ -8,6 +9,7 @@ class Exp_Basic(object):
         self.args = args
         self.model_dict = {
             'Signature': SIT,
+            'KKTFormer': KKTFormer,
         }
         self.device = self._acquire_device()
         self.model = self._build_model().to(self.device)
