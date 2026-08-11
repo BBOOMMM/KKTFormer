@@ -15,7 +15,7 @@ For a decision index ``t`` the historical price window is
 ``t`` to construct ``Sigma_t`` or ``B_t``.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple, Union
 
@@ -400,9 +400,16 @@ def _select_decision_indices(
 
     dates = frame.index
     start = pd.Timestamp(start_date) if start_date is not None else dates[first]
-    end = pd.Timestamp(end_date) if end_date is not None else dates[last_exclusive - 1]
+    # ``end`` is the end of the observable split, not the last permissible
+    # decision date.  The latter is determined below by requiring the entire
+    # future horizon to remain inside the split.
+    end = pd.Timestamp(end_date) if end_date is not None else dates[-1]
     candidates = np.arange(first, last_exclusive, dtype=np.int64)
-    candidates = candidates[(dates[candidates] >= start) & (dates[candidates] <= end)]
+    candidates = candidates[
+        (dates[candidates] >= start)
+        & (dates[candidates] <= end)
+        & (dates[candidates + H] <= end)
+    ]
     if len(candidates) == 0:
         raise ValueError("no valid decision dates in the requested range")
 
@@ -447,6 +454,9 @@ def build_contexts(
     context["transaction_cost_rate"] = np.asarray(
         samples[0]["transaction_cost_rate"], dtype=np.float32
     )
+    context["rebalance_frequency"] = np.asarray(
+        config.problem.rebalance_frequency, dtype=np.int64
+    )
     context["factor_names"] = samples[0]["factor_names"]
     for key in (
         "factor_lower",
@@ -482,8 +492,14 @@ def build_context_cache_from_csv(
     config: PortfolioContextConfig,
     data_pool: Optional[int] = None,
     split_ranges: Optional[Dict[str, Tuple[str, str]]] = None,
+    rebalance_frequencies: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Path]:
-    """Build train/val/test archives from a Date-indexed price CSV."""
+    """Build train/val/test archives from a Date-indexed price CSV.
+
+    ``rebalance_frequencies`` optionally overrides the frequency per split.
+    This is needed when the model is trained on daily decision samples but
+    evaluated on a lower-frequency rebalancing schedule.
+    """
 
     frame = pd.read_csv(csv_path, parse_dates=["Date"]).set_index("Date")
     if data_pool is not None:
@@ -504,10 +520,33 @@ def build_context_cache_from_csv(
             "test": ("2020-01-01", "2024-12-31"),
         }
 
+    if rebalance_frequencies is None:
+        rebalance_frequencies = {
+            split: config.problem.rebalance_frequency for split in split_ranges
+        }
+    unknown_splits = set(rebalance_frequencies).difference(split_ranges)
+    if unknown_splits:
+        raise ValueError(
+            "rebalance_frequencies contains unknown splits: "
+            f"{sorted(unknown_splits)}"
+        )
+    for split, frequency in rebalance_frequencies.items():
+        if not isinstance(frequency, int) or frequency <= 0:
+            raise ValueError(
+                f"rebalance frequency for {split!r} must be a positive integer"
+            )
+
     output_dir = Path(output_dir)
     output_paths: Dict[str, Path] = {}
     for split, (start_date, end_date) in split_ranges.items():
-        context = build_contexts(frame, config, start_date, end_date)
+        split_config = replace(
+            config,
+            problem=replace(
+                config.problem,
+                rebalance_frequency=rebalance_frequencies[split],
+            ),
+        )
+        context = build_contexts(frame, split_config, start_date, end_date)
         path = output_dir / f"{split}.npz"
         save_context_cache(context, path)
         output_paths[split] = path

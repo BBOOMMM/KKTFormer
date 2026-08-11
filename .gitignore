@@ -1,3 +1,7 @@
 __pycache__
 signature_cache_6020/
 tests/
+checkpoints*
+logs/
+portfolio_context_cache*
+results*

@@ -293,7 +293,12 @@ class EXP_KKT(Exp_Basic):
             "industry_upper_violation",
         ):
             if key in state:
-                details[key] = state[key].detach().mean()
+                value = state[key].detach()
+                details[key] = (
+                    value.mean()
+                    if value.numel() > 0
+                    else torch.zeros((), dtype=value.dtype, device=value.device)
+                )
         return total_loss, mu_hat, weights, state, target_mu, details
 
     def _validation_loss(self, loader) -> float:
@@ -418,6 +423,48 @@ class EXP_KKT(Exp_Basic):
             "NumDailyObservations": float(len(daily_returns)),
         }
 
+    def _hold_last_position_returns(
+        self,
+        start_date: str,
+        end_date: str,
+        weights: np.ndarray,
+    ) -> List[Tuple[str, float]]:
+        """Extend the final complete horizon by holding its last portfolio.
+
+        The 20-observation test decision grid can end before the final date of
+        the test split.  The final decision remains investable after its
+        cached horizon, so the backtest must carry that position forward to
+        the common evaluation endpoint instead of silently dropping the tail.
+        """
+
+        start = pd.Timestamp(start_date)
+        end = pd.Timestamp(end_date)
+        if end <= start:
+            return []
+
+        csv_path = Path(self.args.root_path) / self.args.data_path
+        prices = (
+            pd.read_csv(csv_path, parse_dates=["Date"])
+            .set_index("Date")
+            .iloc[:, : self.args.data_pool]
+            .sort_index()
+        )
+        start_position = int(prices.index.searchsorted(start, side="left"))
+        end_position = int(prices.index.searchsorted(end, side="right"))
+        if start_position >= len(prices) or end_position <= start_position:
+            return []
+
+        # Include the last known price at start_date so the first tail return
+        # is measured from the end of the cached horizon.
+        begin = max(0, start_position - 1)
+        window = prices.iloc[begin:end_position]
+        returns = window.pct_change().iloc[1:]
+        returns = returns.loc[(returns.index > start) & (returns.index <= end)]
+        return [
+            (date.strftime("%Y-%m-%d"), float(row.to_numpy().dot(weights)))
+            for date, row in returns.iterrows()
+        ]
+
     def eval(self, setting, load=True):
         if load:
             checkpoint = Path(self.args.checkpoints) / setting / "checkpoint.pth"
@@ -450,6 +497,8 @@ class EXP_KKT(Exp_Basic):
         cvar_losses = []
         regret_losses = []
         asset_names = [f"asset_{i}" for i in range(self.args.data_pool)]
+        last_weight_for_tail = None
+        last_covered_date = None
         self._sequential_previous = None
 
         with torch.no_grad():
@@ -509,18 +558,22 @@ class EXP_KKT(Exp_Basic):
                     )
                 for key in ("factor_lower_violation", "factor_upper_violation"):
                     if key in state:
-                        factor_violations.append(
-                            float(state[key].detach().cpu().numpy().max())
-                        )
+                        violation = state[key].detach()
+                        # The optimizer represents an unconstrained factor
+                        # block as a valid tensor with shape ``(..., 0)``.
+                        # Such a block has no maximum; it means that this
+                        # constraint family is disabled, not that eval failed.
+                        if violation.numel() > 0:
+                            factor_violations.append(float(violation.max().item()))
                 if "factor_exposure" in state:
                     factor_exposure_values.append(
                         float(np.abs(state["factor_exposure"].detach().cpu().numpy()).max())
                     )
                 for key in ("industry_lower_violation", "industry_upper_violation"):
                     if key in state:
-                        industry_violations.append(
-                            float(state[key].detach().cpu().numpy().max())
-                        )
+                        violation = state[key].detach()
+                        if violation.numel() > 0:
+                            industry_violations.append(float(violation.max().item()))
                 if "industry_exposure" in state:
                     industry_exposure_values.append(
                         float(np.abs(state["industry_exposure"].detach().cpu().numpy()).max())
@@ -549,6 +602,22 @@ class EXP_KKT(Exp_Basic):
                     realized[0] -= transaction_cost_np[row_index]
                     for date, value in zip(dates_for_sample, realized):
                         daily_return_rows.append((str(date), float(value)))
+                    last_weight_for_tail = weight.copy()
+                    last_covered_date = str(dates_for_sample[-1])
+
+        evaluation_end_date = getattr(self.args, "evaluation_end_date", "")
+        if (
+            evaluation_end_date
+            and last_weight_for_tail is not None
+            and last_covered_date is not None
+        ):
+            daily_return_rows.extend(
+                self._hold_last_position_returns(
+                    start_date=last_covered_date,
+                    end_date=evaluation_end_date,
+                    weights=last_weight_for_tail,
+                )
+            )
 
         result_dir = Path(self.args.results_path) / setting
         result_dir.mkdir(parents=True, exist_ok=True)
@@ -583,6 +652,7 @@ class EXP_KKT(Exp_Basic):
                 "MeanNetExposure": float(np.mean(net_exposures)),
                 "MeanGrossExposure": float(np.mean(gross_exposures)),
                 "MeanActiveConstraintRatio": float(np.mean(active_constraint_ratios)),
+                "EvaluationEndDate": str(evaluation_end_date),
                 "MaxTurnoverViolation": float(np.max(turnover_violations))
                 if turnover_violations else 0.0,
                 "MaxGrossExposureViolation": float(np.max(gross_violations))

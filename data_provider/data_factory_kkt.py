@@ -58,6 +58,17 @@ def _build_loader(dataset, flag, args):
     return dataset, loader
 
 
+def _split_rebalance_frequency(args, flag):
+    """Return the configured decision frequency for one data split."""
+
+    override = getattr(args, f"{flag}_rebalance_frequency", None)
+    return int(
+        override
+        if override is not None
+        else getattr(args, "rebalance_frequency", 20)
+    )
+
+
 def _parse_bound_text(value):
     """Parse ``-0.1,0.1``/scalar CLI bounds while preserving ``None``."""
 
@@ -95,7 +106,7 @@ def data_provider_kkt(args, flag):
         num_assets=args.data_pool,
         lookback_window=args.window_size,
         horizon=args.horizon,
-        rebalance_frequency=args.rebalance_frequency,
+        rebalance_frequency=_split_rebalance_frequency(args, flag),
         eta=args.eta,
         upper_bound=args.upper_bound,
         lower_bound=getattr(args, "lower_bound", 0.0),

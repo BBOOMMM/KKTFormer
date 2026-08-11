@@ -8,7 +8,10 @@ Example:
         --data_pool 30 \
         --lookback_window 60 \
         --horizon 20 \
-        --rebalance_frequency 20
+        --rebalance_frequency 20 \
+        --train_rebalance_frequency 1 \
+        --val_rebalance_frequency 1 \
+        --test_rebalance_frequency 20
 """
 
 import argparse
@@ -41,6 +44,24 @@ def parse_args():
     parser.add_argument("--lookback_window", type=int, default=60)
     parser.add_argument("--horizon", type=int, default=20)
     parser.add_argument("--rebalance_frequency", type=int, default=20)
+    parser.add_argument(
+        "--train_rebalance_frequency",
+        type=int,
+        default=None,
+        help="override train split frequency; defaults to rebalance_frequency",
+    )
+    parser.add_argument(
+        "--val_rebalance_frequency",
+        type=int,
+        default=None,
+        help="override validation split frequency; defaults to rebalance_frequency",
+    )
+    parser.add_argument(
+        "--test_rebalance_frequency",
+        type=int,
+        default=None,
+        help="override test split frequency; defaults to rebalance_frequency",
+    )
     parser.add_argument("--eta", type=float, default=1e-3)
     parser.add_argument("--upper_bound", type=float, default=1.0)
     parser.add_argument("--lower_bound", type=float, default=0.0)
@@ -101,6 +122,17 @@ def main():
         output_dir=args.output_dir,
         config=config,
         data_pool=args.data_pool,
+        rebalance_frequencies={
+            "train": args.train_rebalance_frequency
+            if args.train_rebalance_frequency is not None
+            else args.rebalance_frequency,
+            "val": args.val_rebalance_frequency
+            if args.val_rebalance_frequency is not None
+            else args.rebalance_frequency,
+            "test": args.test_rebalance_frequency
+            if args.test_rebalance_frequency is not None
+            else args.rebalance_frequency,
+        },
     )
     for split, path in output_paths.items():
         print(f"[{split}] saved context cache: {path}")

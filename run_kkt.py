@@ -21,6 +21,30 @@ def parse_args():
     parser.add_argument("--window_size", type=int, default=60)
     parser.add_argument("--horizon", type=int, default=20)
     parser.add_argument("--rebalance_frequency", type=int, default=20)
+    parser.add_argument(
+        "--train_rebalance_frequency",
+        type=int,
+        default=None,
+        help="context frequency for train; falls back to rebalance_frequency",
+    )
+    parser.add_argument(
+        "--val_rebalance_frequency",
+        type=int,
+        default=None,
+        help="context frequency for validation; falls back to rebalance_frequency",
+    )
+    parser.add_argument(
+        "--test_rebalance_frequency",
+        type=int,
+        default=None,
+        help="context frequency for test; falls back to rebalance_frequency",
+    )
+    parser.add_argument(
+        "--evaluation_end_date",
+        type=str,
+        default="2024-12-27",
+        help="last date retained in the KTTFormer test equity curve",
+    )
     parser.add_argument("--upper_bound", type=float, default=1.0)
     parser.add_argument("--lower_bound", type=float, default=0.0)
     parser.add_argument("--budget_target", type=float, default=1.0)
@@ -106,10 +130,27 @@ def main():
         args.gpu = args.device_ids[0]
 
     for iteration in range(args.itr):
+        train_frequency = (
+            args.train_rebalance_frequency
+            if args.train_rebalance_frequency is not None
+            else args.rebalance_frequency
+        )
+        val_frequency = (
+            args.val_rebalance_frequency
+            if args.val_rebalance_frequency is not None
+            else args.rebalance_frequency
+        )
+        test_frequency = (
+            args.test_rebalance_frequency
+            if args.test_rebalance_frequency is not None
+            else args.rebalance_frequency
+        )
         setting = (
             f"{args.model_id}_KKTFormer-v0_dp{args.data_pool}"
             f"_w{args.window_size}_h{args.horizon}"
-            f"_rb{args.rebalance_frequency}_dm{args.d_model}"
+            f"_rb{args.rebalance_frequency}"
+            f"_trb{train_frequency}_vrb{val_frequency}_teb{test_frequency}"
+            f"_dm{args.d_model}"
             f"_nh{args.n_heads}_nl{args.num_layers}"
             f"_oi{args.optimizer_iterations}_fb{args.feedback_mode}"
             f"_lm{args.loss_mode}"
