@@ -3,7 +3,7 @@
 set -euo pipefail
 
 # Run this script from the KKTFormer repository root:
-#   bash runfile/kkt_test.sh
+#   bash runfile/kkt_test_50.sh
 
 export CUDA_VISIBLE_DEVICES=1
 
@@ -18,7 +18,7 @@ results_path="./results_kkt/"
 log_dir="./logs/"
 
 protocol="sit"                    # sit | native
-data_pool=30
+data_pool=50
 window_size=60
 horizon=20
 rebalance_frequency=1             # ignored by the SIT protocol
@@ -106,7 +106,7 @@ train_epochs=10
 batch_size=64
 patience=3
 num_workers=0
-itr=3
+itr=1
 seed=2023
 
 use_gpu=1
