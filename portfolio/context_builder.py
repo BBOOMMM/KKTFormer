@@ -702,7 +702,7 @@ def build_context_cache_from_csv(
                 if context_start_index < 0:
                     raise ValueError("not enough pre-test history for SIT warm-up")
                 split_frame = frame.iloc[context_start_index:].loc[:end_date]
-                split_allow_incomplete = True
+                split_allow_incomplete = False
 
         split_config = replace(
             config,

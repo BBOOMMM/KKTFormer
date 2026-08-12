@@ -1,12 +1,14 @@
 """Command-line entry point for KKTFormer-v0."""
 
 import argparse
+from pprint import pformat
 import random
 
 import numpy as np
 import torch
 
 from exp.exp_main_kkt import EXP_KKT
+from utils.logger import setup_logger
 
 
 def parse_args():
@@ -17,6 +19,12 @@ def parse_args():
     parser.add_argument("--context_root", type=str, default="")
     parser.add_argument("--checkpoints", type=str, default="./checkpoints_kkt/")
     parser.add_argument("--results_path", type=str, default="./results_kkt/")
+    parser.add_argument(
+        "--log_dir",
+        type=str,
+        default="./logs",
+        help="directory for timestamped experiment log files",
+    )
     parser.add_argument(
         "--protocol",
         type=str,
@@ -127,6 +135,24 @@ def parse_args():
         help="stage-6 optimizer feedback variant",
     )
     parser.add_argument("--active_tolerance", type=float, default=1e-5)
+    parser.add_argument(
+        "--log_return_embed_dim",
+        type=int,
+        default=32,
+        help="output width of the log-return path projection",
+    )
+    parser.add_argument(
+        "--date_embed_dim",
+        type=int,
+        default=32,
+        help="output width of the date-feature projection",
+    )
+    parser.add_argument(
+        "--asset_embed_dim",
+        type=int,
+        default=32,
+        help="width of the learned asset embedding",
+    )
     parser.add_argument("--d_model", type=int, default=32)
     parser.add_argument("--n_heads", type=int, default=4)
     parser.add_argument("--num_layers", type=int, default=1)
@@ -137,17 +163,30 @@ def parse_args():
         "--optimizer_iterations",
         type=int,
         default=10,
-        help="warm-started final optimizer steps; 10 is sufficient for the default QP",
+        help="warm-started final optimizer steps; verify convergence for each asset pool",
     )
     parser.add_argument("--probe_optimizer_iterations", type=int, default=5)
+    parser.add_argument(
+        "--decision_layer",
+        type=str,
+        choices=["softmax", "optimizer"],
+        default="softmax",
+        help="final portfolio layer; softmax is the default KKTFormer policy",
+    )
     parser.add_argument("--projection_iterations", type=int, default=64)
     parser.add_argument("--constraint_projection_iterations", type=int, default=20)
     parser.add_argument(
         "--loss_mode",
         type=str,
-        choices=["prediction", "utility", "cvar", "regret", "hybrid"],
+        choices=["cvar", "hybrid"],
         default="cvar",
-        help="end-to-end realized-return objective (sequence KKTFormer requires cvar)",
+        help="CVaR alone or CVaR plus realized decision regret",
+    )
+    parser.add_argument(
+        "--regret_weight",
+        type=float,
+        default=0.1,
+        help="lambda_regret in L = L_CVaR + lambda_regret * L_regret",
     )
     parser.add_argument("--prediction_loss", type=str, default="MSE")
     parser.add_argument("--cvar_alpha", type=float, default=0.95)
@@ -166,11 +205,22 @@ def parse_args():
         default=0.1,
         help="prediction-loss weight for hybrid regret training",
     )
-    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="fixed temperature of the final softmax allocation head",
+    )
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--lradj", type=str, default="type1")
     parser.add_argument("--train_epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument(
+        "--test_batch_size",
+        type=int,
+        default=None,
+        help="test batch size; defaults to --batch_size (forced to 1 with --sequential_state)",
+    )
     parser.add_argument("--patience", type=int, default=3)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--itr", type=int, default=1)
@@ -185,6 +235,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    log_path = setup_logger(args.log_dir, args.model_id)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -220,12 +271,15 @@ def main():
             f"_w{args.window_size}_h{args.horizon}"
             f"_rb{protocol_frequency}"
             f"_trb{train_frequency}_vrb{val_frequency}_teb{test_frequency}"
-            f"_dm{args.d_model}"
+            f"_lre{args.log_return_embed_dim}_de{args.date_embed_dim}"
+            f"_ae{args.asset_embed_dim}_dm{args.d_model}"
             f"_nh{args.n_heads}_nl{args.num_layers}"
             f"_oi{args.optimizer_iterations}_fb{args.feedback_mode}"
+            f"_dl{args.decision_layer}_tp{args.temperature:g}"
             f"_sn{args.signal_normalization}_ss{args.signal_scale:g}"
             f"_lm{args.loss_mode}_cv{args.cvar_variant}"
-            f"_pw{args.prediction_weight}_seq{int(args.sequential_state)}_{iteration}"
+            f"_rw{args.regret_weight:g}_pw{args.prediction_weight}"
+            f"_seq{int(args.sequential_state)}_{iteration}"
         )
         if args.entropy_regularization != 0.0:
             setting = setting.replace(
@@ -233,6 +287,13 @@ def main():
                 f"_pw{args.prediction_weight}_er{args.entropy_regularization:g}"
                 f"_ee{args.entropy_epsilon:g}_seq",
             )
+        print("\n" + "=" * 88)
+        print(f"Experiment {iteration + 1}/{args.itr}")
+        print(f"Setting: {setting}")
+        print(f"Log file: {log_path}")
+        print("Full parameter configuration:")
+        print(pformat(vars(args), sort_dicts=True, width=100))
+        print("=" * 88)
         print(f">>>>>>> start training: {setting} >>>>>>>>>")
         experiment = EXP_KKT(args)
         experiment.train(setting)

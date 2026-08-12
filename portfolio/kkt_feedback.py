@@ -1,4 +1,4 @@
-"""KKT state extraction for the minimal KKTFormer quadratic program."""
+"""KKT state extraction for the KKTFormer convex portfolio problem."""
 
 import math
 from typing import Dict
@@ -27,21 +27,22 @@ def compute_kkt_state(
     compute_jacobian: bool = True,
     w_prev: torch.Tensor = None,
     turnover_penalty: float = 0.0,
+    entropy_regularization: float = 0.0,
+    entropy_epsilon: float = 1e-4,
 ) -> Dict[str, torch.Tensor]:
-    """Extract primal-dual state and local sensitivity for the minimal QP.
+    """Extract primal-dual state and local sensitivity for the portfolio problem.
 
-    For the QP
+    The represented objective is
 
-    ``min 0.5*w.T*Q*w - mu.T*w + 0.5*rho*||w-w_prev||^2``
+    ``0.5*w.T*Q*w - mu.T*w + 0.5*rho*||w-w_prev||^2``
+    ``+ tau*sum((w+eps)*log(w+eps) - eps*log(eps))``.
 
     subject to budget and box constraints, the effective quadratic and linear
     terms are ``Q + rho*I`` and ``mu + rho*w_prev``.  Setting ``rho=0`` gives
     the risk-only problem.
 
-    the active-set Jacobian is computed from the free-coordinate KKT system.
-    If ``F`` is the current free set, its block is
-
-    ``Q_FF^{-1} - Q_FF^{-1}1(1.T Q_FF^{-1}1)^{-1}1.T Q_FF^{-1}``.
+    The active-set Jacobian is computed from the free-coordinate KKT system
+    using the local Hessian ``Q + rho*I + diag(tau/(w+eps))``.
 
     Active coordinates have zero local sensitivity.  The active-set decision
     is intentionally treated as a discrete state; dual pressure remains
@@ -55,6 +56,12 @@ def compute_kkt_state(
         raise ValueError("turnover_penalty must be finite and non-negative")
     if turnover_penalty != 0.0 and w_prev is None:
         raise ValueError("w_prev is required when turnover_penalty is non-zero")
+    entropy_regularization = float(entropy_regularization)
+    entropy_epsilon = float(entropy_epsilon)
+    if not math.isfinite(entropy_regularization) or entropy_regularization < 0:
+        raise ValueError("entropy_regularization must be finite and non-negative")
+    if not math.isfinite(entropy_epsilon) or entropy_epsilon <= 0:
+        raise ValueError("entropy_epsilon must be finite and positive")
     problem.validate_mu(mu_hat)
     problem.validate_sigma(sigma)
     if weights.shape != mu_hat.shape:
@@ -75,6 +82,10 @@ def compute_kkt_state(
         lower = lower_bounds
     else:
         raise ValueError("lower_bounds must have shape (N,) or (B, N)")
+    if entropy_regularization != 0.0 and (lower < 0).any():
+        raise ValueError("entropy_regularization requires non-negative lower bounds")
+    if entropy_regularization != 0.0 and (weights + entropy_epsilon <= 0).any():
+        raise ValueError("weights + entropy_epsilon must be positive")
 
     batch_size, num_assets = weights.shape
     sigma_batch = _batch_sigma(sigma, batch_size, num_assets)
@@ -93,7 +104,16 @@ def compute_kkt_state(
     else:
         effective_mu = mu_hat
     quadratic_marginal = torch.bmm(q, weights.unsqueeze(-1)).squeeze(-1)
-    gradient = quadratic_marginal - effective_mu
+    if entropy_regularization != 0.0:
+        safe_weights = weights + entropy_epsilon
+        entropy_gradient = entropy_regularization * (
+            torch.log(safe_weights) + 1.0
+        )
+        entropy_curvature = entropy_regularization / safe_weights
+    else:
+        entropy_gradient = torch.zeros_like(weights)
+        entropy_curvature = torch.zeros_like(weights)
+    gradient = quadratic_marginal - effective_mu + entropy_gradient
 
     active_lower = weights <= lower + active_tolerance
     active_upper = weights >= upper - active_tolerance
@@ -170,6 +190,9 @@ def compute_kkt_state(
             q_free = q[batch_index].index_select(0, free_indices).index_select(
                 1, free_indices
             )
+            q_free = q_free + torch.diag(
+                entropy_curvature[batch_index].index_select(0, free_indices)
+            )
             ones = torch.ones(free_count_item, 1, dtype=q.dtype, device=q.device)
             kkt = torch.zeros(
                 free_count_item + 1, free_count_item + 1,
@@ -205,6 +228,8 @@ def compute_kkt_state(
         ),
         "marginal_risk": marginal_risk,
         "quadratic_marginal": quadratic_marginal,
+        "entropy_gradient": entropy_gradient,
+        "entropy_curvature": entropy_curvature,
     }
     if jacobian is not None:
         result["jacobian"] = jacobian

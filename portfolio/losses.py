@@ -178,6 +178,81 @@ def decision_regret_loss(
     return regret, components
 
 
+def sequence_decision_regret_loss(
+    predicted_weights: torch.Tensor,
+    oracle_weights: torch.Tensor,
+    realized_returns: torch.Tensor,
+    sigma: torch.Tensor,
+    problem: MinimalPortfolioProblem,
+    w_prev: Optional[torch.Tensor] = None,
+    transaction_cost_rate: Optional[torch.Tensor] = None,
+    turnover_penalty: float = 0.0,
+    transaction_cost_smoothing: float = 1e-4,
+    entropy_regularization: float = 0.0,
+    entropy_epsilon: float = 1e-4,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Compute per-token realized decision regret for a portfolio sequence.
+
+    Every ``(..., N)`` slice is one decision. ``realized_returns`` supplies
+    the next-period asset returns known only to the training oracle. Both
+    decisions are evaluated under the same quadratic risk, costs and previous
+    position. The oracle contribution is detached from the model graph.
+    """
+
+    if predicted_weights.shape != realized_returns.shape:
+        raise ValueError(
+            "predicted_weights and realized_returns must have identical shape"
+        )
+    if oracle_weights.shape != predicted_weights.shape:
+        raise ValueError(
+            "oracle_weights and predicted_weights must have identical shape"
+        )
+    if sigma.shape != predicted_weights.shape[:-1] + (
+        problem.num_assets,
+        problem.num_assets,
+    ):
+        raise ValueError("sigma batch shape must match the decision sequence")
+    if w_prev is not None and w_prev.shape != predicted_weights.shape:
+        raise ValueError("w_prev must have the same shape as predicted_weights")
+
+    predicted_objective = problem.objective(
+        predicted_weights,
+        realized_returns,
+        sigma,
+        w_prev=w_prev,
+        turnover_penalty=turnover_penalty,
+        transaction_cost_rate=transaction_cost_rate,
+        transaction_cost_smoothing=transaction_cost_smoothing,
+        entropy_regularization=entropy_regularization,
+        entropy_epsilon=entropy_epsilon,
+    )
+    with torch.no_grad():
+        oracle_objective = problem.objective(
+            oracle_weights,
+            realized_returns,
+            sigma,
+            w_prev=w_prev,
+            turnover_penalty=turnover_penalty,
+            transaction_cost_rate=transaction_cost_rate,
+            transaction_cost_smoothing=transaction_cost_smoothing,
+            entropy_regularization=entropy_regularization,
+            entropy_epsilon=entropy_epsilon,
+        )
+
+    predicted_return_loss = -(
+        predicted_weights * realized_returns
+    ).sum(dim=-1)
+    oracle_return_loss = -(oracle_weights * realized_returns).sum(dim=-1)
+    regret = predicted_objective - oracle_objective.detach()
+    return regret, {
+        "predicted_objective": predicted_objective,
+        "oracle_objective": oracle_objective.detach(),
+        "regret": regret,
+        "predicted_return_loss": predicted_return_loss,
+        "oracle_return_loss": oracle_return_loss.detach(),
+    }
+
+
 def portfolio_cvar_loss(
     weights: torch.Tensor,
     future_returns: torch.Tensor,

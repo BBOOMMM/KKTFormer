@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch import nn, optim
+from tqdm.auto import tqdm
 
 from data_provider.data_factory_kkt import data_provider_kkt
 from exp.exp_basic import Exp_Basic
@@ -16,6 +17,7 @@ from portfolio import (
     DifferentiablePortfolioOptimizer,
     MinimalPortfolioProblem,
     portfolio_cvar_loss,
+    sequence_decision_regret_loss,
     compute_kkt_state,
 )
 from utils.tools import EarlyStopping, adjust_learning_rate
@@ -32,6 +34,14 @@ class EXP_KKT(Exp_Basic):
         self.feedback_mode = str(getattr(args, "feedback_mode", "none")).lower()
         if self.feedback_mode not in {"none", "dual", "jacobian"}:
             raise ValueError("feedback_mode must be one of none, dual, jacobian")
+        self.decision_layer = str(
+            getattr(args, "decision_layer", "softmax")
+        ).lower()
+        if self.decision_layer not in {"softmax", "optimizer"}:
+            raise ValueError("decision_layer must be one of softmax or optimizer")
+        self.temperature = float(getattr(args, "temperature", 1.0))
+        if not math.isfinite(self.temperature) or self.temperature <= 0.0:
+            raise ValueError("temperature must be finite and positive")
         super().__init__(args)
         problem_rebalance_frequency = (
             1 if self.protocol == "sit" else args.rebalance_frequency
@@ -77,8 +87,11 @@ class EXP_KKT(Exp_Basic):
         self.sequential_state = bool(getattr(args, "sequential_state", False))
         self._sequential_previous = None
         self.loss_mode = str(getattr(args, "loss_mode", "cvar")).lower()
-        if self.loss_mode != "cvar":
-            raise ValueError("sequence KKTFormer is trained end-to-end with loss_mode=cvar")
+        if self.loss_mode not in {"cvar", "hybrid"}:
+            raise ValueError("sequence KKTFormer supports loss_mode=cvar or hybrid")
+        self.regret_weight = float(getattr(args, "regret_weight", 0.1))
+        if not math.isfinite(self.regret_weight) or self.regret_weight < 0.0:
+            raise ValueError("regret_weight must be finite and non-negative")
         self.prediction_weight = float(
             getattr(args, "prediction_weight", 0.1)
         )
@@ -143,7 +156,7 @@ class EXP_KKT(Exp_Basic):
         }
 
     def _validate_feedback_problem(self, optimizer_kwargs):
-        """Keep KKT feedback tied to the QP represented by its KKT state."""
+        """Keep KKT feedback tied to the problem represented by its KKT state."""
 
         if self.feedback_mode == "none":
             return
@@ -158,16 +171,76 @@ class EXP_KKT(Exp_Basic):
         ):
             if optimizer_kwargs[name] is not None:
                 unsupported.append(name)
-        if self.entropy_regularization != 0.0:
-            unsupported.append("entropy_regularization")
         if unsupported:
             names = ", ".join(unsupported)
             raise ValueError(
-                "KKT feedback currently represents only budget, box, quadratic "
-                "risk, and optional quadratic turnover; unsupported optimizer "
+                "KKT feedback currently represents budget, box, quadratic risk, "
+                "optional quadratic turnover, and entropy regularization; "
+                "unsupported optimizer "
                 f"terms: {names}. Use --feedback_mode none for extension-only "
                 "experiments."
             )
+
+    def _validate_softmax_problem(self, optimizer_kwargs, lower, upper):
+        """Reject hard constraints that a plain simplex softmax cannot enforce."""
+
+        if self.decision_layer != "softmax":
+            return
+        unsupported = []
+        for name in (
+            "factor_lower",
+            "factor_upper",
+            "industry_lower",
+            "industry_upper",
+            "max_turnover",
+            "gross_exposure_limit",
+        ):
+            if optimizer_kwargs[name] is not None:
+                unsupported.append(name)
+        if not torch.allclose(lower, torch.zeros_like(lower), atol=1e-7):
+            unsupported.append("lower_bounds")
+        if not torch.allclose(upper, torch.ones_like(upper), atol=1e-7):
+            unsupported.append("upper_bounds")
+        if abs(float(self.problem.budget_target) - 1.0) > 1e-7:
+            unsupported.append("budget_target")
+        if unsupported:
+            raise ValueError(
+                "decision_layer=softmax only enforces the long-only unit simplex; "
+                f"unsupported hard constraints: {', '.join(unsupported)}. "
+                "Use --decision_layer optimizer for constrained experiments."
+            )
+
+    def _softmax_state(self, weights, lower, upper, w_prev):
+        """Return the diagnostics expected by training and test exporters."""
+
+        epsilon = self.entropy_epsilon
+        entropy = (-weights * torch.log(weights.clamp_min(epsilon))).sum(dim=-1)
+        smoothed_entropy_term = (
+            (weights + epsilon) * torch.log(weights + epsilon)
+            - epsilon * math.log(epsilon)
+        ).sum(dim=-1)
+        active = torch.cat(
+            (
+                (weights - lower <= 1e-5).to(weights.dtype),
+                (upper - weights <= 1e-5).to(weights.dtype),
+            ),
+            dim=-1,
+        )
+        return {
+            "budget_residual": weights.sum(dim=-1) - self.problem.budget_target,
+            "lower_violation": torch.relu(lower - weights),
+            "upper_violation": torch.relu(weights - upper),
+            "net_exposure": weights.sum(dim=-1),
+            "gross_exposure": weights.abs().sum(dim=-1),
+            "active_constraint_ratio": active.mean(dim=-1),
+            "entropy": entropy,
+            "entropy_penalty": self.entropy_regularization * smoothed_entropy_term,
+            "turnover": (
+                (weights - w_prev).abs().sum(dim=-1)
+                if w_prev is not None
+                else torch.zeros_like(entropy)
+            ),
+        }
 
     def _forward_batch(self, batch, w_prev_override=None):
         log_return_path = batch["log_return_path"].to(self.device, non_blocking=True)
@@ -240,7 +313,7 @@ class EXP_KKT(Exp_Basic):
             "upper_bounds": upper_flat,
             "turnover_penalty": self.turnover_penalty,
             # In the strict KKT method, trading cost belongs to the realized
-            # decision loss/evaluation, not the probe or final QP.  The
+            # decision loss/evaluation, not the probe or final optimizer. The
             # extension-only no-feedback optimizer retains its smooth cost.
             "transaction_cost_rate": (
                 cost_rate_flat if self.feedback_mode == "none" else None
@@ -251,6 +324,7 @@ class EXP_KKT(Exp_Basic):
             "entropy_regularization": self.entropy_regularization,
         }
         self._validate_feedback_problem(optimizer_kwargs)
+        self._validate_softmax_problem(optimizer_kwargs, lower_flat, upper_flat)
 
         def reshape_state(flat_state):
             result = {}
@@ -263,7 +337,7 @@ class EXP_KKT(Exp_Basic):
 
         model_core = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         if self.feedback_mode == "none":
-            _, raw_mu_hat = self.model(log_return_path, date_feats)
+            allocation_hidden, raw_mu_hat = self.model(log_return_path, date_feats)
             mu_hat = model_core.normalize_signal(raw_mu_hat, sigma)
             initial_weights = None
         else:
@@ -288,26 +362,42 @@ class EXP_KKT(Exp_Basic):
                 compute_jacobian=self.feedback_mode == "jacobian",
                 w_prev=w_prev_flat,
                 turnover_penalty=self.turnover_penalty,
+                entropy_regularization=self.entropy_regularization,
+                entropy_epsilon=self.entropy_epsilon,
             )
             kkt_state = reshape_state(kkt_state_flat)
-            _, raw_mu_hat = model_core.refine(hidden0, kkt_state)
+            allocation_hidden, raw_mu_hat = model_core.refine(hidden0, kkt_state)
             mu_hat = model_core.normalize_signal(raw_mu_hat, sigma)
             initial_weights = probe_weights
 
-        weights_flat, state_flat = self.portfolio_optimizer(
-            mu_hat=mu_hat.reshape(batch_size * horizon, num_assets),
-            sigma=sigma_flat,
-            initial_weights=initial_weights,
-            **optimizer_kwargs,
-        )
-        weights = weights_flat.reshape(batch_size, horizon, num_assets)
-        state = reshape_state(state_flat)
+        if self.decision_layer == "softmax":
+            allocation_logits = model_core.allocation_logits_from_hidden(
+                allocation_hidden
+            )
+            weights = torch.softmax(allocation_logits / self.temperature, dim=-1)
+            weights_flat = weights.reshape(batch_size * horizon, num_assets)
+            state = reshape_state(
+                self._softmax_state(
+                    weights_flat, lower_flat, upper_flat, w_prev_flat
+                )
+            )
+        else:
+            weights_flat, state_flat = self.portfolio_optimizer(
+                mu_hat=mu_hat.reshape(batch_size * horizon, num_assets),
+                sigma=sigma_flat,
+                initial_weights=initial_weights,
+                **optimizer_kwargs,
+            )
+            weights = weights_flat.reshape(batch_size, horizon, num_assets)
+            state = reshape_state(state_flat)
         if self.feedback_mode != "none":
             # This diagnostic belongs to the short-run probe optimizer, not
-            # the final allocation optimizer represented by ``state_flat``.
+            # the final softmax policy (or optional optimizer ablation).
             state["probe_kkt_stationarity_residual_inf"] = kkt_state[
                 "kkt_stationarity_residual_inf"
             ]
+            state["probe_entropy_gradient"] = kkt_state["entropy_gradient"]
+            state["probe_entropy_curvature"] = kkt_state["entropy_curvature"]
 
         cvar_batch, cvar_components = portfolio_cvar_loss(
             weights=weights,
@@ -328,23 +418,72 @@ class EXP_KKT(Exp_Basic):
             ),
             transaction_cost_smoothing=self.transaction_cost_smoothing,
         )
-        total_loss = cvar_batch.mean()
+        cvar_loss = cvar_batch.mean()
+        regret_loss = cvar_loss.detach() * 0.0
+        oracle_objective = cvar_loss.detach() * 0.0
+        mean_return_loss = cvar_loss.detach() * 0.0
+        oracle_return_loss = cvar_loss.detach() * 0.0
+
+        if self.loss_mode == "hybrid":
+            # The hindsight oracle sees the realized next-period return for
+            # each causal token. It starts from the detached model decision,
+            # uses the exact same feasible set, and never receives gradients.
+            with torch.no_grad():
+                oracle_weights_flat, _ = self.portfolio_optimizer(
+                    mu_hat=future_returns.reshape(
+                        batch_size * horizon, num_assets
+                    ),
+                    sigma=sigma_flat,
+                    initial_weights=weights_flat.detach(),
+                    **optimizer_kwargs,
+                )
+            oracle_weights = oracle_weights_flat.reshape(
+                batch_size, horizon, num_assets
+            )
+            regret_batch, regret_components = sequence_decision_regret_loss(
+                predicted_weights=weights,
+                oracle_weights=oracle_weights,
+                realized_returns=future_returns,
+                sigma=sigma,
+                problem=self.problem,
+                w_prev=w_prev_flat.reshape(batch_size, horizon, num_assets),
+                transaction_cost_rate=(
+                    optimizer_kwargs["transaction_cost_rate"].reshape(
+                        batch_size, horizon
+                    )
+                    if optimizer_kwargs["transaction_cost_rate"] is not None
+                    else None
+                ),
+                turnover_penalty=self.turnover_penalty,
+                transaction_cost_smoothing=self.transaction_cost_smoothing,
+                entropy_regularization=self.entropy_regularization,
+                entropy_epsilon=self.entropy_epsilon,
+            )
+            regret_loss = regret_batch.mean()
+            oracle_objective = regret_components["oracle_objective"].mean()
+            mean_return_loss = regret_components["predicted_return_loss"].mean()
+            oracle_return_loss = regret_components["oracle_return_loss"].mean()
+
+        total_loss = cvar_loss + self.regret_weight * regret_loss
         zero = total_loss.detach() * 0.0
 
         details = {
             "total_loss": total_loss,
             "prediction_loss": zero,
             "utility_loss": zero,
-            "cvar_loss": total_loss,
-            "regret_loss": zero,
-            "mean_return_loss": zero,
+            "cvar_loss": cvar_loss,
+            "regret_loss": regret_loss,
+            "weighted_regret_loss": self.regret_weight * regret_loss,
+            "mean_return_loss": mean_return_loss,
+            "oracle_return_loss": oracle_return_loss,
             "risk_loss": zero,
             "entropy": state["entropy"].mean(),
             "entropy_penalty": state["entropy_penalty"].mean(),
             "transaction_cost": cvar_components["transaction_cost"].mean(),
             "cvar_var": cvar_components["var"].mean(),
-            "oracle_objective": zero,
+            "oracle_objective": oracle_objective,
             "feedback_mode": self.feedback_mode,
+            "decision_layer": self.decision_layer,
             "turnover": cvar_components["turnover"].mean(),
             "smooth_transaction_cost": cvar_components["smooth_transaction_cost"].mean(),
         }
@@ -366,12 +505,19 @@ class EXP_KKT(Exp_Basic):
                 )
         return total_loss, mu_hat, weights, state, future_returns, details
 
-    def _validation_loss(self, loader) -> float:
+    def _validation_loss(self, loader, epoch: int) -> float:
         self.model.eval()
         losses = []
         self._sequential_previous = None
         with torch.no_grad():
-            for batch in loader:
+            progress = tqdm(
+                loader,
+                desc=f"Validate {epoch + 1}/{self.args.train_epochs}",
+                unit="batch",
+                dynamic_ncols=True,
+                leave=False,
+            )
+            for batch in progress:
                 previous = self._sequential_previous if self.sequential_state else None
                 _, _, weights, _, _, details = self._forward_batch(
                     batch, w_prev_override=previous
@@ -406,7 +552,13 @@ class EXP_KKT(Exp_Basic):
             utility_losses = []
             cvar_losses = []
             regret_losses = []
-            for batch in train_loader:
+            progress = tqdm(
+                train_loader,
+                desc=f"Train {epoch + 1}/{self.args.train_epochs}",
+                unit="batch",
+                dynamic_ncols=True,
+            )
+            for batch in progress:
                 model_optimizer.zero_grad(set_to_none=True)
                 previous = self._sequential_previous if self.sequential_state else None
                 loss, _, weights, _, _, details = self._forward_batch(
@@ -422,8 +574,9 @@ class EXP_KKT(Exp_Basic):
                 utility_losses.append(float(details["utility_loss"].item()))
                 cvar_losses.append(float(details["cvar_loss"].item()))
                 regret_losses.append(float(details["regret_loss"].item()))
+                progress.set_postfix(loss=f"{train_losses[-1]:.6f}")
 
-            val_loss = self._validation_loss(val_loader)
+            val_loss = self._validation_loss(val_loader, epoch)
             train_loss = float(np.mean(train_losses)) if train_losses else math.nan
             print(
                 f"[Epoch {epoch + 1}] mode={self.loss_mode} "
@@ -448,20 +601,30 @@ class EXP_KKT(Exp_Basic):
         return self.model
 
     @staticmethod
-    def _decode_dates(value) -> List[str]:
-        """Decode default-collated date strings for test batch size one."""
+    def _decode_date_batch(value, batch_size: int) -> List[List[str]]:
+        """Convert default-collated future dates from H x B into B x H."""
 
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
         if isinstance(value, str):
-            return [value]
-        if isinstance(value, (tuple, list)):
-            if len(value) == 0:
-                return []
-            if all(isinstance(item, str) for item in value):
-                return list(value)
-            # DataLoader collates a list of H strings into H one-item tuples.
-            if all(isinstance(item, (tuple, list)) for item in value):
-                return [item[0] for item in value]
-        return [str(value)]
+            if batch_size != 1:
+                raise ValueError("one date string cannot describe multiple samples")
+            return [[value]]
+        if not isinstance(value, (tuple, list)) or not value:
+            return [[] for _ in range(batch_size)]
+
+        # Dataset items contain a list of H strings. PyTorch's default collate
+        # transposes these into H sequences, each containing B strings.
+        if all(isinstance(item, (tuple, list)) for item in value):
+            if any(len(item) != batch_size for item in value):
+                raise ValueError("collated future_dates has an invalid batch dimension")
+            return [
+                [str(horizon_dates[sample_index]) for horizon_dates in value]
+                for sample_index in range(batch_size)
+            ]
+        if batch_size == 1 and all(isinstance(item, str) for item in value):
+            return [list(value)]
+        raise ValueError("unsupported future_dates collation structure")
 
     @staticmethod
     def _portfolio_metrics(daily_returns: pd.Series) -> Dict[str, float]:
@@ -582,39 +745,63 @@ class EXP_KKT(Exp_Basic):
         )
 
         with torch.no_grad():
-            for batch in test_loader:
-                execution_dates = self._decode_dates(batch["future_dates"])
-                if not execution_dates:
+            progress = tqdm(
+                test_loader,
+                desc="Test",
+                unit="context",
+                dynamic_ncols=True,
+            )
+            for batch in progress:
+                batch_size = int(batch["future_returns"].shape[0])
+                execution_date_batch = self._decode_date_batch(
+                    batch["future_dates"], batch_size
+                )
+                if any(not dates for dates in execution_date_batch):
                     raise RuntimeError("test context has no execution date")
                 _, _, weights, state, _, details = self._forward_batch(
-                    batch, w_prev_override=held_weights
+                    batch,
+                    # A generated previous position is inherently sequential.
+                    # Batched evaluation uses each context's cached w_prev;
+                    # --sequential_state keeps the loader at batch size one.
+                    w_prev_override=held_weights if batch_size == 1 else None,
                 )
-                total_losses.append(float(details["total_loss"].item()))
-                prediction_losses.append(float(details["prediction_loss"].item()))
-                utility_losses.append(float(details["utility_loss"].item()))
-                cvar_losses.append(float(details["cvar_loss"].item()))
-                regret_losses.append(float(details["regret_loss"].item()))
+                # Each detail is a batch mean. Repeat it by the batch size so
+                # the final diagnostic mean does not overweight a short tail.
+                total_losses.extend([float(details["total_loss"].item())] * batch_size)
+                prediction_losses.extend(
+                    [float(details["prediction_loss"].item())] * batch_size
+                )
+                utility_losses.extend(
+                    [float(details["utility_loss"].item())] * batch_size
+                )
+                cvar_losses.extend([float(details["cvar_loss"].item())] * batch_size)
+                regret_losses.extend(
+                    [float(details["regret_loss"].item())] * batch_size
+                )
 
-                token_indices = (
-                    range(len(execution_dates)) if self.protocol == "sit" else (0,)
-                )
-                for token_index in token_indices:
-                    execution_date = execution_dates[token_index]
-                    if execution_date in event_records:
-                        continue
-                    token_weights = weights[:, token_index].detach()
-                    is_rebalance = (
-                        not event_records
-                        or self.protocol != "sit"
-                        or execution_date in SIT_REBALANCE_DATE_SET
+                # Preserve the exact batch-size-one ordering: samples first,
+                # then horizon tokens. This keeps SIT's first-date dedup rule.
+                for sample_index, execution_dates in enumerate(execution_date_batch):
+                    token_indices = (
+                        range(len(execution_dates)) if self.protocol == "sit" else (0,)
                     )
-                    if is_rebalance:
-                        held_weights = token_weights
-                    event_records[execution_date] = {
-                        "weight": token_weights[0].cpu().numpy(),
-                        "state": state,
-                        "horizon_token": token_index,
-                    }
+                    for token_index in token_indices:
+                        execution_date = execution_dates[token_index]
+                        if execution_date in event_records:
+                            continue
+                        token_weights = weights[sample_index, token_index].detach()
+                        is_rebalance = (
+                            not event_records
+                            or self.protocol != "sit"
+                            or execution_date in SIT_REBALANCE_DATE_SET
+                        )
+                        if is_rebalance and batch_size == 1:
+                            held_weights = token_weights.unsqueeze(0)
+                        event_records[execution_date] = {
+                            "weight": token_weights.cpu().numpy(),
+                            "state": state,
+                            "horizon_token": token_index,
+                        }
 
                 budget_errors.extend(
                     state["budget_residual"].detach().cpu().numpy().reshape(-1).tolist()
@@ -789,7 +976,12 @@ class EXP_KKT(Exp_Basic):
         diagnostics = {
             "Protocol": self.protocol,
             "LossMode": self.loss_mode,
+            "DecisionLayer": self.decision_layer,
+            "SoftmaxTemperature": self.temperature,
+            "RegretWeight": self.regret_weight,
             "CVaRVariant": str(getattr(self.args, "cvar_variant", "sit")),
+            "EntropyRegularization": self.entropy_regularization,
+            "EntropyEpsilon": self.entropy_epsilon,
             "TestLoss": float(np.mean(total_losses)) if total_losses else math.nan,
             "PredictionLoss": float(np.mean(prediction_losses))
             if prediction_losses else math.nan,

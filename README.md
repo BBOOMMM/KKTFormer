@@ -1,6 +1,6 @@
 # KKTFormer
 
-KKTFormer 是一个面向资产配置的端到端决策模型。模型先用 Transformer 提取时间和资产交互特征，再通过可微投资组合优化器得到初始仓位及近似 KKT 状态；这些 primal-dual 信息会被编码为多头注意力偏置，用于修正资产注意力和最终仓位。
+KKTFormer 是一个面向资产配置的端到端决策模型。模型先用 Transformer 提取时间和资产交互特征，再通过可微投资组合优化器得到初始仓位及近似 KKT 状态；这些 primal-dual 信息会被编码为多头注意力偏置，最终由独立的 softmax allocation head 直接生成组合仓位。
 
 本仓库同时保留了上游 Signature-Informed Transformer（SIT）的部分代码，用于公平对照。KKTFormer 的实验协议默认向 SIT 对齐，但模型输入、KKT 模块、约束和可微优化策略属于 KKTFormer。
 
@@ -27,9 +27,11 @@ multi-head low-rank KKT attention bias
         ↓
 KKT-conditioned Asset Attention
         ↓
-μ¹              (B,H,N)
+refined hidden ──→ μ¹ (diagnostic)
         ↓
-warm-start batched differentiable optimizer
+allocation logits
+        ↓
+temperature softmax
         ↓
 weights         (B,H,N)
         ↓
@@ -44,27 +46,27 @@ detach-VaR + softplus 实现保留为 `--cvar_variant smooth` 消融；SIT 协�
 和换手惩罚不混入该训练 loss。
 
 模型不使用收益预测 MSE 等 prediction loss。为防止无界 return head 通过任意放大
-`mu` 把 QP 退化为线性目标和单资产 corner solution，probe 与 final optimizer 前均默认执行
+`mu` 把 probe QP 退化为线性目标和单资产 corner solution，probe optimizer 前默认执行
 横截面 signal normalization：
 
 `z = (s - mean(s)) / (std(s) + eps)`，
 `mu = c * mean(diag(Sigma + eta I)) * z`。
 
 因此 alpha 的尺度与实际二次风险项一致，而不是由神经网络输出幅度决定。默认固定较小的
-`c=0.05`，避免可学习温度重新产生无界尺度自由度。训练梯度来自真实资产收益、组合仓位和
-CVaR 目标，并穿过 signal normalization、最终优化器、KKT-conditioned attention，以及
-第一阶段 probe optimizer。
+`c=0.05`。最终 allocation logits 使用独立 head，不对风险缩放后的 `mu` 直接做 softmax，
+避免仓位退化为近似等权。训练梯度来自真实资产收益、组合仓位和 CVaR 目标，并穿过
+softmax policy、KKT-conditioned attention 和第一阶段 probe optimizer。
 
 ### 三路输入
 
 每个 token 由三类特征融合：
 
 ```text
-log-return path → Linear(60, d_model)
-date features   → Linear(3, d_model)
-asset identity  → Embedding(N, d_model)
+log-return path → Linear(60, log_return_embed_dim)
+date features   → Linear(3, date_embed_dim)
+asset identity  → Embedding(N, asset_embed_dim)
 
-concat → Linear(3 × d_model, d_model)
+concat → Linear(log_return_embed_dim + date_embed_dim + asset_embed_dim, d_model)
 ```
 
 - `log_return_path`：`(B,H,N,W)`，默认 `W=60`。
@@ -81,14 +83,20 @@ concat → Linear(3 × d_model, d_model)
 
 ### KKT attention bias
 
-当前主方法的优化问题严格限定为 budget + box + quadratic risk，并可选加入二次换手惩罚：
+当前主方法的优化问题包含 budget + box + quadratic risk，并可选加入二次换手和熵正则：
 
 ```text
 min_w  0.5 wᵀQw - μᵀw + 0.5 ρ||w-w_prev||²
+       + τ Σᵢ [(wᵢ+ε)log(wᵢ+ε) - εlog ε]
 s.t.   1ᵀw = budget,  lower ≤ w ≤ upper
 ```
 
-因此 box dual 和 active-set Jacobian 都来自同一个 QP。factor/industry bounds、L1 turnover cap、gross exposure、entropy 等仍保留为 `--feedback_mode none` 的扩展优化器能力，但在 `dual`/`jacobian` 下会被明确拒绝，不能被表述为当前 KKT state 的组成部分。交易成本只进入 realized decision loss 和评估，不进入主方法的 probe/final QP。
+box dual 和 active-set Jacobian 来自同一个凸优化问题。熵梯度
+`τ(log(w+ε)+1)` 进入 stationarity、dual 和 pressure；熵曲率
+`τ/(w+ε)` 进入 active-set Jacobian 的局部 Hessian。factor/industry bounds、
+L1 turnover cap 和 gross exposure 仍只属于 `--feedback_mode none` 的扩展能力，
+在 `dual`/`jacobian` 下会被明确拒绝。交易成本只进入 realized decision loss 和
+评估，不进入主方法的 probe/final optimizer。
 
 第一阶段优化器产生的每资产 KKT token 包含：
 
@@ -100,8 +108,9 @@ s.t.   1ᵀw = budget,  lower ≤ w ≤ upper
 
 即严格使用 7 维 token `z_i = [w_i, (Qw)_i, alpha_i, beta_i, I_i^L, I_i^U, p_i]`。raw factor exposure（market beta、momentum、volatility）不进入 KKT token，避免 `dual` 相对 `none` 获得额外市场特征。未来若主问题加入 factor constraints，应编码优化器给出的逐资产约束压力 `(A^T lambda)_i`，而不是原始暴露 `A_i`。
 
-诊断量严格区分 `reduced_gradient = Qw - mu + nu*1` 与完整的
-`kkt_stationarity_residual = Qw - mu + nu*1 - alpha + beta`。前者尚未计入
+诊断量严格区分
+`reduced_gradient = Qw - mu + rho*(w-w_prev) + tau*(log(w+eps)+1) + nu*1`
+与完整的 `kkt_stationarity_residual = reduced_gradient - alpha + beta`。前者尚未计入
 box dual，不能称为 stationarity residual。`test_diagnostics.csv` 会对每个
 probe 解先在资产维计算无穷范数，再报告
 `MeanProbeKKTStationarityResidualInf` 和
@@ -211,6 +220,9 @@ python run_kkt.py \
   --data_pool 30 \
   --window_size 60 \
   --horizon 20 \
+  --log_return_embed_dim 32 \
+  --date_embed_dim 32 \
+  --asset_embed_dim 32 \
   --d_model 32 \
   --n_heads 4 \
   --num_layers 1 \
@@ -218,8 +230,9 @@ python run_kkt.py \
   --feedback_mode dual \
   --kkt_bias_rank 4 \
   --probe_optimizer_iterations 5 \
-  --optimizer_iterations 10 \
-  --loss_mode cvar \
+  --optimizer_iterations 100 \
+  --loss_mode hybrid \
+  --regret_weight 0.1 \
   --cvar_alpha 0.95 \
   --cvar_variant sit \
   --batch_size 64 \
@@ -238,11 +251,18 @@ results_kkt/
 
 | 参数 | 默认值 | 说明 |
 | --- | ---: | --- |
+| `--log_return_embed_dim` | `32` | log-return path 经线性层后的维度 |
+| `--date_embed_dim` | `32` | date feature 经线性层后的维度 |
+| `--asset_embed_dim` | `32` | asset identity embedding 的维度 |
+| `--d_model` | `32` | 三路特征融合后投影到的 Transformer 隐状态维度 |
 | `--feedback_mode` | `dual` | `none`、`dual` 或 `jacobian` |
 | `--kkt_bias_rank` | `4` | 每个 head 的 KKT bias 低秩维度 |
 | `--probe_optimizer_iterations` | `5` | 第一阶段 probe optimizer 迭代数 |
-| `--optimizer_iterations` | `10` | warm-start 最终优化器迭代数 |
-| `--loss_mode` | `cvar` | 当前 sequence KKTFormer 只允许 CVaR |
+| `--decision_layer` | `softmax` | 最终组合层；`optimizer` 保留为旧版消融 |
+| `--temperature` | `1.0` | 最终 allocation softmax 的固定温度 |
+| `--optimizer_iterations` | `10` | optimizer 消融或 hybrid oracle 的迭代数 |
+| `--loss_mode` | `cvar` | `cvar` 或 `hybrid`（CVaR + decision regret） |
+| `--regret_weight` | `0.1` | hybrid 中的 `lambda_regret`；应只用验证集选择 |
 | `--cvar_alpha` | `0.95` | CVaR 置信水平 |
 | `--cvar_variant` | `sit` | `sit` 完全复刻原版 quantile + ReLU；`smooth` 为消融 |
 | `--cvar_temperature` | `1e-3` | 仅 `cvar_variant=smooth` 使用的平滑温度 |
@@ -253,19 +273,47 @@ results_kkt/
 | `--upper_bound` | `1.0` | 单资产仓位上界 |
 | `--lower_bound` | `0.0` | 单资产仓位下界 |
 | `--turnover_penalty` | `0.0` | 二次换手惩罚 |
+| `--entropy_regularization` | `0.0` | 熵正则强度 `tau`；支持 `none/dual/jacobian` |
+| `--entropy_epsilon` | `1e-4` | 熵梯度和 Hessian 在零权重附近的平滑参数 |
 | `--trade_cost_bps` | `0.0` | 测试交易成本；SIT 协议下不进入训练 loss 或 KKT QP |
 | `--max_turnover` | disabled | 最大 L1 换手约束，仅 `feedback_mode=none` |
 | `--gross_exposure_limit` | disabled | 总杠杆约束，仅 `feedback_mode=none` |
 | `--factor_lower/upper` | disabled | 风格暴露上下界，仅 `feedback_mode=none` |
 | `--industry_lower/upper` | disabled | 行业暴露上下界，仅 `feedback_mode=none` |
 
-最终优化器默认使用 10 次迭代，并从 probe 仓位 warm start。更高迭代数可用于收敛敏感性实验，例如：
+默认最终仓位由独立 allocation head 和 softmax 直接产生，只严格保证非负及权重和为 1。
+单资产上下界、总换手、风格/行业暴露等硬约束实验需要切回优化器消融：
 
 ```bash
---optimizer_iterations 100
+--decision_layer optimizer --optimizer_iterations 100
 ```
 
-但这会显著降低训练速度。默认配置下所有 `B×H` 优化问题均以一次张量批处理运行，不会在 Python 中逐 token 调用优化器。
+optimizer 模式会从 probe 仓位 warm start，并显著降低训练速度。默认 softmax 模式下，
+probe 的所有 `B×H` 优化问题仍以一次张量批处理运行，不会在 Python 中逐 token 调用优化器。
+
+### CVaR + 决策遗憾
+
+设置 `--loss_mode hybrid` 后，训练目标为：
+
+```text
+L = L_CVaR + regret_weight * L_regret
+```
+
+每个 causal horizon token 对应一笔组合决策。训练 oracle 使用该 token 的真实
+下一期资产收益，从预测权重的 detached 副本出发，在相同的风险矩阵、预算、
+box/factor/industry/换手约束下再次求解。预测组合与 oracle 组合随后由相同的
+realized portfolio objective 评价；oracle objective 被 detach，因此梯度只通过
+预测 softmax 组合流回预测网络。oracle 只在训练、验证和诊断中使用，不进入
+测试时的决策输入。
+
+例如：
+
+```bash
+--loss_mode hybrid --regret_weight 0.1
+```
+
+`L_regret` 与 CVaR 的数值尺度可能不同，建议只根据验证集搜索
+`regret_weight`，例如 `0.01/0.05/0.1/0.5/1.0`，不要按测试 Sharpe 选择。
 
 ## 扩展约束示例
 
@@ -277,6 +325,7 @@ python run_kkt.py \
   --data_pool 30 \
   --upper_bound 0.10 \
   --feedback_mode none \
+  --decision_layer optimizer \
   --max_turnover 0.50 \
   --factor_lower=-0.2,-0.2,-0.2 \
   --factor_upper=0.2,0.2,0.2 \
@@ -296,7 +345,7 @@ KKTFormer/
 ├── portfolio/optimizer_layer.py   # 批量可微投资组合优化器
 ├── portfolio/kkt_feedback.py      # primal-dual/Jacobian 状态提取
 ├── portfolio/losses.py            # 端到端 CVaR 与其他决策损失工具
-├── exp/exp_main_kkt.py            # 双阶段训练和 SIT 对齐评估
+├── exp/exp_main_kkt.py            # KKT-feedback + policy 训练和 SIT 对齐评估
 ├── data_provider/                 # Dataset、cache loader 和 DataLoader
 ├── utils/sit_protocol.py          # SIT split 与固定调仓日
 ├── run.py                         # 保留的上游 SIT 入口
@@ -323,7 +372,7 @@ python -m py_compile \
 
 ## 与 SIT 的关系
 
-SIT 使用 signature path interaction 作为 attention bias，并通过 softmax 仓位和真实收益优化 CVaR。KKTFormer 使用可微优化器产生的 primal-dual 最优性状态作为 cross-asset attention bias，并通过受约束仓位和真实收益优化 CVaR。
+SIT 使用 signature path interaction 作为 attention bias，并通过 softmax 仓位和真实收益优化 CVaR。KKTFormer 使用可微优化器产生的 primal-dual 最优性状态作为 cross-asset attention bias，再由独立的 softmax policy 根据该状态修正后的表示生成仓位并优化 CVaR。
 
 两者对比的核心约束是：数据切分、lookback、horizon、测试调仓日、交易成本和评估指标保持一致；输入表征、优化模块、约束设计和 KKT attention 属于 KKTFormer 的方法差异。
 

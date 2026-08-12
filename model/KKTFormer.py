@@ -16,6 +16,15 @@ class Model(nn.Module):
         self.horizon = int(configs.horizon)
         self.time_feat_dim = int(getattr(configs, "time_feat_dim", 3))
         self.d_model = int(configs.d_model)
+        self.log_return_embed_dim = int(
+            getattr(configs, "log_return_embed_dim", 32)
+        )
+        self.date_embed_dim = int(
+            getattr(configs, "date_embed_dim", 32)
+        )
+        self.asset_embed_dim = int(
+            getattr(configs, "asset_embed_dim", 32)
+        )
         self.n_heads = int(configs.n_heads)
         self.num_layers = int(configs.num_layers)
         self.ff_dim = int(configs.ff_dim)
@@ -31,6 +40,12 @@ class Model(nn.Module):
 
         if self.d_model % self.n_heads != 0:
             raise ValueError("d_model must be divisible by n_heads")
+        if min(
+            self.log_return_embed_dim,
+            self.date_embed_dim,
+            self.asset_embed_dim,
+        ) <= 0:
+            raise ValueError("input embedding dimensions must be positive")
         if self.signal_normalization not in {"risk", "none"}:
             raise ValueError("signal_normalization must be risk or none")
         if self.signal_scale <= 0:
@@ -38,10 +53,19 @@ class Model(nn.Module):
         if self.signal_normalization_epsilon <= 0:
             raise ValueError("signal_normalization_epsilon must be positive")
 
-        self.path_projection = nn.Linear(self.lookback_window, self.d_model)
-        self.date_projection = nn.Linear(self.time_feat_dim, self.d_model)
-        self.asset_embedding = nn.Embedding(self.num_assets, self.d_model)
-        self.concat_projection = nn.Linear(3 * self.d_model, self.d_model)
+        fusion_input_dim = (
+            self.log_return_embed_dim
+            + self.date_embed_dim
+            + self.asset_embed_dim
+        )
+        self.path_projection = nn.Linear(
+            self.lookback_window, self.log_return_embed_dim
+        )
+        self.date_projection = nn.Linear(self.time_feat_dim, self.date_embed_dim)
+        self.asset_embedding = nn.Embedding(
+            self.num_assets, self.asset_embed_dim
+        )
+        self.concat_projection = nn.Linear(fusion_input_dim, self.d_model)
         self.input_norm = nn.LayerNorm(self.d_model)
 
         temporal_layer = nn.TransformerEncoderLayer(
@@ -71,6 +95,15 @@ class Model(nn.Module):
         )
         self.final_norm = nn.LayerNorm(self.d_model)
         self.return_head = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model),
+            nn.GELU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.d_model, 1),
+        )
+        # Keep allocation logits separate from the risk-scaled return signal.
+        # The latter is deliberately tiny and would make a direct softmax
+        # nearly uniform; this head is free to learn the concentration scale.
+        self.allocation_head = nn.Sequential(
             nn.Linear(self.d_model, self.d_model),
             nn.GELU(),
             nn.Dropout(self.dropout),
@@ -129,6 +162,18 @@ class Model(nn.Module):
             )
         mu_hat = self.return_head(hidden).squeeze(-1)
         return mu_hat
+
+    def allocation_logits_from_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Produce unconstrained logits for a long-only simplex policy."""
+
+        if hidden.ndim < 3 or hidden.shape[-2:] != (
+            self.num_assets,
+            self.d_model,
+        ):
+            raise ValueError(
+                "hidden must have trailing shape (num_assets, d_model)"
+            )
+        return self.allocation_head(hidden).squeeze(-1)
 
     def normalize_signal(
         self, raw_signal: torch.Tensor, sigma: torch.Tensor
@@ -305,6 +350,9 @@ class DecisionAwareModel(nn.Module):
         self, raw_signal: torch.Tensor, sigma: torch.Tensor
     ) -> torch.Tensor:
         return self.backbone.normalize_signal(raw_signal, sigma)
+
+    def allocation_logits_from_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.backbone.allocation_logits_from_hidden(hidden)
 
     def refine(
         self,

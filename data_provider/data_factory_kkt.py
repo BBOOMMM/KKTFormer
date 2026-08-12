@@ -41,8 +41,12 @@ def _build_loader(dataset, flag, args):
         shuffle = False
         drop_last = False
     elif flag == "test":
-        # Keeping test batches at one makes date/position export deterministic.
-        batch_size = 1
+        # Test export supports batched contexts. Stateful portfolio paths stay
+        # at one because the next decision consumes the previous allocation.
+        configured = getattr(args, "test_batch_size", None)
+        batch_size = args.batch_size if configured is None else configured
+        if batch_size <= 0:
+            raise ValueError("test_batch_size must be positive")
         shuffle = False
         drop_last = False
     else:
