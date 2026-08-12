@@ -95,7 +95,7 @@ cvar_variant="sit"                # sit | smooth
 cvar_temperature=1e-3
 kkt_bias_rank=4
 prediction_weight=0.1
-temperature=1.0
+temperature=2.0
 
 # -----------------------------------------------------------------------------
 # Training and hardware
