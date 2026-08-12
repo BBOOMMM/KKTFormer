@@ -14,6 +14,7 @@ half-space and L1-ball projections.  All iterations are fixed and implemented
 with PyTorch operations, so the layer remains usable inside training.
 """
 
+import math
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -230,6 +231,7 @@ class DifferentiablePortfolioOptimizer(nn.Module):
         bisection_steps: int = 64,
         step_size: Optional[float] = None,
         constraint_projection_iterations: int = 20,
+        entropy_epsilon: float = 1e-4,
     ) -> None:
         super().__init__()
         if num_iterations <= 0:
@@ -238,11 +240,14 @@ class DifferentiablePortfolioOptimizer(nn.Module):
             raise ValueError("projection iteration counts must be positive")
         if step_size is not None and step_size <= 0:
             raise ValueError("step_size must be positive")
+        if not math.isfinite(float(entropy_epsilon)) or entropy_epsilon <= 0:
+            raise ValueError("entropy_epsilon must be finite and positive")
         self.problem = problem
         self.num_iterations = int(num_iterations)
         self.bisection_steps = int(bisection_steps)
         self.step_size = None if step_size is None else float(step_size)
         self.constraint_projection_iterations = int(constraint_projection_iterations)
+        self.entropy_epsilon = float(entropy_epsilon)
 
     def _flatten_asset_tensor(
         self,
@@ -500,7 +505,13 @@ class DifferentiablePortfolioOptimizer(nn.Module):
                 corrections[:, set_index] = shifted - z
         return z
 
-    def _step_size_for(self, q, transaction_cost_rate, transaction_cost_smoothing):
+    def _step_size_for(
+        self,
+        q,
+        transaction_cost_rate,
+        transaction_cost_smoothing,
+        entropy_regularization=0.0,
+    ):
         if self.step_size is not None:
             eigenvalues = torch.linalg.eigvalsh(q)
             if (eigenvalues[..., 0] <= 0).any():
@@ -512,7 +523,14 @@ class DifferentiablePortfolioOptimizer(nn.Module):
         if (eigenvalues[..., 0] <= 0).any():
             raise ValueError("Sigma + eta I + turnover penalty must be positive definite")
         smooth_lipschitz = transaction_cost_rate / transaction_cost_smoothing
-        return 0.95 / (eigenvalues[..., -1] + smooth_lipschitz).clamp_min(1e-8)
+        # The smoothed entropy gradient has local Lipschitz constant
+        # ``tau / entropy_epsilon``.  Include it in the step-size bound so a
+        # non-zero entropy coefficient does not destabilise the projected
+        # gradient iterations near the lower boundary.
+        entropy_lipschitz = float(entropy_regularization) / self.entropy_epsilon
+        return 0.95 / (
+            eigenvalues[..., -1] + smooth_lipschitz + entropy_lipschitz
+        ).clamp_min(1e-8)
 
     def forward(
         self,
@@ -534,11 +552,19 @@ class DifferentiablePortfolioOptimizer(nn.Module):
         transaction_cost_smoothing: float = 1e-4,
         max_turnover=None,
         gross_exposure_limit=None,
+        entropy_regularization: float = 0.0,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Solve the constrained portfolio problem and return diagnostics."""
 
         if turnover_penalty < 0:
             raise ValueError("turnover_penalty cannot be negative")
+        entropy_regularization = float(entropy_regularization)
+        if not math.isfinite(entropy_regularization) or entropy_regularization < 0:
+            raise ValueError("entropy_regularization must be finite and non-negative")
+        if entropy_regularization != 0.0 and min(self.problem.lower_bounds) < 0:
+            raise ValueError(
+                "entropy_regularization requires non-negative portfolio weights"
+            )
         if transaction_cost_smoothing <= 0:
             raise ValueError("transaction_cost_smoothing must be positive")
         if budget_target is not None and float(budget_target) != self.problem.budget_target:
@@ -571,7 +597,12 @@ class DifferentiablePortfolioOptimizer(nn.Module):
         )
         if previous is None and (turnover_penalty != 0.0 or (cost_rate != 0).any()):
             raise ValueError("w_prev is required for turnover penalty and transaction cost")
-        step = self._step_size_for(q, cost_rate, transaction_cost_smoothing)
+        step = self._step_size_for(
+            q,
+            cost_rate,
+            transaction_cost_smoothing,
+            entropy_regularization=entropy_regularization,
+        )
 
         if initial is None:
             initial = previous
@@ -585,6 +616,14 @@ class DifferentiablePortfolioOptimizer(nn.Module):
         last_step_norm = torch.zeros(mu.shape[0], dtype=mu.dtype, device=mu.device)
         for _ in range(self.num_iterations):
             gradient = torch.bmm(q, weights.unsqueeze(-1)).squeeze(-1) - effective_mu
+            if entropy_regularization != 0.0:
+                # ``w log w`` has an unbounded derivative at zero.  The
+                # epsilon-smoothed form is numerically stable and keeps the
+                # optimizer differentiable at the lower bound.
+                safe_weights = weights + self.entropy_epsilon
+                gradient = gradient + entropy_regularization * (
+                    torch.log(safe_weights) + 1.0
+                )
             if previous is not None and (cost_rate != 0).any():
                 delta = weights - previous
                 gradient = gradient + cost_rate.unsqueeze(-1) * delta / torch.sqrt(
@@ -613,6 +652,8 @@ class DifferentiablePortfolioOptimizer(nn.Module):
             turnover_penalty=turnover_penalty,
             transaction_cost_rate=cost_rate if previous is not None else None,
             transaction_cost_smoothing=transaction_cost_smoothing,
+            entropy_regularization=entropy_regularization,
+            entropy_epsilon=self.entropy_epsilon,
         )
         residuals = self.problem.constraint_residuals(weights)
         factor_value = (
@@ -673,6 +714,15 @@ class DifferentiablePortfolioOptimizer(nn.Module):
             "turnover_penalty": (0.5 * float(turnover_penalty) * delta.square().sum(dim=-1)).reshape(original_batch_shape),
             "transaction_cost": actual_transaction_cost.reshape(original_batch_shape),
             "smooth_transaction_cost": smooth_transaction_cost.reshape(original_batch_shape),
+            "entropy": (-weights * torch.log(weights.clamp_min(self.entropy_epsilon))).sum(dim=-1).reshape(original_batch_shape),
+            "entropy_penalty": (
+                entropy_regularization
+                * (
+                    (weights + self.entropy_epsilon)
+                    * torch.log(weights + self.entropy_epsilon)
+                    - self.entropy_epsilon * math.log(self.entropy_epsilon)
+                ).sum(dim=-1)
+            ).reshape(original_batch_shape),
             "active_constraint_ratio": active_ratio.reshape(original_batch_shape),
             "net_exposure": weights.sum(dim=-1).reshape(original_batch_shape),
             "gross_exposure": weights.abs().sum(dim=-1).reshape(original_batch_shape),

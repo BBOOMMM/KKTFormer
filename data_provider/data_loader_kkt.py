@@ -29,6 +29,8 @@ class Dataset_PortfolioContext(Dataset):
         config: Optional[PortfolioContextConfig] = None,
         pred_start: Optional[Union[str, pd.Timestamp]] = None,
         pred_end: Optional[Union[str, pd.Timestamp]] = None,
+        execution_dates=None,
+        allow_incomplete_future: bool = False,
         cache_path: Optional[Union[str, bytes]] = None,
     ) -> None:
         super().__init__()
@@ -45,6 +47,8 @@ class Dataset_PortfolioContext(Dataset):
                 config,
                 start_date=pred_start,
                 end_date=pred_end,
+                execution_dates=execution_dates,
+                allow_incomplete_future=allow_incomplete_future,
             )
 
         self._validate_context()
@@ -118,6 +122,10 @@ class Dataset_PortfolioContext(Dataset):
             "decision_date": decision_date,
             "future_dates": future_dates,
         }
+        if "future_valid_length" in context:
+            item["future_valid_length"] = torch.as_tensor(
+                context["future_valid_length"][index], dtype=torch.int64
+            )
         optional_tensor_fields = (
             "factor_lower",
             "factor_upper",

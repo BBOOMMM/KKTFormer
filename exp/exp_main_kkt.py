@@ -22,21 +22,28 @@ from portfolio import (
     compute_kkt_state,
 )
 from utils.tools import EarlyStopping, adjust_learning_rate
+from utils.sit_protocol import SIT_REBALANCE_DATE_SET, SIT_TEST_RANGE
 
 
 class EXP_KKT(Exp_Basic):
     """KKTFormer-v0 experiment: prediction loss + constrained allocation."""
 
     def __init__(self, args):
+        self.protocol = str(getattr(args, "protocol", "sit")).lower()
+        if self.protocol not in {"sit", "native"}:
+            raise ValueError("protocol must be one of sit or native")
         self.feedback_mode = str(getattr(args, "feedback_mode", "none")).lower()
         if self.feedback_mode not in {"none", "dual", "jacobian"}:
             raise ValueError("feedback_mode must be one of none, dual, jacobian")
         super().__init__(args)
+        problem_rebalance_frequency = (
+            1 if self.protocol == "sit" else args.rebalance_frequency
+        )
         self.problem = MinimalPortfolioProblem(
             num_assets=args.data_pool,
             lookback_window=args.window_size,
             horizon=args.horizon,
-            rebalance_frequency=args.rebalance_frequency,
+            rebalance_frequency=problem_rebalance_frequency,
             eta=args.eta,
             upper_bound=args.upper_bound,
             lower_bound=getattr(args, "lower_bound", 0.0),
@@ -49,7 +56,12 @@ class EXP_KKT(Exp_Basic):
             constraint_projection_iterations=getattr(
                 args, "constraint_projection_iterations", 20
             ),
+            entropy_epsilon=getattr(args, "entropy_epsilon", 1e-4),
         )
+        self.entropy_regularization = float(
+            getattr(args, "entropy_regularization", 0.0)
+        )
+        self.entropy_epsilon = float(getattr(args, "entropy_epsilon", 1e-4))
         self.turnover_penalty = float(getattr(args, "turnover_penalty", 0.0))
         self.transaction_cost_smoothing = float(
             getattr(args, "transaction_cost_smoothing", 1e-4)
@@ -159,6 +171,7 @@ class EXP_KKT(Exp_Basic):
             "transaction_cost_smoothing": self.transaction_cost_smoothing,
             "max_turnover": self.max_turnover,
             "gross_exposure_limit": self.gross_exposure_limit,
+            "entropy_regularization": self.entropy_regularization,
         }
 
         model_core = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
@@ -209,6 +222,8 @@ class EXP_KKT(Exp_Basic):
             transaction_cost_rate=transaction_cost_rate,
             turnover_penalty=self.turnover_penalty,
             transaction_cost_smoothing=self.transaction_cost_smoothing,
+            entropy_regularization=self.entropy_regularization,
+            entropy_epsilon=self.entropy_epsilon,
         )
         utility_loss = utility_batch.mean()
 
@@ -245,6 +260,8 @@ class EXP_KKT(Exp_Basic):
                 transaction_cost_rate=transaction_cost_rate,
                 turnover_penalty=self.turnover_penalty,
                 transaction_cost_smoothing=self.transaction_cost_smoothing,
+                entropy_regularization=self.entropy_regularization,
+                entropy_epsilon=self.entropy_epsilon,
             )
             regret_loss = regret_batch.mean()
         else:
@@ -274,6 +291,8 @@ class EXP_KKT(Exp_Basic):
             "regret_loss": regret_loss,
             "mean_return_loss": utility_components["return_loss"].mean(),
             "risk_loss": utility_components["risk_loss"].mean(),
+            "entropy": utility_components["entropy"].mean(),
+            "entropy_penalty": utility_components["entropy_penalty"].mean(),
             "transaction_cost": utility_components["transaction_cost"].mean(),
             "cvar_var": cvar_components["var"].mean(),
             "oracle_objective": regret_components["oracle_objective"].mean(),
@@ -403,24 +422,32 @@ class EXP_KKT(Exp_Basic):
         daily_returns = daily_returns.dropna().sort_index()
         if daily_returns.empty:
             raise RuntimeError("no daily portfolio returns were generated")
-        equity = (1.0 + daily_returns).cumprod()
+        returns = daily_returns.to_numpy(dtype=float)
+        equity = np.cumprod(1.0 + returns)
         annual_factor = 252.0
-        volatility = float(daily_returns.std(ddof=1) * math.sqrt(annual_factor))
+        volatility_daily = float(np.std(returns))
         sharpe = float(
-            daily_returns.mean() / (daily_returns.std(ddof=1) + 1e-12)
-            * math.sqrt(annual_factor)
+            returns.mean() / (volatility_daily + 1e-12) * math.sqrt(annual_factor)
         )
-        years = len(daily_returns) / annual_factor
-        terminal = float(equity.iloc[-1])
-        annual_return = float(terminal ** (1.0 / years) - 1.0) if terminal > 0 else math.nan
-        drawdown = equity / equity.cummax() - 1.0
+        negative_returns = returns[returns < 0]
+        negative_std = float(np.std(negative_returns)) if negative_returns.size else math.nan
+        sortino = float(
+            returns.mean() / (negative_std + 1e-12) * math.sqrt(annual_factor)
+        )
+        peak = np.maximum.accumulate(equity)
+        max_drawdown = float(np.max((peak - equity) / (peak + 1e-12)))
+        final_wealth_factor = float(equity[-1])
+        annual_return = float(
+            final_wealth_factor ** (annual_factor / len(returns)) - 1.0
+        )
         return {
-            "TotalReturn": float(terminal - 1.0),
-            "AnnualReturn": annual_return,
-            "AnnualVolatility": volatility,
             "Sharpe": sharpe,
-            "MaxDrawdown": float(drawdown.min()),
-            "NumDailyObservations": float(len(daily_returns)),
+            "Sortino": sortino,
+            "MaxDrawdown": max_drawdown,
+            "AnnualReturn": annual_return,
+            "AnnualVol": float(volatility_daily * math.sqrt(annual_factor)),
+            "FinalWealthFactor": final_wealth_factor,
+            "WinRate": float((returns > 0).mean()),
         }
 
     def _hold_last_position_returns(
@@ -466,6 +493,15 @@ class EXP_KKT(Exp_Basic):
         ]
 
     def eval(self, setting, load=True):
+        """Evaluate with the released SIT execution protocol.
+
+        In the SIT protocol KKTFormer produces one optimizer decision for every
+        daily test context.  The initial prediction is executed immediately;
+        later predictions update the held portfolio only on SIT's fixed
+        rebalance dates.  Costs are charged on those execution dates exactly
+        as in ``exp_main.py``.
+        """
+
         if load:
             checkpoint = Path(self.args.checkpoints) / setting / "checkpoint.pth"
             if checkpoint.exists():
@@ -475,10 +511,14 @@ class EXP_KKT(Exp_Basic):
         self.model.eval()
         _, test_loader = self._get_data("test")
 
-        position_rows = []
-        daily_return_rows: List[Tuple[str, float]] = []
+        event_records = {}
         prediction_losses = []
-        turnover_values = []
+        total_losses = []
+        utility_losses = []
+        cvar_losses = []
+        regret_losses = []
+        event_turnovers = []
+        event_transaction_costs = []
         budget_errors = []
         lower_violations = []
         upper_violations = []
@@ -487,45 +527,51 @@ class EXP_KKT(Exp_Basic):
         turnover_violations = []
         gross_violations = []
         active_constraint_ratios = []
-        transaction_costs = []
         net_exposures = []
         gross_exposures = []
         factor_exposure_values = []
         industry_exposure_values = []
-        total_losses = []
-        utility_losses = []
-        cvar_losses = []
-        regret_losses = []
-        asset_names = [f"asset_{i}" for i in range(self.args.data_pool)]
-        last_weight_for_tail = None
-        last_covered_date = None
-        self._sequential_previous = None
+        asset_names = [f"Asset_{i}" for i in range(self.args.data_pool)]
+        held_weights = torch.zeros(
+            1, self.args.data_pool, dtype=torch.float32, device=self.device
+        )
 
         with torch.no_grad():
             for batch in test_loader:
-                previous = self._sequential_previous if self.sequential_state else None
+                execution_dates = self._decode_dates(batch["future_dates"])
+                if not execution_dates:
+                    raise RuntimeError("test context has no execution date")
+                execution_date = execution_dates[0]
                 _, _, weights, state, _, details = self._forward_batch(
-                    batch, w_prev_override=previous
+                    batch, w_prev_override=held_weights
                 )
-                if self.sequential_state:
-                    self._sequential_previous = weights.detach()
-                total_losses.append(float(details["total_loss"].item()))
-                prediction_losses.append(float(details["prediction_loss"].item()))
-                utility_losses.append(float(details["utility_loss"].item()))
-                cvar_losses.append(float(details["cvar_loss"].item()))
-                regret_losses.append(float(details["regret_loss"].item()))
-                weights_np = weights.detach().cpu().numpy()
-                future_np = batch["future_returns"].numpy()
-                transaction_cost_np = (
-                    state["transaction_cost"].detach().cpu().numpy().reshape(-1)
+                is_rebalance = (
+                    not event_records
+                    or self.protocol != "sit"
+                    or execution_date in SIT_REBALANCE_DATE_SET
                 )
-                previous_np = (
-                    previous.detach().cpu().numpy()
-                    if previous is not None
-                    else batch["w_prev"].numpy()
+                if is_rebalance:
+                    held_weights = weights.detach()
+
+                # SIT has 1237 complete test windows.  The final H daily
+                # contexts are required to reproduce its 1257-day prediction
+                # and backtest grid, but their padded horizons must not enter
+                # test-loss averages.
+                valid_length = int(
+                    batch.get("future_valid_length", torch.tensor(self.args.horizon))
+                    .reshape(-1)[0]
+                    .item()
                 )
-                decision_dates = self._decode_dates(batch["decision_date"])
-                future_dates = batch["future_dates"]
+                if valid_length == self.args.horizon:
+                    total_losses.append(float(details["total_loss"].item()))
+                    prediction_losses.append(float(details["prediction_loss"].item()))
+                    utility_losses.append(float(details["utility_loss"].item()))
+                    cvar_losses.append(float(details["cvar_loss"].item()))
+                    regret_losses.append(float(details["regret_loss"].item()))
+                event_records[execution_date] = {
+                    "weight": weights[0].detach().cpu().numpy(),
+                    "state": state,
+                }
 
                 budget_errors.extend(
                     state["budget_residual"].detach().cpu().numpy().reshape(-1).tolist()
@@ -535,9 +581,6 @@ class EXP_KKT(Exp_Basic):
                 )
                 upper_violations.append(
                     float(state["upper_violation"].detach().cpu().numpy().max())
-                )
-                transaction_costs.extend(
-                    state["transaction_cost"].detach().cpu().numpy().reshape(-1).tolist()
                 )
                 net_exposures.extend(
                     state["net_exposure"].detach().cpu().numpy().reshape(-1).tolist()
@@ -579,45 +622,97 @@ class EXP_KKT(Exp_Basic):
                         float(np.abs(state["industry_exposure"].detach().cpu().numpy()).max())
                     )
 
-                for row_index, weight in enumerate(weights_np):
-                    decision_date = decision_dates[row_index]
-                    row = {"Date": decision_date}
-                    row.update({name: float(value) for name, value in zip(asset_names, weight)})
-                    position_rows.append(row)
-                    turnover_values.append(
-                        float(np.abs(weight - previous_np[row_index]).sum())
-                    )
+        if self.protocol == "sit":
+            evaluation_start, evaluation_end = SIT_TEST_RANGE
+        else:
+            evaluation_start = "2020-01-01"
+            evaluation_end = getattr(self.args, "evaluation_end_date", "2024-12-31")
 
-                    if isinstance(future_dates, list) and future_dates and isinstance(
-                        future_dates[0], (tuple, list)
-                    ):
-                        dates_for_sample = [item[row_index] for item in future_dates]
-                    else:
-                        dates_for_sample = self._decode_dates(future_dates)
-                    realized = future_np[row_index].dot(weight)
-                    # Charge the rebalance cost on the first holding day so
-                    # the reported equity curve uses the same convention as
-                    # the training objective and optimizer diagnostics.
-                    realized = realized.copy()
-                    realized[0] -= transaction_cost_np[row_index]
-                    for date, value in zip(dates_for_sample, realized):
-                        daily_return_rows.append((str(date), float(value)))
-                    last_weight_for_tail = weight.copy()
-                    last_covered_date = str(dates_for_sample[-1])
+        csv_path = Path(self.args.root_path) / self.args.data_path
+        prices = (
+            pd.read_csv(csv_path, parse_dates=["Date"])
+            .set_index("Date")
+            .iloc[:, : self.args.data_pool]
+            .sort_index()
+        )
+        start = pd.Timestamp(evaluation_start)
+        end = pd.Timestamp(evaluation_end)
+        start_position = int(prices.index.searchsorted(start, side="left"))
+        end_position = int(prices.index.searchsorted(end, side="right"))
+        if end_position <= start_position:
+            raise RuntimeError("invalid SIT evaluation price range")
+        # SIT labels the return P[t+1] / P[t] - 1 with date t.  A backward
+        # pct_change would shift every realized return by one day.
+        forward_returns = prices.shift(-1).divide(prices) - 1.0
+        daily_returns = forward_returns.loc[
+            (forward_returns.index >= start) & (forward_returns.index <= end)
+        ].dropna()
+        if self.protocol == "sit":
+            # The released SIT windows stop at the final date that still has a
+            # next-day price and belongs to the union of their H-step outputs.
+            available_prediction_dates = sorted(event_records)
+            if not available_prediction_dates:
+                raise RuntimeError("no KKT test predictions were generated")
+            last_prediction_date = pd.Timestamp(available_prediction_dates[-1])
+            daily_returns = daily_returns.loc[:last_prediction_date]
 
-        evaluation_end_date = getattr(self.args, "evaluation_end_date", "")
-        if (
-            evaluation_end_date
-            and last_weight_for_tail is not None
-            and last_covered_date is not None
-        ):
-            daily_return_rows.extend(
-                self._hold_last_position_returns(
-                    start_date=last_covered_date,
-                    end_date=evaluation_end_date,
-                    weights=last_weight_for_tail,
-                )
+        transaction_cost_bps = float(
+            getattr(self.args, "trade_cost_bps", 0.0)
+            if getattr(self.args, "transaction_cost_bps", None) is None
+            else self.args.transaction_cost_bps
+        )
+        cost_rate = transaction_cost_bps * 1e-4
+        initial_capital = 10_000.0
+        capital = initial_capital
+        current_w = None
+        previous_w = np.zeros(self.args.data_pool, dtype=float)
+        daily_return_rows: List[Tuple[str, float]] = []
+        position_rows = []
+        equity_curve = [capital]
+
+        for date, asset_return in daily_returns.iterrows():
+            date_string = date.strftime("%Y-%m-%d")
+            cost_cash = 0.0
+            turnover = 0.0
+            should_rebalance = current_w is None or (
+                self.protocol == "sit" and date_string in SIT_REBALANCE_DATE_SET
+            ) or (
+                self.protocol != "sit" and date_string in event_records
             )
+            if should_rebalance:
+                if date_string not in event_records:
+                    raise RuntimeError(
+                        f"missing KKT decision for SIT execution date {date_string}"
+                    )
+                current_w = event_records[date_string]["weight"].astype(float)
+                turnover = float(np.abs(current_w - previous_w).sum())
+                cost_cash = turnover * cost_rate * capital
+                previous_w = current_w.copy()
+
+            previous_capital = capital
+            pnl = float(np.dot(current_w, asset_return.to_numpy())) * previous_capital
+            pnl -= cost_cash
+            capital += pnl
+            daily_return = pnl / (previous_capital + 1e-12)
+            daily_return_rows.append((date_string, daily_return))
+            equity_curve.append(capital)
+            position_row = {
+                "Date": date_string,
+                "DailyPnL": pnl,
+                "Cost": cost_cash,
+                "Turnover": turnover if cost_cash > 0.0 else 0.0,
+                "CumulativeCapital": capital,
+            }
+            position_row.update(
+                {
+                    f"Weight_{name}": float(value)
+                    for name, value in zip(asset_names, current_w)
+                }
+            )
+            position_rows.append(position_row)
+            if turnover > 0.0 or cost_cash > 0.0:
+                event_turnovers.append(turnover)
+                event_transaction_costs.append(cost_rate * turnover)
 
         result_dir = Path(self.args.results_path) / setting
         result_dir.mkdir(parents=True, exist_ok=True)
@@ -635,40 +730,54 @@ class EXP_KKT(Exp_Basic):
         daily["Equity"] = (1.0 + daily["Return"]).cumprod()
         daily.to_csv(result_dir / "test_daily_returns.csv", index=False)
 
+        # Keep test_metrics.csv exactly compatible with SIT's seven reported
+        # metrics.  KKT-specific diagnostics are written separately so they
+        # do not change the baseline comparison table.
         metrics = self._portfolio_metrics(daily_series)
-        metrics.update(
-            {
-                "LossMode": self.loss_mode,
-                "TestLoss": float(np.mean(total_losses)),
-                "PredictionLoss": float(np.mean(prediction_losses)),
-                "UtilityLoss": float(np.mean(utility_losses)),
-                "CVaRLoss": float(np.mean(cvar_losses)),
-                "DecisionRegret": float(np.mean(regret_losses)),
-                "MeanTurnover": float(np.mean(turnover_values)),
-                "MaxAbsBudgetResidual": float(np.max(np.abs(budget_errors))),
-                "MaxLowerViolation": float(np.max(lower_violations)),
-                "MaxUpperViolation": float(np.max(upper_violations)),
-                "MeanTransactionCost": float(np.mean(transaction_costs)),
-                "MeanNetExposure": float(np.mean(net_exposures)),
-                "MeanGrossExposure": float(np.mean(gross_exposures)),
-                "MeanActiveConstraintRatio": float(np.mean(active_constraint_ratios)),
-                "EvaluationEndDate": str(evaluation_end_date),
-                "MaxTurnoverViolation": float(np.max(turnover_violations))
-                if turnover_violations else 0.0,
-                "MaxGrossExposureViolation": float(np.max(gross_violations))
-                if gross_violations else 0.0,
-                "MaxFactorExposureViolation": float(np.max(factor_violations))
-                if factor_violations else 0.0,
-                "MaxIndustryExposureViolation": float(np.max(industry_violations))
-                if industry_violations else 0.0,
-                "MaxFactorExposure": float(np.max(factor_exposure_values))
-                if factor_exposure_values else 0.0,
-                "MaxIndustryExposure": float(np.max(industry_exposure_values))
-                if industry_exposure_values else 0.0,
-                "SequentialState": bool(self.sequential_state),
-            }
-        )
+        diagnostics = {
+            "Protocol": self.protocol,
+            "LossMode": self.loss_mode,
+            "TestLoss": float(np.mean(total_losses)) if total_losses else math.nan,
+            "PredictionLoss": float(np.mean(prediction_losses))
+            if prediction_losses else math.nan,
+            "UtilityLoss": float(np.mean(utility_losses))
+            if utility_losses else math.nan,
+            "CVaRLoss": float(np.mean(cvar_losses)) if cvar_losses else math.nan,
+            "DecisionRegret": float(np.mean(regret_losses))
+            if regret_losses else math.nan,
+            "MeanTurnover": float(np.mean(event_turnovers))
+            if event_turnovers else 0.0,
+            "MaxAbsBudgetResidual": float(np.max(np.abs(budget_errors))),
+            "MaxLowerViolation": float(np.max(lower_violations)),
+            "MaxUpperViolation": float(np.max(upper_violations)),
+            "MeanTransactionCost": float(np.mean(event_transaction_costs))
+            if event_transaction_costs else 0.0,
+            "MeanNetExposure": float(np.mean(net_exposures)),
+            "MeanGrossExposure": float(np.mean(gross_exposures)),
+            "MeanActiveConstraintRatio": float(np.mean(active_constraint_ratios)),
+            "EvaluationEndDate": str(evaluation_end),
+            "MaxTurnoverViolation": float(np.max(turnover_violations))
+            if turnover_violations else 0.0,
+            "MaxGrossExposureViolation": float(np.max(gross_violations))
+            if gross_violations else 0.0,
+            "MaxFactorExposureViolation": float(np.max(factor_violations))
+            if factor_violations else 0.0,
+            "MaxIndustryExposureViolation": float(np.max(industry_violations))
+            if industry_violations else 0.0,
+            "MaxFactorExposure": float(np.max(factor_exposure_values))
+            if factor_exposure_values else 0.0,
+            "MaxIndustryExposure": float(np.max(industry_exposure_values))
+            if industry_exposure_values else 0.0,
+            "SequentialState": True,
+            "NumTestContexts": float(len(event_records)),
+            "NumCompleteHorizonContexts": float(len(total_losses)),
+            "NumDailyObservations": float(len(daily_series)),
+            "TotalReturn": float(metrics["FinalWealthFactor"] - 1.0),
+        }
         pd.DataFrame([metrics]).to_csv(result_dir / "test_metrics.csv", index=False)
+        pd.DataFrame([diagnostics]).to_csv(
+            result_dir / "test_diagnostics.csv", index=False
+        )
 
         plt.figure(figsize=(10, 4))
         plt.plot(daily["Date"], daily["Equity"], label="KKTFormer-v0")
@@ -679,5 +788,5 @@ class EXP_KKT(Exp_Basic):
         plt.savefig(result_dir / "test_equity_curve.png", dpi=150)
         plt.close()
         print(f"[Test] results saved to {result_dir}")
-        print(metrics)
+        print({**metrics, **diagnostics})
         return metrics

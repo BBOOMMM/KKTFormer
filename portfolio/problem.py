@@ -12,6 +12,7 @@ portfolio-decision axis.
 """
 
 from dataclasses import dataclass
+import math
 from numbers import Real
 from typing import Sequence, Tuple, Union
 
@@ -229,11 +230,17 @@ class MinimalPortfolioProblem:
         turnover_penalty: float = 0.0,
         transaction_cost_rate: torch.Tensor = None,
         transaction_cost_smoothing: float = 1e-6,
+        entropy_regularization: float = 0.0,
+        entropy_epsilon: float = 1e-4,
     ) -> torch.Tensor:
-        """Evaluate the v0 quadratic objective without solving it.
+        """Evaluate the portfolio objective without solving it.
 
         Broadcasting is supported for a shared ``sigma`` with shape ``(N, N)``
         or per-sample covariance with shape ``(..., N, N)``.
+
+        The optional entropy term is the smoothed version of
+        ``tau * sum_i w_i log(w_i)``.  It encourages diversified weights while
+        remaining finite at the long-only lower boundary.
         """
 
         self.validate_mu(mu_hat)
@@ -250,6 +257,14 @@ class MinimalPortfolioProblem:
                 f"weights must have trailing shape ({self.num_assets},), got "
                 f"{tuple(weights.shape)}"
             )
+        if not math.isfinite(float(entropy_regularization)) or entropy_regularization < 0:
+            raise ValueError("entropy_regularization must be finite and non-negative")
+        if not math.isfinite(float(entropy_epsilon)) or entropy_epsilon <= 0:
+            raise ValueError("entropy_epsilon must be finite and positive")
+        if entropy_regularization != 0.0 and (weights < 0).any():
+            raise ValueError(
+                "entropy_regularization requires non-negative portfolio weights"
+            )
 
         eye = torch.eye(
             self.num_assets, dtype=sigma.dtype, device=sigma.device
@@ -260,6 +275,14 @@ class MinimalPortfolioProblem:
         risk = 0.5 * torch.einsum("...i,...ij,...j->...", weights, q, weights)
         linear = -(weights * mu_hat).sum(dim=-1)
         objective = risk + linear
+        if entropy_regularization != 0.0:
+            epsilon = float(entropy_epsilon)
+            safe_weights = weights + epsilon
+            entropy = (
+                safe_weights * torch.log(safe_weights)
+                - epsilon * math.log(epsilon)
+            ).sum(dim=-1)
+            objective = objective + float(entropy_regularization) * entropy
         if turnover_penalty < 0:
             raise ValueError("turnover_penalty cannot be negative")
         if transaction_cost_smoothing <= 0:

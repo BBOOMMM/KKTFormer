@@ -9,10 +9,12 @@ only quantities that are independent of the neural-network parameters:
 * the future simple-return path used only as a training/evaluation target;
 * static constraint and transaction-cost parameters.
 
-For a decision index ``t`` the historical price window is
-``prices[t-lookback_window : t+1]``.  The first future return is
-``prices[t+1] / prices[t] - 1``.  Thus the context never uses a price after
-``t`` to construct ``Sigma_t`` or ``B_t``.
+For a decision index ``t`` the historical price window contains the ``W``
+prices ending at ``t``.  The first prediction/execution date is ``t+1`` and
+its return is ``prices[t+1] / prices[t] - 1``.  Thus the context never uses a
+price after ``t`` to construct ``Sigma_t`` or ``B_t``.  This date convention
+matches SIT: a prediction for execution date ``R`` observes data through
+``R-1`` and evaluates the return from ``R`` to ``R+1``.
 """
 
 from dataclasses import dataclass, replace
@@ -285,12 +287,16 @@ def _build_context_at_frame(
     frame: pd.DataFrame,
     decision_index: int,
     config: PortfolioContextConfig,
+    allow_incomplete_future: bool = False,
 ) -> Dict[str, np.ndarray]:
     """Build one point-in-time context at an integer DataFrame index.
 
-    ``decision_index`` denotes the last observed price.  It is not a future
-    return index.  The first target return starts at this price and ends at
-    the next available price.
+    ``decision_index`` denotes the last observed price.  The first target
+    return starts at the next price, so a context anchored at ``R-1`` has
+    execution date ``R``.  When ``allow_incomplete_future`` is true, the
+    target path is zero-padded for the final test decisions; the first target
+    remains an actual observed return and is the only one used by the SIT
+    compatible backtest.
     """
 
     values = frame.to_numpy(dtype=np.float64)
@@ -306,14 +312,45 @@ def _build_context_at_frame(
     if not isinstance(decision_index, (int, np.integer)):
         raise TypeError("decision_index must be an integer")
     decision_index = int(decision_index)
-    if decision_index < W:
+    if decision_index < W - 1:
         raise IndexError("not enough history before decision_index")
-    if decision_index + H >= len(frame):
+    first_future_index = decision_index + 1
+    if first_future_index + 1 >= len(frame):
         raise IndexError("not enough future prices after decision_index")
 
-    historical_prices = values[decision_index - W : decision_index + 1]
-    future_prices = values[decision_index : decision_index + H + 1]
+    historical_prices = values[decision_index - W + 1 : decision_index + 1]
+    future_end_exclusive = min(first_future_index + H + 1, len(frame))
+    future_prices = values[first_future_index:future_end_exclusive]
+    future_length = future_prices.shape[0] - 1
+    if future_length < 1:
+        raise IndexError("not enough future prices after decision_index")
+    if future_length < H and not allow_incomplete_future:
+        raise IndexError("not enough complete future horizon after decision_index")
+
+    # SIT's path input contains W observed prices.  KKTFormer consumes a
+    # return channel, so preserve the same W-step tensor shape by prepending a
+    # neutral return to the W-1 actual historical log returns.
     historical_log_returns = _log_returns(historical_prices).astype(np.float32)
+    historical_log_returns = np.concatenate(
+        [np.zeros((1, n_assets), dtype=np.float32), historical_log_returns],
+        axis=0,
+    )
+    future_returns = _future_simple_returns(future_prices)
+    if future_length < H:
+        future_returns = np.concatenate(
+            [future_returns, np.zeros((H - future_length, n_assets), dtype=np.float32)],
+            axis=0,
+        )
+    future_dates = frame.index[first_future_index:future_end_exclusive].to_numpy(
+        dtype="datetime64[ns]"
+    )
+    if future_dates.shape[0] < H + 1:
+        # The loader expects a fixed H-date field.  Padded dates are never
+        # used for realized test returns; they only keep the custom KKT loss
+        # shape valid for the final incomplete context.
+        future_dates = np.concatenate(
+            [future_dates, np.repeat(future_dates[-1:], H + 1 - future_dates.shape[0])]
+        )
 
     factor_lower = _normalise_bound_vector(
         config.factor_lower, len(config.factor_names), "factor_lower"
@@ -324,7 +361,7 @@ def _build_context_at_frame(
 
     result = {
         "market_window": historical_log_returns[..., None],  # (W, N, 1)
-        "future_returns": _future_simple_returns(future_prices),  # (H, N)
+        "future_returns": future_returns,  # (H, N), zero-padded only if allowed
         "Sigma": estimate_covariance(
             historical_prices, epsilon=config.covariance_epsilon
         ),
@@ -334,8 +371,8 @@ def _build_context_at_frame(
         ),
         "w_prev": _equal_weight(n_assets),
         "decision_date": np.datetime64(frame.index[decision_index], "ns"),
-        "future_dates": frame.index[decision_index + 1 : decision_index + H + 1]
-        .to_numpy(dtype="datetime64[ns]"),
+        "future_dates": future_dates[:H],
+        "future_valid_length": np.int64(future_length),
         "lower_bounds": np.asarray(config.problem.lower_bounds, dtype=np.float32),
         "upper_bounds": np.asarray(config.problem.upper_bounds, dtype=np.float32),
         "budget_target": np.float32(config.problem.budget_target),
@@ -370,16 +407,19 @@ def build_context_at(
     prices: pd.DataFrame,
     decision_index: int,
     config: PortfolioContextConfig,
+    allow_incomplete_future: bool = False,
 ) -> Dict[str, np.ndarray]:
     """Build one point-in-time context at an integer DataFrame index.
 
-    ``decision_index`` denotes the last observed price.  It is not a future
-    return index.  The first target return starts at this price and ends at
-    the next available price.
+    ``decision_index`` denotes the last observed price.  The first target
+    return starts on the next execution date.
     """
 
     return _build_context_at_frame(
-        _as_price_frame(prices), decision_index=decision_index, config=config
+        _as_price_frame(prices),
+        decision_index=decision_index,
+        config=config,
+        allow_incomplete_future=allow_incomplete_future,
     )
 
 
@@ -388,13 +428,22 @@ def _select_decision_indices(
     config: PortfolioContextConfig,
     start_date: Optional[Union[str, pd.Timestamp]] = None,
     end_date: Optional[Union[str, pd.Timestamp]] = None,
+    allow_incomplete_future: bool = False,
 ) -> np.ndarray:
-    """Select regularly spaced, valid decision indices in a date range."""
+    """Select regularly spaced decision indices in a date range.
+
+    Date filtering is applied to the future execution path, not the decision
+    date.  This is important for SIT compatibility: the decision at ``R-1``
+    belongs to the prediction/return date ``R``.
+    """
 
     W = config.problem.lookback_window
     H = config.problem.horizon
-    first = W
-    last_exclusive = len(frame) - H
+    first = W - 1
+    last_exclusive = len(frame) - 2
+    if not allow_incomplete_future:
+        # H returns starting at t+1 require prices through t+H+1.
+        last_exclusive = len(frame) - H - 1
     if first >= last_exclusive:
         raise ValueError("price data is shorter than lookback_window + horizon")
 
@@ -405,11 +454,13 @@ def _select_decision_indices(
     # future horizon to remain inside the split.
     end = pd.Timestamp(end_date) if end_date is not None else dates[-1]
     candidates = np.arange(first, last_exclusive, dtype=np.int64)
-    candidates = candidates[
-        (dates[candidates] >= start)
-        & (dates[candidates] <= end)
-        & (dates[candidates + H] <= end)
-    ]
+    candidates = candidates[(dates[candidates + 1] >= start)]
+    if allow_incomplete_future:
+        candidates = candidates[dates[candidates + 1] <= end]
+    else:
+        candidates = candidates[
+            (dates[candidates + H] <= end)
+        ]
     if len(candidates) == 0:
         raise ValueError("no valid decision dates in the requested range")
 
@@ -417,21 +468,77 @@ def _select_decision_indices(
     return candidates[:: config.problem.rebalance_frequency]
 
 
+def _decision_indices_for_dates(
+    frame: pd.DataFrame,
+    execution_dates: Sequence[Union[str, pd.Timestamp]],
+    config: PortfolioContextConfig,
+    allow_incomplete_future: bool = False,
+) -> np.ndarray:
+    """Map execution dates ``R`` to KKT decision indices ``R-1``."""
+
+    dates = frame.index
+    indices = []
+    for execution_date in execution_dates:
+        execution_date = pd.Timestamp(execution_date)
+        location = dates.get_indexer([execution_date])[0]
+        if location < 0:
+            raise ValueError(f"execution date {execution_date.date()} is not in the data")
+        decision_index = int(location) - 1
+        if decision_index < config.problem.lookback_window - 1:
+            raise ValueError(
+                f"execution date {execution_date.date()} has insufficient history"
+            )
+        if decision_index + 2 >= len(frame):
+            raise ValueError(
+                f"execution date {execution_date.date()} has no following return"
+            )
+        if not allow_incomplete_future and decision_index + config.problem.horizon + 1 >= len(frame):
+            raise ValueError(
+                f"execution date {execution_date.date()} has an incomplete future horizon"
+            )
+        indices.append(decision_index)
+    if not indices:
+        raise ValueError("execution_dates must contain at least one date")
+    return np.asarray(indices, dtype=np.int64)
+
+
 def build_contexts(
     prices: pd.DataFrame,
     config: PortfolioContextConfig,
     start_date: Optional[Union[str, pd.Timestamp]] = None,
     end_date: Optional[Union[str, pd.Timestamp]] = None,
+    execution_dates: Optional[Sequence[Union[str, pd.Timestamp]]] = None,
+    allow_incomplete_future: bool = False,
 ) -> Dict[str, np.ndarray]:
     """Build and stack contexts for one train/validation/test split."""
 
     frame = _as_price_frame(prices)
-    indices = _select_decision_indices(frame, config, start_date, end_date)
+    if execution_dates is None:
+        indices = _select_decision_indices(
+            frame,
+            config,
+            start_date,
+            end_date,
+            allow_incomplete_future=allow_incomplete_future,
+        )
+    else:
+        indices = _decision_indices_for_dates(
+            frame,
+            execution_dates,
+            config,
+            allow_incomplete_future=allow_incomplete_future,
+        )
     # The public builder validates and copies a DataFrame for safety.  Avoid
     # repeating that work for every sample in a split; all samples use this
     # already validated frame.
     samples = [
-        _build_context_at_frame(frame, int(index), config) for index in indices
+        _build_context_at_frame(
+            frame,
+            int(index),
+            config,
+            allow_incomplete_future=allow_incomplete_future,
+        )
+        for index in indices
     ]
 
     dynamic_keys = {
@@ -442,6 +549,7 @@ def build_contexts(
         "w_prev",
         "decision_date",
         "future_dates",
+        "future_valid_length",
     }
     context: Dict[str, np.ndarray] = {
         key: np.stack([sample[key] for sample in samples], axis=0)
@@ -493,6 +601,11 @@ def build_context_cache_from_csv(
     data_pool: Optional[int] = None,
     split_ranges: Optional[Dict[str, Tuple[str, str]]] = None,
     rebalance_frequencies: Optional[Dict[str, int]] = None,
+    execution_dates_by_split: Optional[
+        Dict[str, Sequence[Union[str, pd.Timestamp]]]
+    ] = None,
+    allow_incomplete_future_splits: Optional[Sequence[str]] = None,
+    protocol: str = "sit",
 ) -> Dict[str, Path]:
     """Build train/val/test archives from a Date-indexed price CSV.
 
@@ -502,6 +615,9 @@ def build_context_cache_from_csv(
     """
 
     frame = pd.read_csv(csv_path, parse_dates=["Date"]).set_index("Date")
+    protocol = str(protocol).lower()
+    if protocol not in {"sit", "native"}:
+        raise ValueError("protocol must be one of sit or native")
     if data_pool is not None:
         if data_pool <= 0 or data_pool > frame.shape[1]:
             raise ValueError("data_pool must be between 1 and the number of assets")
@@ -539,14 +655,43 @@ def build_context_cache_from_csv(
     output_dir = Path(output_dir)
     output_paths: Dict[str, Path] = {}
     for split, (start_date, end_date) in split_ranges.items():
+        split_frame = frame
+        split_execution_dates = (execution_dates_by_split or {}).get(split)
+        split_allow_incomplete = split in set(allow_incomplete_future_splits or ())
+        if protocol == "sit":
+            # Match data_factory.py: train/val use only their own rows, while
+            # test receives W+1 rows of context before the test start.
+            if split in {"train", "val"}:
+                split_frame = frame.loc[start_date:end_date]
+            elif split == "test":
+                test_start_index = int(
+                    frame.index.searchsorted(pd.Timestamp(start_date), side="left")
+                )
+                context_start_index = test_start_index - (
+                    config.problem.lookback_window + 1
+                )
+                if context_start_index < 0:
+                    raise ValueError("not enough pre-test history for SIT warm-up")
+                split_frame = frame.iloc[context_start_index:].loc[:end_date]
+                split_allow_incomplete = True
+
         split_config = replace(
             config,
             problem=replace(
                 config.problem,
-                rebalance_frequency=rebalance_frequencies[split],
+                rebalance_frequency=(
+                    1 if protocol == "sit" else rebalance_frequencies[split]
+                ),
             ),
         )
-        context = build_contexts(frame, split_config, start_date, end_date)
+        context = build_contexts(
+            split_frame,
+            split_config,
+            start_date if protocol != "sit" or split == "test" else None,
+            end_date if protocol != "sit" or split == "test" else None,
+            execution_dates=split_execution_dates,
+            allow_incomplete_future=split_allow_incomplete,
+        )
         path = output_dir / f"{split}.npz"
         save_context_cache(context, path)
         output_paths[split] = path

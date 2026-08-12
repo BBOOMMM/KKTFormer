@@ -1,5 +1,6 @@
 """Decision-focused losses for KKTFormer stage 5."""
 
+import math
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -37,6 +38,8 @@ def portfolio_objective_loss(
     transaction_cost_rate: Optional[torch.Tensor] = None,
     turnover_penalty: float = 0.0,
     transaction_cost_smoothing: float = 1e-4,
+    entropy_regularization: float = 0.0,
+    entropy_epsilon: float = 1e-4,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Evaluate the realized portfolio objective for one decision.
 
@@ -59,9 +62,20 @@ def portfolio_objective_loss(
         raise ValueError("weights and future_returns have incompatible batch shapes")
 
     realized_mu = problem.aggregate_future_returns(future_returns)
-    objective_without_cost = problem.objective(weights, realized_mu, sigma)
+    objective_without_cost = problem.objective(
+        weights,
+        realized_mu,
+        sigma,
+        entropy_regularization=entropy_regularization,
+        entropy_epsilon=entropy_epsilon,
+    )
     return_loss = -(weights * realized_mu).sum(dim=-1)
-    risk_loss = objective_without_cost - return_loss
+    epsilon = float(entropy_epsilon)
+    safe_weights = weights + epsilon
+    entropy_penalty = float(entropy_regularization) * (
+        safe_weights * torch.log(safe_weights) - epsilon * math.log(epsilon)
+    ).sum(dim=-1)
+    risk_loss = objective_without_cost - return_loss - entropy_penalty
 
     batch_size = int(weights.numel() // problem.num_assets)
     flat_weights = weights.reshape(batch_size, problem.num_assets)
@@ -94,6 +108,10 @@ def portfolio_objective_loss(
     components = {
         "return_loss": return_loss.reshape(batch_size),
         "risk_loss": risk_loss.reshape(batch_size),
+        "entropy": (
+            -weights * torch.log(weights.clamp_min(float(entropy_epsilon)))
+        ).sum(dim=-1).reshape(batch_size),
+        "entropy_penalty": entropy_penalty.reshape(batch_size),
         "turnover": turnover,
         "transaction_cost": cost,
         "smooth_transaction_cost": smooth_transaction_cost,
@@ -113,6 +131,8 @@ def decision_regret_loss(
     transaction_cost_rate: Optional[torch.Tensor] = None,
     turnover_penalty: float = 0.0,
     transaction_cost_smoothing: float = 1e-4,
+    entropy_regularization: float = 0.0,
+    entropy_epsilon: float = 1e-4,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Compute predicted-vs-oracle realized portfolio objective regret.
 
@@ -131,6 +151,8 @@ def decision_regret_loss(
         transaction_cost_rate=transaction_cost_rate,
         turnover_penalty=turnover_penalty,
         transaction_cost_smoothing=transaction_cost_smoothing,
+        entropy_regularization=entropy_regularization,
+        entropy_epsilon=entropy_epsilon,
     )
     with torch.no_grad():
         oracle_loss, oracle_components = portfolio_objective_loss(
@@ -142,6 +164,8 @@ def decision_regret_loss(
             transaction_cost_rate=transaction_cost_rate,
             turnover_penalty=turnover_penalty,
             transaction_cost_smoothing=transaction_cost_smoothing,
+            entropy_regularization=entropy_regularization,
+            entropy_epsilon=entropy_epsilon,
         )
     regret = predicted_loss - oracle_loss.detach()
     components = {

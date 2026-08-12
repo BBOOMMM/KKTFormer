@@ -4,12 +4,14 @@ import os
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 from torch.utils.data import DataLoader
 
 from data_provider.data_loader_kkt import Dataset_PortfolioContext
 from portfolio.context_builder import PortfolioContextConfig, load_industry_exposure
 from portfolio.problem import MinimalPortfolioProblem
+from utils.sit_protocol import SIT_SPLIT_RANGES
 
 
 def _context_cache_dir(args) -> Optional[Path]:
@@ -61,6 +63,12 @@ def _build_loader(dataset, flag, args):
 def _split_rebalance_frequency(args, flag):
     """Return the configured decision frequency for one data split."""
 
+    if str(getattr(args, "protocol", "sit")).lower() == "sit":
+        # SIT constructs daily train/validation samples.  Test decisions are
+        # selected from the fixed execution calendar below instead of by a
+        # regular frequency.
+        return 1
+
     override = getattr(args, f"{flag}_rebalance_frequency", None)
     return int(
         override
@@ -94,14 +102,64 @@ def data_provider_kkt(args, flag):
     cache_path = cache_dir / f"{flag}.npz" if cache_dir is not None else None
     if cache_path is not None and cache_path.exists():
         dataset = Dataset_PortfolioContext(cache_path=cache_path)
+        if str(getattr(args, "protocol", "sit")).lower() == "sit":
+            frequency = np.asarray(dataset.context.get("rebalance_frequency", 1))
+            decision_indices = np.asarray(
+                dataset.context.get("decision_index", ()), dtype=np.int64
+            )
+            is_daily = (
+                decision_indices.size > 0
+                and (
+                    decision_indices.size == 1
+                    or np.all(np.diff(decision_indices) == 1)
+                )
+            )
+            if (
+                not np.all(frequency == 1)
+                or "future_valid_length" not in dataset.context
+                or not is_daily
+            ):
+                raise ValueError(
+                    "the context cache is not SIT-compatible; rebuild it with "
+                    "2_build_portfolio_context.py --protocol sit"
+                )
         return _build_loader(dataset, flag, args)
 
     csv_path = os.path.join(args.root_path, args.data_path)
-    prices = (
+    combined_prices = (
         pd.read_csv(csv_path, parse_dates=["Date"])
         .set_index("Date")
         .iloc[:, : args.data_pool]
     )
+    protocol = str(getattr(args, "protocol", "sit")).lower()
+
+    if protocol == "sit":
+        # Match SIT's split construction.  Train and validation do not borrow
+        # historical rows from the previous split; test receives exactly the
+        # W+1-row context warm-up used in data_factory.py.
+        split_ranges = SIT_SPLIT_RANGES
+        train_start, train_end = split_ranges["train"]
+        val_start, val_end = split_ranges["val"]
+        test_start, test_end = split_ranges["test"]
+        test_start_index = int(
+            combined_prices.index.searchsorted(pd.Timestamp(test_start), side="left")
+        )
+        context_start_index = test_start_index - (args.window_size + 1)
+        if context_start_index < 0:
+            raise ValueError("not enough pre-test history for the SIT context warm-up")
+        split_prices = {
+            "train": combined_prices.loc[train_start:train_end],
+            "val": combined_prices.loc[val_start:val_end],
+            "test": combined_prices.iloc[context_start_index:].loc[:test_end],
+        }
+        df_use = split_prices[flag]
+    else:
+        split_ranges = {
+            "train": ("2000-01-01", "2016-12-31"),
+            "val": ("2017-01-01", "2019-12-31"),
+            "test": ("2020-01-01", "2024-12-31"),
+        }
+        df_use = combined_prices
     problem = MinimalPortfolioProblem(
         num_assets=args.data_pool,
         lookback_window=args.window_size,
@@ -117,12 +175,16 @@ def data_provider_kkt(args, flag):
     industry_path = getattr(args, "industry_exposure_path", "")
     if industry_path:
         industry_exposure, industry_names = load_industry_exposure(
-            industry_path, prices.columns
+            industry_path, combined_prices.columns
         )
     context_config = PortfolioContextConfig(
         problem=problem,
         covariance_epsilon=args.covariance_epsilon,
-        transaction_cost_bps=args.transaction_cost_bps,
+        transaction_cost_bps=float(
+            getattr(args, "trade_cost_bps", 0.0)
+            if getattr(args, "transaction_cost_bps", None) is None
+            else args.transaction_cost_bps
+        ),
         factor_lower=_parse_bound_text(getattr(args, "factor_lower", "")),
         factor_upper=_parse_bound_text(getattr(args, "factor_upper", "")),
         industry_exposure=industry_exposure,
@@ -130,16 +192,29 @@ def data_provider_kkt(args, flag):
         industry_lower=_parse_bound_text(getattr(args, "industry_lower", "")),
         industry_upper=_parse_bound_text(getattr(args, "industry_upper", "")),
     )
-    split_ranges = {
-        "train": ("2000-01-01", "2016-12-31"),
-        "val": ("2017-01-01", "2019-12-31"),
-        "test": ("2020-01-01", "2024-12-31"),
-    }
     pred_start, pred_end = split_ranges[flag]
-    dataset = Dataset_PortfolioContext(
-        prices=prices,
-        config=context_config,
-        pred_start=pred_start,
-        pred_end=pred_end,
-    )
+    if protocol == "sit" and flag == "test":
+        # SIT has 1237 test windows, each producing H daily predictions.  Their
+        # union is a continuous daily prediction/return grid (1257 dates for
+        # the released W=60, H=20 data).  KKTFormer emits one decision per
+        # context, so construct that same effective daily grid directly.
+        dataset = Dataset_PortfolioContext(
+            prices=df_use,
+            config=context_config,
+            pred_start=pred_start,
+            pred_end=pred_end,
+            allow_incomplete_future=True,
+        )
+    elif protocol == "sit":
+        dataset = Dataset_PortfolioContext(
+            prices=df_use,
+            config=context_config,
+        )
+    else:
+        dataset = Dataset_PortfolioContext(
+            prices=df_use,
+            config=context_config,
+            pred_start=pred_start,
+            pred_end=pred_end,
+        )
     return _build_loader(dataset, flag, args)

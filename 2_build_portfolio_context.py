@@ -8,10 +8,11 @@ Example:
         --data_pool 30 \
         --lookback_window 60 \
         --horizon 20 \
-        --rebalance_frequency 20 \
+        --protocol sit \
+        --rebalance_frequency 1 \
         --train_rebalance_frequency 1 \
         --val_rebalance_frequency 1 \
-        --test_rebalance_frequency 20
+        --test_rebalance_frequency 1
 """
 
 import argparse
@@ -40,10 +41,17 @@ def parse_args():
         default="./portfolio_context_cache/pool_30",
         help="directory receiving train.npz, val.npz and test.npz",
     )
+    parser.add_argument(
+        "--protocol",
+        type=str,
+        choices=["sit", "native"],
+        default="sit",
+        help="use the released SIT split and fixed execution calendar",
+    )
     parser.add_argument("--data_pool", type=int, default=30)
     parser.add_argument("--lookback_window", type=int, default=60)
     parser.add_argument("--horizon", type=int, default=20)
-    parser.add_argument("--rebalance_frequency", type=int, default=20)
+    parser.add_argument("--rebalance_frequency", type=int, default=1)
     parser.add_argument(
         "--train_rebalance_frequency",
         type=int,
@@ -133,6 +141,7 @@ def main():
             if args.test_rebalance_frequency is not None
             else args.rebalance_frequency,
         },
+        protocol=args.protocol,
     )
     for split, path in output_paths.items():
         print(f"[{split}] saved context cache: {path}")

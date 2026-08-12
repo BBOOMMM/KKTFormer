@@ -17,10 +17,22 @@ def parse_args():
     parser.add_argument("--context_root", type=str, default="")
     parser.add_argument("--checkpoints", type=str, default="./checkpoints_kkt/")
     parser.add_argument("--results_path", type=str, default="./results_kkt/")
+    parser.add_argument(
+        "--protocol",
+        type=str,
+        choices=["sit", "native"],
+        default="sit",
+        help="experiment protocol; sit matches the released SIT split/calendar",
+    )
     parser.add_argument("--data_pool", type=int, default=30)
     parser.add_argument("--window_size", type=int, default=60)
     parser.add_argument("--horizon", type=int, default=20)
-    parser.add_argument("--rebalance_frequency", type=int, default=20)
+    parser.add_argument(
+        "--rebalance_frequency",
+        type=int,
+        default=1,
+        help="legacy regular context frequency; ignored by the SIT protocol",
+    )
     parser.add_argument(
         "--train_rebalance_frequency",
         type=int,
@@ -42,17 +54,40 @@ def parse_args():
     parser.add_argument(
         "--evaluation_end_date",
         type=str,
-        default="2024-12-27",
-        help="last date retained in the KTTFormer test equity curve",
+        default="2024-12-31",
+        help="last date retained by the native test evaluator",
     )
     parser.add_argument("--upper_bound", type=float, default=1.0)
     parser.add_argument("--lower_bound", type=float, default=0.0)
     parser.add_argument("--budget_target", type=float, default=1.0)
     parser.add_argument("--eta", type=float, default=1e-3)
     parser.add_argument("--covariance_epsilon", type=float, default=1e-6)
-    parser.add_argument("--transaction_cost_bps", type=float, default=0.0)
+    parser.add_argument(
+        "--trade_cost_bps",
+        type=float,
+        default=0.0,
+        help="SIT-compatible transaction cost in basis points",
+    )
+    parser.add_argument(
+        "--transaction_cost_bps",
+        type=float,
+        default=None,
+        help="legacy alias; overrides --trade_cost_bps when supplied",
+    )
     parser.add_argument("--transaction_cost_smoothing", type=float, default=1e-4)
     parser.add_argument("--turnover_penalty", type=float, default=0.0)
+    parser.add_argument(
+        "--entropy_regularization",
+        type=float,
+        default=0.0,
+        help="tau for tau * sum_i w_i log(w_i); 0 disables entropy regularization",
+    )
+    parser.add_argument(
+        "--entropy_epsilon",
+        type=float,
+        default=1e-4,
+        help="positive smoothing floor used when evaluating log(weights)",
+    )
     parser.add_argument("--max_turnover", type=float, default=None)
     parser.add_argument("--gross_exposure_limit", type=float, default=None)
     parser.add_argument("--factor_lower", type=str, default="")
@@ -130,25 +165,30 @@ def main():
         args.gpu = args.device_ids[0]
 
     for iteration in range(args.itr):
-        train_frequency = (
-            args.train_rebalance_frequency
-            if args.train_rebalance_frequency is not None
-            else args.rebalance_frequency
-        )
-        val_frequency = (
-            args.val_rebalance_frequency
-            if args.val_rebalance_frequency is not None
-            else args.rebalance_frequency
-        )
-        test_frequency = (
-            args.test_rebalance_frequency
-            if args.test_rebalance_frequency is not None
-            else args.rebalance_frequency
-        )
+        if args.protocol == "sit":
+            train_frequency = val_frequency = test_frequency = 1
+            protocol_frequency = 1
+        else:
+            train_frequency = (
+                args.train_rebalance_frequency
+                if args.train_rebalance_frequency is not None
+                else args.rebalance_frequency
+            )
+            val_frequency = (
+                args.val_rebalance_frequency
+                if args.val_rebalance_frequency is not None
+                else args.rebalance_frequency
+            )
+            test_frequency = (
+                args.test_rebalance_frequency
+                if args.test_rebalance_frequency is not None
+                else args.rebalance_frequency
+            )
+            protocol_frequency = args.rebalance_frequency
         setting = (
-            f"{args.model_id}_KKTFormer-v0_dp{args.data_pool}"
+            f"{args.model_id}_KKTFormer-v0_{args.protocol}_dp{args.data_pool}"
             f"_w{args.window_size}_h{args.horizon}"
-            f"_rb{args.rebalance_frequency}"
+            f"_rb{protocol_frequency}"
             f"_trb{train_frequency}_vrb{val_frequency}_teb{test_frequency}"
             f"_dm{args.d_model}"
             f"_nh{args.n_heads}_nl{args.num_layers}"
@@ -156,6 +196,12 @@ def main():
             f"_lm{args.loss_mode}"
             f"_pw{args.prediction_weight}_seq{int(args.sequential_state)}_{iteration}"
         )
+        if args.entropy_regularization != 0.0:
+            setting = setting.replace(
+                f"_pw{args.prediction_weight}_seq",
+                f"_pw{args.prediction_weight}_er{args.entropy_regularization:g}"
+                f"_ee{args.entropy_epsilon:g}_seq",
+            )
         print(f">>>>>>> start training: {setting} >>>>>>>>>")
         experiment = EXP_KKT(args)
         experiment.train(setting)
