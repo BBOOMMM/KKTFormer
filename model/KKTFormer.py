@@ -20,9 +20,23 @@ class Model(nn.Module):
         self.num_layers = int(configs.num_layers)
         self.ff_dim = int(configs.ff_dim)
         self.dropout = float(configs.dropout)
+        self.signal_normalization = str(
+            getattr(configs, "signal_normalization", "risk")
+        ).lower()
+        self.signal_scale = float(getattr(configs, "signal_scale", 0.05))
+        self.signal_normalization_epsilon = float(
+            getattr(configs, "signal_normalization_epsilon", 1e-6)
+        )
+        self.eta = float(getattr(configs, "eta", 1e-3))
 
         if self.d_model % self.n_heads != 0:
             raise ValueError("d_model must be divisible by n_heads")
+        if self.signal_normalization not in {"risk", "none"}:
+            raise ValueError("signal_normalization must be risk or none")
+        if self.signal_scale <= 0:
+            raise ValueError("signal_scale must be positive")
+        if self.signal_normalization_epsilon <= 0:
+            raise ValueError("signal_normalization_epsilon must be positive")
 
         self.path_projection = nn.Linear(self.lookback_window, self.d_model)
         self.date_projection = nn.Linear(self.time_feat_dim, self.d_model)
@@ -104,7 +118,7 @@ class Model(nn.Module):
         return x.reshape(batch_size, horizon, num_assets, self.d_model)
 
     def predict_from_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Project ``(..., N, d_model)`` representations to decision logits."""
+        """Project ``(..., N, d_model)`` representations to raw signals."""
 
         if hidden.ndim < 3 or hidden.shape[-2:] != (
             self.num_assets,
@@ -115,6 +129,42 @@ class Model(nn.Module):
             )
         mu_hat = self.return_head(hidden).squeeze(-1)
         return mu_hat
+
+    def normalize_signal(
+        self, raw_signal: torch.Tensor, sigma: torch.Tensor
+    ) -> torch.Tensor:
+        """Put cross-sectional alpha on the optimizer's quadratic-risk scale.
+
+        The budget constraint makes the cross-sectional level of alpha
+        irrelevant, while an unconstrained neural-output scale can turn the
+        QP into a linear corner solution.  We therefore use
+
+        ``mu = c * mean(diag(Sigma + eta I)) * (s - mean(s)) / (std(s) + eps)``.
+
+        Normalization is applied outside ``predict_from_hidden`` because each
+        horizon token has its own covariance matrix.
+        """
+
+        if self.signal_normalization == "none":
+            return raw_signal
+        if raw_signal.shape[-1] != self.num_assets:
+            raise ValueError("raw_signal must have num_assets in its last dimension")
+        if sigma.shape[:-2] != raw_signal.shape[:-1] or sigma.shape[-2:] != (
+            self.num_assets,
+            self.num_assets,
+        ):
+            raise ValueError("sigma batch shape must match raw_signal")
+
+        centered = raw_signal - raw_signal.mean(dim=-1, keepdim=True)
+        cross_sectional_std = raw_signal.std(
+            dim=-1, unbiased=False, keepdim=True
+        )
+        z = centered / (cross_sectional_std + self.signal_normalization_epsilon)
+        risk_scale = sigma.diagonal(dim1=-2, dim2=-1).mean(
+            dim=-1, keepdim=True
+        ) + self.eta
+        risk_scale = risk_scale.clamp_min(self.signal_normalization_epsilon)
+        return self.signal_scale * risk_scale * z
 
     def forward(
         self, log_return_path: torch.Tensor, date_feats: torch.Tensor
@@ -228,8 +278,9 @@ class DecisionAwareModel(nn.Module):
         self.backbone = Model(configs)
         self.num_assets = self.backbone.num_assets
         self.d_model = self.backbone.d_model
-        self.factor_dim = int(getattr(configs, "factor_dim", 3))
-        self.kkt_feature_dim = 8 + self.factor_dim
+        # Keep the feedback token strictly optimizer-derived.  Raw factor
+        # exposures are ordinary market features, not KKT information.
+        self.kkt_feature_dim = 7
         self.kkt_bias_rank = int(getattr(configs, "kkt_bias_rank", 4))
         self.attention = DecisionAwareAssetAttention(
             d_model=self.d_model,
@@ -250,47 +301,34 @@ class DecisionAwareModel(nn.Module):
         hidden = self.backbone.encode_inputs(log_return_path, date_feats)
         return hidden, self.backbone.predict_from_hidden(hidden)
 
+    def normalize_signal(
+        self, raw_signal: torch.Tensor, sigma: torch.Tensor
+    ) -> torch.Tensor:
+        return self.backbone.normalize_signal(raw_signal, sigma)
+
     def refine(
         self,
         hidden: torch.Tensor,
         kkt_state: Dict[str, torch.Tensor],
-        factor_exposure: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if hidden.ndim != 4:
             raise ValueError("hidden must have shape (B, H, N, d_model)")
         weights = kkt_state["weights"]
         marginal_risk = kkt_state["marginal_risk"]
-        stationarity = kkt_state["stationarity"]
         lower_dual = kkt_state["lower_dual"]
         upper_dual = kkt_state["upper_dual"]
         active_lower = kkt_state["active_lower"].to(hidden.dtype)
         active_upper = kkt_state["active_upper"].to(hidden.dtype)
-        if factor_exposure is None:
-            factor_exposure = torch.zeros(
-                hidden.shape[0], hidden.shape[1],
-                self.num_assets,
-                self.factor_dim,
-                dtype=hidden.dtype,
-                device=hidden.device,
-            )
-        else:
-            if factor_exposure.shape[-1] != self.factor_dim:
-                raise ValueError(
-                    f"factor_exposure must have last dimension {self.factor_dim}"
-                )
-            factor_exposure = factor_exposure.to(dtype=hidden.dtype)
 
         kkt_features = torch.cat(
             [
                 weights.unsqueeze(-1),
                 marginal_risk.unsqueeze(-1),
-                stationarity.unsqueeze(-1),
                 lower_dual.unsqueeze(-1),
                 upper_dual.unsqueeze(-1),
                 active_lower.unsqueeze(-1),
                 active_upper.unsqueeze(-1),
                 kkt_state["pressure"].unsqueeze(-1),
-                factor_exposure,
             ],
             dim=-1,
         )
@@ -320,8 +358,7 @@ class DecisionAwareModel(nn.Module):
         log_return_path: torch.Tensor,
         date_feats: torch.Tensor,
         kkt_state: Dict[str, torch.Tensor],
-        factor_exposure: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         hidden0, mu0 = self.initial_forward(log_return_path, date_feats)
-        hidden1, mu1 = self.refine(hidden0, kkt_state, factor_exposure)
+        hidden1, mu1 = self.refine(hidden0, kkt_state)
         return hidden0, mu0, hidden1, mu1

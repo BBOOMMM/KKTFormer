@@ -63,6 +63,22 @@ def parse_args():
     parser.add_argument("--eta", type=float, default=1e-3)
     parser.add_argument("--covariance_epsilon", type=float, default=1e-6)
     parser.add_argument(
+        "--signal_normalization",
+        type=str,
+        choices=["risk", "none"],
+        default="risk",
+        help="cross-sectionally normalize alpha and match it to quadratic-risk scale",
+    )
+    parser.add_argument(
+        "--signal_scale",
+        type=float,
+        default=0.05,
+        help="fixed c in tau_mu = c * mean(diag(Sigma + eta I))",
+    )
+    parser.add_argument(
+        "--signal_normalization_epsilon", type=float, default=1e-6
+    )
+    parser.add_argument(
         "--trade_cost_bps",
         type=float,
         default=0.0,
@@ -135,6 +151,13 @@ def parse_args():
     )
     parser.add_argument("--prediction_loss", type=str, default="MSE")
     parser.add_argument("--cvar_alpha", type=float, default=0.95)
+    parser.add_argument(
+        "--cvar_variant",
+        type=str,
+        choices=["sit", "smooth"],
+        default="sit",
+        help="SIT-exact quantile/ReLU objective or detached-VaR smooth ablation",
+    )
     parser.add_argument("--cvar_temperature", type=float, default=1e-3)
     parser.add_argument("--kkt_bias_rank", type=int, default=4)
     parser.add_argument(
@@ -200,7 +223,8 @@ def main():
             f"_dm{args.d_model}"
             f"_nh{args.n_heads}_nl{args.num_layers}"
             f"_oi{args.optimizer_iterations}_fb{args.feedback_mode}"
-            f"_lm{args.loss_mode}"
+            f"_sn{args.signal_normalization}_ss{args.signal_scale:g}"
+            f"_lm{args.loss_mode}_cv{args.cvar_variant}"
             f"_pw{args.prediction_weight}_seq{int(args.sequential_state)}_{iteration}"
         )
         if args.entropy_regularization != 0.0:

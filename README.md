@@ -1,6 +1,6 @@
 # KKTFormer
 
-KKTFormer 是一个面向资产配置的端到端决策模型。模型先用 Transformer 提取时间和资产交互特征，再通过可微投资组合优化器得到初始仓位及 KKT 状态；这些 primal-dual 信息会被编码为多头注意力偏置，用于修正资产注意力和最终仓位。
+KKTFormer 是一个面向资产配置的端到端决策模型。模型先用 Transformer 提取时间和资产交互特征，再通过可微投资组合优化器得到初始仓位及近似 KKT 状态；这些 primal-dual 信息会被编码为多头注意力偏置，用于修正资产注意力和最终仓位。
 
 本仓库同时保留了上游 Signature-Informed Transformer（SIT）的部分代码，用于公平对照。KKTFormer 的实验协议默认向 SIT 对齐，但模型输入、KKT 模块、约束和可微优化策略属于 KKTFormer。
 
@@ -21,7 +21,7 @@ Temporal Attention + Asset Attention
         ↓
 B×H batched differentiable probe optimizer
         ↓
-[w, marginal risk, stationarity, dual, active set, factor exposure]
+[w, marginal risk, box duals, active set, constraint pressure]
         ↓
 multi-head low-rank KKT attention bias
         ↓
@@ -38,7 +38,22 @@ realized returns (B,H,N)
 end-to-end CVaR loss
 ```
 
-模型不使用收益预测 MSE 等 prediction loss。训练梯度来自真实资产收益、组合仓位和 CVaR 目标，并穿过最终优化器、KKT-conditioned attention，以及第一阶段 probe optimizer。
+默认 `--cvar_variant sit` 与发布版 SIT 使用完全相同的训练目标：VaR 由
+`torch.quantile` 计算且不 detach，tail excess 使用 `ReLU(L - VaR)`。原先的
+detach-VaR + softplus 实现保留为 `--cvar_variant smooth` 消融；SIT 协议下交易成本
+和换手惩罚不混入该训练 loss。
+
+模型不使用收益预测 MSE 等 prediction loss。为防止无界 return head 通过任意放大
+`mu` 把 QP 退化为线性目标和单资产 corner solution，probe 与 final optimizer 前均默认执行
+横截面 signal normalization：
+
+`z = (s - mean(s)) / (std(s) + eps)`，
+`mu = c * mean(diag(Sigma + eta I)) * z`。
+
+因此 alpha 的尺度与实际二次风险项一致，而不是由神经网络输出幅度决定。默认固定较小的
+`c=0.05`，避免可学习温度重新产生无界尺度自由度。训练梯度来自真实资产收益、组合仓位和
+CVaR 目标，并穿过 signal normalization、最终优化器、KKT-conditioned attention，以及
+第一阶段 probe optimizer。
 
 ### 三路输入
 
@@ -66,15 +81,37 @@ concat → Linear(3 × d_model, d_model)
 
 ### KKT attention bias
 
+当前主方法的优化问题严格限定为 budget + box + quadratic risk，并可选加入二次换手惩罚：
+
+```text
+min_w  0.5 wᵀQw - μᵀw + 0.5 ρ||w-w_prev||²
+s.t.   1ᵀw = budget,  lower ≤ w ≤ upper
+```
+
+因此 box dual 和 active-set Jacobian 都来自同一个 QP。factor/industry bounds、L1 turnover cap、gross exposure、entropy 等仍保留为 `--feedback_mode none` 的扩展优化器能力，但在 `dual`/`jacobian` 下会被明确拒绝，不能被表述为当前 KKT state 的组成部分。交易成本只进入 realized decision loss 和评估，不进入主方法的 probe/final QP。
+
 第一阶段优化器产生的每资产 KKT token 包含：
 
 - 初始仓位 `w`；
 - 边际风险 `Qw`；
-- stationarity residual；
 - 上下界对偶变量；
 - 上下界 active-set 指示；
-- 总约束压力；
-- 风格因子暴露。
+- 总约束压力。
+
+即严格使用 7 维 token `z_i = [w_i, (Qw)_i, alpha_i, beta_i, I_i^L, I_i^U, p_i]`。raw factor exposure（market beta、momentum、volatility）不进入 KKT token，避免 `dual` 相对 `none` 获得额外市场特征。未来若主问题加入 factor constraints，应编码优化器给出的逐资产约束压力 `(A^T lambda)_i`，而不是原始暴露 `A_i`。
+
+诊断量严格区分 `reduced_gradient = Qw - mu + nu*1` 与完整的
+`kkt_stationarity_residual = Qw - mu + nu*1 - alpha + beta`。前者尚未计入
+box dual，不能称为 stationarity residual。`test_diagnostics.csv` 会对每个
+probe 解先在资产维计算无穷范数，再报告
+`MeanProbeKKTStationarityResidualInf` 和
+`MaxProbeKKTStationarityResidualInf`，用于检查默认 5 次 probe 迭代是否足以
+支撑“近似 KKT state”的表述。
+
+budget dual `nu` 在存在 free asset 时由 `gradient_i + nu = 0` 估计。当所有资产都
+位于 box bound 时，该乘子不再唯一：lower-active 坐标要求
+`nu >= -gradient_i`，upper-active 坐标要求 `nu <= -gradient_i`。实现取 admissible
+interval 的中点作为规范代表；若区间只有单侧，则取有限端点，不再错误回退为 `nu=0`。
 
 KKT token 经过每个 attention head 独立的低秩 query/key 投影，得到：
 
@@ -102,7 +139,7 @@ attention_scores = QKᵀ / √d + γ_head × kkt_bias
 | Lookback | 60 个价格点 |
 | Horizon | 20 个交易日 |
 | Train/Val context | 日频滑动样本 |
-| Test context | 覆盖 SIT 的有效日度预测日期网格 |
+| Test context | SIT 原版完整重叠窗口；逐 token record/dedup |
 | 测试调仓日 | SIT 发布代码中的固定调仓日期 |
 | 日收益日期约定 | 日期 `t` 对应 `P[t+1]/P[t]-1` |
 
@@ -111,12 +148,12 @@ attention_scores = QKᵀ / √d + γ_head × kkt_bias
 ```text
 train: 4197 samples
 val:    674 samples
-test:  1256 samples
+test:  1237 samples
 ```
 
-测试集中有 1237 个完整 20 日 horizon context；最后 19 个不完整 context 用于补齐 SIT 的有效日度预测和回测日期范围，不进入完整 horizon 测试损失均值。
+测试集中有 1237 个完整 20 日 horizon context。评估按 SIT 原版顺序遍历每个窗口的全部 horizon token，日期已存在时跳过；因此首个窗口之后，每个新日期通常取自 `h=19`，保留了完整 causal temporal context。
 
-当前缓存为每个样本保存一个决策时点的 `Sigma`、factor exposure 和初始 `w_prev`。训练时它们广播到 H 个 token；每个 token 的 `μ` 和优化仓位仍然独立，并通过 `B×H` 批量计算。测试时，每个日度 context 的第一个 token 对应该 context 的即时执行日期，实际仓位仅在 SIT 固定调仓日更新。
+当前缓存为每个样本的 H 个 token 分别保存与 rolling path 同时点的 `Sigma` 和 factor exposure；即 token `h` 使用价格窗口 `X_{t+h}` 估计 `Sigma_{t+h}` 与 `F_{t+h}`。只有初始 `w_prev` 等样本级静态量会广播到 H 个 token。每个 token 的 `μ` 和优化仓位独立，并通过 `B×H` 批量计算。测试时使用上述 record/dedup 后的 token 仓位，实际仓位仅在 SIT 固定调仓日更新。
 
 ## 环境安装
 
@@ -153,12 +190,12 @@ python 2_build_portfolio_context.py \
 | `log_return_path` | `(H,N,60)` | Transformer 路径输入 |
 | `date_feats` | `(H,3)` | 时间特征 |
 | `future_returns` | `(H,N)` | 端到端 CVaR 的真实收益 |
-| `Sigma` | `(N,N)` | 决策时点协方差 |
-| `factor_exposure` | `(N,3)` | 市场 beta、动量、波动率暴露 |
+| `Sigma` | `(H,N,N)` | 每个 token 同时点的滚动协方差 |
+| `factor_exposure` | `(H,N,3)` | 每个 token 同时点的市场 beta、动量、波动率暴露 |
 | `w_prev` | `(N,)` | 初始/上一期仓位 |
 | `future_dates` | `(H,)` | 每个 horizon token 的执行日期 |
 
-修改资产池、lookback、horizon、约束或交易成本后，应重新构建对应缓存。旧版含 `market_window` 的缓存与当前模型不兼容，loader 会拒绝加载。
+修改资产池、lookback、horizon、约束或交易成本后，应重新构建对应缓存。旧版含 `market_window`，或仅含单个 `(N,N)` `Sigma` / `(N,3)` factor exposure 的缓存与当前模型不兼容，loader 会拒绝加载。
 
 ## 训练和评估
 
@@ -184,6 +221,7 @@ python run_kkt.py \
   --optimizer_iterations 10 \
   --loss_mode cvar \
   --cvar_alpha 0.95 \
+  --cvar_variant sit \
   --batch_size 64 \
   --train_epochs 10 \
   --gpu 0
@@ -206,16 +244,20 @@ results_kkt/
 | `--optimizer_iterations` | `10` | warm-start 最终优化器迭代数 |
 | `--loss_mode` | `cvar` | 当前 sequence KKTFormer 只允许 CVaR |
 | `--cvar_alpha` | `0.95` | CVaR 置信水平 |
-| `--cvar_temperature` | `1e-3` | CVaR tail excess 的平滑温度 |
+| `--cvar_variant` | `sit` | `sit` 完全复刻原版 quantile + ReLU；`smooth` 为消融 |
+| `--cvar_temperature` | `1e-3` | 仅 `cvar_variant=smooth` 使用的平滑温度 |
 | `--eta` | `1e-3` | 优化问题二次正则项 |
+| `--signal_normalization` | `risk` | 对 return head 做横截面标准化并匹配风险尺度；`none` 仅用于消融 |
+| `--signal_scale` | `0.05` | 风险尺度固定系数 `c`；建议做敏感性分析 |
+| `--signal_normalization_epsilon` | `1e-6` | signal 标准化数值稳定项 |
 | `--upper_bound` | `1.0` | 单资产仓位上界 |
 | `--lower_bound` | `0.0` | 单资产仓位下界 |
 | `--turnover_penalty` | `0.0` | 二次换手惩罚 |
-| `--trade_cost_bps` | `0.0` | SIT 兼容的测试交易成本 |
-| `--max_turnover` | disabled | 最大 L1 换手约束 |
-| `--gross_exposure_limit` | disabled | 总杠杆约束 |
-| `--factor_lower/upper` | disabled | 风格暴露上下界 |
-| `--industry_lower/upper` | disabled | 行业暴露上下界 |
+| `--trade_cost_bps` | `0.0` | 测试交易成本；SIT 协议下不进入训练 loss 或 KKT QP |
+| `--max_turnover` | disabled | 最大 L1 换手约束，仅 `feedback_mode=none` |
+| `--gross_exposure_limit` | disabled | 总杠杆约束，仅 `feedback_mode=none` |
+| `--factor_lower/upper` | disabled | 风格暴露上下界，仅 `feedback_mode=none` |
+| `--industry_lower/upper` | disabled | 行业暴露上下界，仅 `feedback_mode=none` |
 
 最终优化器默认使用 10 次迭代，并从 probe 仓位 warm start。更高迭代数可用于收敛敏感性实验，例如：
 
@@ -225,15 +267,16 @@ results_kkt/
 
 但这会显著降低训练速度。默认配置下所有 `B×H` 优化问题均以一次张量批处理运行，不会在 Python 中逐 token 调用优化器。
 
-## 约束示例
+## 扩展约束示例
 
-限制单资产仓位、总换手和风格暴露：
+扩展优化器可限制单资产仓位、总换手和风格暴露；这些实验必须关闭 KKT feedback：
 
 ```bash
 python run_kkt.py \
   --context_root ./portfolio_context_cache \
   --data_pool 30 \
   --upper_bound 0.10 \
+  --feedback_mode none \
   --max_turnover 0.50 \
   --factor_lower=-0.2,-0.2,-0.2 \
   --factor_upper=0.2,0.2,0.2 \

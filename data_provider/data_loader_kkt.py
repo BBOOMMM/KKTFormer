@@ -80,7 +80,30 @@ class Dataset_PortfolioContext(Dataset):
             raise ValueError("log_return_path must have shape (samples, H, N, W)")
         if self.context["date_feats"].shape[1:] != (paths.shape[1], 3):
             raise ValueError("date_feats must have shape (samples, H, 3)")
-        n_samples = paths.shape[0]
+        n_samples, horizon, num_assets, _ = paths.shape
+        if self.context["future_returns"].shape != (n_samples, horizon, num_assets):
+            raise ValueError("future_returns must have shape (samples, H, N)")
+        if self.context["Sigma"].shape != (
+            n_samples,
+            horizon,
+            num_assets,
+            num_assets,
+        ):
+            raise ValueError(
+                "Sigma must have shape (samples, H, N, N); rebuild legacy "
+                "context caches that contain one covariance per sample"
+            )
+        factor_exposure = self.context["factor_exposure"]
+        if (
+            factor_exposure.ndim != 4
+            or factor_exposure.shape[:3] != (n_samples, horizon, num_assets)
+        ):
+            raise ValueError(
+                "factor_exposure must have shape (samples, H, N, K); rebuild "
+                "legacy context caches that contain one exposure per sample"
+            )
+        if self.context["w_prev"].shape != (n_samples, num_assets):
+            raise ValueError("w_prev must have shape (samples, N)")
         for key in ("date_feats", "future_returns", "Sigma", "factor_exposure", "w_prev", "decision_date", "future_dates"):
             if self.context[key].shape[0] != n_samples:
                 raise ValueError(f"context field {key} has inconsistent sample count")

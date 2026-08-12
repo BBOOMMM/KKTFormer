@@ -114,9 +114,16 @@ def data_provider_kkt(args, flag):
                     or np.all(np.diff(decision_indices) == 1)
                 )
             )
+            has_only_complete_horizons = (
+                "future_valid_length" in dataset.context
+                and np.all(
+                    np.asarray(dataset.context["future_valid_length"])
+                    == int(args.horizon)
+                )
+            )
             if (
                 not np.all(frequency == 1)
-                or "future_valid_length" not in dataset.context
+                or not has_only_complete_horizons
                 or not is_daily
             ):
                 raise ValueError(
@@ -194,16 +201,14 @@ def data_provider_kkt(args, flag):
     )
     pred_start, pred_end = split_ranges[flag]
     if protocol == "sit" and flag == "test":
-        # SIT has 1237 test windows, each producing H daily predictions.  Their
-        # union is a continuous daily prediction/return grid (1257 dates for
-        # the released W=60, H=20 data).  KKTFormer emits one decision per
-        # context, so construct that same effective daily grid directly.
+        # Preserve SIT's complete, overlapping test windows. Evaluation must
+        # iterate all H tokens and deduplicate dates in encounter order; after
+        # the first window, each new date normally comes from token H-1.
         dataset = Dataset_PortfolioContext(
             prices=df_use,
             config=context_config,
             pred_start=pred_start,
             pred_end=pred_end,
-            allow_incomplete_future=True,
         )
     elif protocol == "sit":
         dataset = Dataset_PortfolioContext(

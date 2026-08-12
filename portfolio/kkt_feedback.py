@@ -1,5 +1,6 @@
-"""KKT state extraction for decision-aware representation learning."""
+"""KKT state extraction for the minimal KKTFormer quadratic program."""
 
+import math
 from typing import Dict
 
 import torch
@@ -24,12 +25,18 @@ def compute_kkt_state(
     lower_bounds: torch.Tensor = None,
     active_tolerance: float = 1e-5,
     compute_jacobian: bool = True,
+    w_prev: torch.Tensor = None,
+    turnover_penalty: float = 0.0,
 ) -> Dict[str, torch.Tensor]:
-    """Extract box-constraint dual pressure and local decision sensitivity.
+    """Extract primal-dual state and local sensitivity for the minimal QP.
 
     For the QP
 
-    ``min 0.5*w.T*Q*w - mu.T*w`` subject to budget and box constraints,
+    ``min 0.5*w.T*Q*w - mu.T*w + 0.5*rho*||w-w_prev||^2``
+
+    subject to budget and box constraints, the effective quadratic and linear
+    terms are ``Q + rho*I`` and ``mu + rho*w_prev``.  Setting ``rho=0`` gives
+    the risk-only problem.
 
     the active-set Jacobian is computed from the free-coordinate KKT system.
     If ``F`` is the current free set, its block is
@@ -43,6 +50,11 @@ def compute_kkt_state(
 
     if active_tolerance <= 0:
         raise ValueError("active_tolerance must be positive")
+    turnover_penalty = float(turnover_penalty)
+    if not math.isfinite(turnover_penalty) or turnover_penalty < 0:
+        raise ValueError("turnover_penalty must be finite and non-negative")
+    if turnover_penalty != 0.0 and w_prev is None:
+        raise ValueError("w_prev is required when turnover_penalty is non-zero")
     problem.validate_mu(mu_hat)
     problem.validate_sigma(sigma)
     if weights.shape != mu_hat.shape:
@@ -69,20 +81,74 @@ def compute_kkt_state(
     eye = torch.eye(num_assets, dtype=sigma.dtype, device=sigma.device)
     q = 0.5 * (sigma_batch + sigma_batch.transpose(-1, -2))
     q = q + problem.eta * eye.unsqueeze(0)
-    gradient = torch.bmm(q, weights.unsqueeze(-1)).squeeze(-1) - mu_hat
     marginal_risk = torch.bmm(q, weights.unsqueeze(-1)).squeeze(-1)
+    if w_prev is not None:
+        if w_prev.shape != weights.shape:
+            raise ValueError("w_prev and weights must have the same shape")
+        if not torch.isfinite(w_prev).all():
+            raise ValueError("w_prev contains NaN or infinite values")
+    if turnover_penalty != 0.0:
+        q = q + turnover_penalty * eye.unsqueeze(0)
+        effective_mu = mu_hat + turnover_penalty * w_prev
+    else:
+        effective_mu = mu_hat
+    quadratic_marginal = torch.bmm(q, weights.unsqueeze(-1)).squeeze(-1)
+    gradient = quadratic_marginal - effective_mu
 
     active_lower = weights <= lower + active_tolerance
     active_upper = weights >= upper - active_tolerance
     free = ~(active_lower | active_upper)
     free_count = free.sum(dim=-1, keepdim=True).to(weights.dtype)
-    nu = -(
+    free_nu = -(
         gradient * free.to(weights.dtype)
     ).sum(dim=-1, keepdim=True) / free_count.clamp_min(1.0)
-    stationarity = gradient + nu
-    lower_dual = torch.relu(stationarity) * active_lower.to(weights.dtype)
-    upper_dual = torch.relu(-stationarity) * active_upper.to(weights.dtype)
+
+    # If every coordinate is on a box bound, the budget multiplier is not
+    # identified by a free-coordinate stationarity equation.  KKT signs give
+    # an admissible interval instead:
+    #
+    #   lower-active i: gradient_i + nu >= 0  => nu >= -gradient_i
+    #   upper-active i: gradient_i + nu <= 0  => nu <= -gradient_i.
+    #
+    # Pick the interval midpoint as a symmetric canonical representative.
+    # When the budget itself pins every asset to only one side, the interval
+    # is one-sided; its finite endpoint is a valid representative.  Assets
+    # simultaneously classified at both bounds impose no restriction on nu.
+    lower_only = active_lower & ~active_upper
+    upper_only = active_upper & ~active_lower
+    negative_gradient = -gradient
+    positive_inf = torch.full_like(negative_gradient, torch.inf)
+    negative_inf = torch.full_like(negative_gradient, -torch.inf)
+    nu_lower = torch.where(
+        lower_only, negative_gradient, negative_inf
+    ).amax(dim=-1, keepdim=True)
+    nu_upper = torch.where(
+        upper_only, negative_gradient, positive_inf
+    ).amin(dim=-1, keepdim=True)
+    has_lower = lower_only.any(dim=-1, keepdim=True)
+    has_upper = upper_only.any(dim=-1, keepdim=True)
+    finite_nu_lower = torch.where(has_lower, nu_lower, torch.zeros_like(nu_lower))
+    finite_nu_upper = torch.where(has_upper, nu_upper, torch.zeros_like(nu_upper))
+    interval_midpoint = 0.5 * (finite_nu_lower + finite_nu_upper)
+    no_free_nu = torch.where(
+        has_lower & has_upper,
+        interval_midpoint,
+        torch.where(
+            has_lower,
+            nu_lower,
+            torch.where(has_upper, nu_upper, -gradient.mean(dim=-1, keepdim=True)),
+        ),
+    )
+    has_free = free_count > 0
+    nu = torch.where(has_free, free_nu, no_free_nu)
+    reduced_gradient = gradient + nu
+    lower_dual = torch.relu(reduced_gradient) * active_lower.to(weights.dtype)
+    upper_dual = torch.relu(-reduced_gradient) * active_upper.to(weights.dtype)
     pressure = lower_dual + upper_dual
+    # With constraints written as lower-w <= 0 and w-upper <= 0, the full
+    # stationarity residual is grad(f) + nu*1 - alpha + beta.  Keep it
+    # distinct from the pre-box-dual reduced gradient above.
+    kkt_stationarity_residual = reduced_gradient - lower_dual + upper_dual
 
     # The active set varies per sample, so the small KKT systems are solved in
     # a batch loop.  N is at most a few dozen in the current experiments and
@@ -131,8 +197,14 @@ def compute_kkt_state(
         "upper_dual": upper_dual,
         "pressure": pressure,
         "budget_dual": nu.squeeze(-1),
-        "stationarity": stationarity,
+        "budget_dual_has_free": has_free.squeeze(-1),
+        "reduced_gradient": reduced_gradient,
+        "kkt_stationarity_residual": kkt_stationarity_residual,
+        "kkt_stationarity_residual_inf": (
+            kkt_stationarity_residual.abs().amax(dim=-1)
+        ),
         "marginal_risk": marginal_risk,
+        "quadratic_marginal": quadratic_marginal,
     }
     if jacobian is not None:
         result["jacobian"] = jacobian

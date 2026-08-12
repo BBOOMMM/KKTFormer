@@ -142,6 +142,33 @@ class EXP_KKT(Exp_Basic):
             ),
         }
 
+    def _validate_feedback_problem(self, optimizer_kwargs):
+        """Keep KKT feedback tied to the QP represented by its KKT state."""
+
+        if self.feedback_mode == "none":
+            return
+        unsupported = []
+        for name in (
+            "factor_lower",
+            "factor_upper",
+            "industry_lower",
+            "industry_upper",
+            "max_turnover",
+            "gross_exposure_limit",
+        ):
+            if optimizer_kwargs[name] is not None:
+                unsupported.append(name)
+        if self.entropy_regularization != 0.0:
+            unsupported.append("entropy_regularization")
+        if unsupported:
+            names = ", ".join(unsupported)
+            raise ValueError(
+                "KKT feedback currently represents only budget, box, quadratic "
+                "risk, and optional quadratic turnover; unsupported optimizer "
+                f"terms: {names}. Use --feedback_mode none for extension-only "
+                "experiments."
+            )
+
     def _forward_batch(self, batch, w_prev_override=None):
         log_return_path = batch["log_return_path"].to(self.device, non_blocking=True)
         date_feats = batch["date_feats"].to(self.device, non_blocking=True)
@@ -172,11 +199,28 @@ class EXP_KKT(Exp_Basic):
             )
             return expanded.reshape(batch_size * horizon, *value.shape[1:])
 
-        sigma_flat = repeat_horizon(sigma)
+        if sigma.shape != (batch_size, horizon, num_assets, num_assets):
+            raise ValueError(
+                "Sigma must have shape (B, H, N, N); rebuild legacy context "
+                "caches instead of broadcasting Sigma_t across the horizon"
+            )
+        factor_sequence = constraint_inputs["factor_exposure"]
+        if (
+            factor_sequence.ndim != 4
+            or factor_sequence.shape[:3] != (batch_size, horizon, num_assets)
+        ):
+            raise ValueError(
+                "factor_exposure must have shape (B, H, N, K); rebuild legacy "
+                "context caches instead of broadcasting F_t across the horizon"
+            )
+
+        sigma_flat = sigma.reshape(batch_size * horizon, num_assets, num_assets)
         w_prev_flat = repeat_horizon(w_prev)
         lower_flat = repeat_horizon(lower_bounds)
         upper_flat = repeat_horizon(upper_bounds)
-        factor_flat = repeat_horizon(constraint_inputs["factor_exposure"])
+        factor_flat = factor_sequence.reshape(
+            batch_size * horizon, num_assets, factor_sequence.shape[-1]
+        )
         industry_flat = repeat_horizon(constraint_inputs["industry_exposure"])
         factor_lower_flat = repeat_horizon(constraint_inputs["factor_lower"])
         factor_upper_flat = repeat_horizon(constraint_inputs["factor_upper"])
@@ -195,12 +239,18 @@ class EXP_KKT(Exp_Basic):
             "lower_bounds": lower_flat,
             "upper_bounds": upper_flat,
             "turnover_penalty": self.turnover_penalty,
-            "transaction_cost_rate": cost_rate_flat,
+            # In the strict KKT method, trading cost belongs to the realized
+            # decision loss/evaluation, not the probe or final QP.  The
+            # extension-only no-feedback optimizer retains its smooth cost.
+            "transaction_cost_rate": (
+                cost_rate_flat if self.feedback_mode == "none" else None
+            ),
             "transaction_cost_smoothing": self.transaction_cost_smoothing,
             "max_turnover": self.max_turnover,
             "gross_exposure_limit": self.gross_exposure_limit,
             "entropy_regularization": self.entropy_regularization,
         }
+        self._validate_feedback_problem(optimizer_kwargs)
 
         def reshape_state(flat_state):
             result = {}
@@ -213,10 +263,12 @@ class EXP_KKT(Exp_Basic):
 
         model_core = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         if self.feedback_mode == "none":
-            _, mu_hat = self.model(log_return_path, date_feats)
+            _, raw_mu_hat = self.model(log_return_path, date_feats)
+            mu_hat = model_core.normalize_signal(raw_mu_hat, sigma)
             initial_weights = None
         else:
-            hidden0, mu0 = model_core.initial_forward(log_return_path, date_feats)
+            hidden0, raw_mu0 = model_core.initial_forward(log_return_path, date_feats)
+            mu0 = model_core.normalize_signal(raw_mu0, sigma)
             mu0_flat = mu0.reshape(batch_size * horizon, num_assets)
             probe_weights, _ = self.probe_optimizer(
                 mu_hat=mu0_flat,
@@ -234,16 +286,12 @@ class EXP_KKT(Exp_Basic):
                     getattr(self.args, "active_tolerance", 1e-5)
                 ),
                 compute_jacobian=self.feedback_mode == "jacobian",
+                w_prev=w_prev_flat,
+                turnover_penalty=self.turnover_penalty,
             )
             kkt_state = reshape_state(kkt_state_flat)
-            factor_sequence = factor_flat.reshape(
-                batch_size, horizon, num_assets, -1
-            ) if factor_flat is not None else None
-            _, mu_hat = model_core.refine(
-                hidden0,
-                kkt_state,
-                factor_exposure=factor_sequence,
-            )
+            _, raw_mu_hat = model_core.refine(hidden0, kkt_state)
+            mu_hat = model_core.normalize_signal(raw_mu_hat, sigma)
             initial_weights = probe_weights
 
         weights_flat, state_flat = self.portfolio_optimizer(
@@ -254,17 +302,30 @@ class EXP_KKT(Exp_Basic):
         )
         weights = weights_flat.reshape(batch_size, horizon, num_assets)
         state = reshape_state(state_flat)
+        if self.feedback_mode != "none":
+            # This diagnostic belongs to the short-run probe optimizer, not
+            # the final allocation optimizer represented by ``state_flat``.
+            state["probe_kkt_stationarity_residual_inf"] = kkt_state[
+                "kkt_stationarity_residual_inf"
+            ]
 
         cvar_batch, cvar_components = portfolio_cvar_loss(
             weights=weights,
             future_returns=future_returns,
             alpha=float(getattr(self.args, "cvar_alpha", 0.95)),
+            variant=str(getattr(self.args, "cvar_variant", "sit")),
             smooth_temperature=float(
                 getattr(self.args, "cvar_temperature", 1e-3)
             ),
             w_prev=w_prev,
-            transaction_cost_rate=transaction_cost_rate,
-            turnover_penalty=self.turnover_penalty,
+            # The strict SIT protocol uses CVaR alone as its training
+            # objective. Costs and turnover are evaluated separately.
+            transaction_cost_rate=(
+                None if self.protocol == "sit" else transaction_cost_rate
+            ),
+            turnover_penalty=(
+                0.0 if self.protocol == "sit" else self.turnover_penalty
+            ),
             transaction_cost_smoothing=self.transaction_cost_smoothing,
         )
         total_loss = cvar_batch.mean()
@@ -478,13 +539,11 @@ class EXP_KKT(Exp_Basic):
         ]
 
     def eval(self, setting, load=True):
-        """Evaluate with the released SIT execution protocol.
+        """Evaluate with the released SIT record/dedup protocol.
 
-        In the SIT protocol KKTFormer produces one optimizer decision for every
-        daily test context.  The initial prediction is executed immediately;
-        later predictions update the held portfolio only on SIT's fixed
-        rebalance dates.  Costs are charged on those execution dates exactly
-        as in ``exp_main.py``.
+        SIT iterates every horizon token from each overlapping test window and
+        keeps the first representation encountered for each date. Thus most
+        newly encountered dates use a late-horizon causal representation.
         """
 
         if load:
@@ -516,6 +575,7 @@ class EXP_KKT(Exp_Basic):
         gross_exposures = []
         factor_exposure_values = []
         industry_exposure_values = []
+        probe_kkt_residual_infs = []
         asset_names = [f"Asset_{i}" for i in range(self.args.data_pool)]
         held_weights = torch.zeros(
             1, self.args.data_pool, dtype=torch.float32, device=self.device
@@ -526,37 +586,35 @@ class EXP_KKT(Exp_Basic):
                 execution_dates = self._decode_dates(batch["future_dates"])
                 if not execution_dates:
                     raise RuntimeError("test context has no execution date")
-                execution_date = execution_dates[0]
                 _, _, weights, state, _, details = self._forward_batch(
                     batch, w_prev_override=held_weights
                 )
-                is_rebalance = (
-                    not event_records
-                    or self.protocol != "sit"
-                    or execution_date in SIT_REBALANCE_DATE_SET
-                )
-                if is_rebalance:
-                    held_weights = weights[:, 0].detach()
+                total_losses.append(float(details["total_loss"].item()))
+                prediction_losses.append(float(details["prediction_loss"].item()))
+                utility_losses.append(float(details["utility_loss"].item()))
+                cvar_losses.append(float(details["cvar_loss"].item()))
+                regret_losses.append(float(details["regret_loss"].item()))
 
-                # SIT has 1237 complete test windows.  The final H daily
-                # contexts are required to reproduce its 1257-day prediction
-                # and backtest grid, but their padded horizons must not enter
-                # test-loss averages.
-                valid_length = int(
-                    batch.get("future_valid_length", torch.tensor(self.args.horizon))
-                    .reshape(-1)[0]
-                    .item()
+                token_indices = (
+                    range(len(execution_dates)) if self.protocol == "sit" else (0,)
                 )
-                if valid_length == self.args.horizon:
-                    total_losses.append(float(details["total_loss"].item()))
-                    prediction_losses.append(float(details["prediction_loss"].item()))
-                    utility_losses.append(float(details["utility_loss"].item()))
-                    cvar_losses.append(float(details["cvar_loss"].item()))
-                    regret_losses.append(float(details["regret_loss"].item()))
-                event_records[execution_date] = {
-                    "weight": weights[0, 0].detach().cpu().numpy(),
-                    "state": state,
-                }
+                for token_index in token_indices:
+                    execution_date = execution_dates[token_index]
+                    if execution_date in event_records:
+                        continue
+                    token_weights = weights[:, token_index].detach()
+                    is_rebalance = (
+                        not event_records
+                        or self.protocol != "sit"
+                        or execution_date in SIT_REBALANCE_DATE_SET
+                    )
+                    if is_rebalance:
+                        held_weights = token_weights
+                    event_records[execution_date] = {
+                        "weight": token_weights[0].cpu().numpy(),
+                        "state": state,
+                        "horizon_token": token_index,
+                    }
 
                 budget_errors.extend(
                     state["budget_residual"].detach().cpu().numpy().reshape(-1).tolist()
@@ -576,6 +634,15 @@ class EXP_KKT(Exp_Basic):
                 active_constraint_ratios.extend(
                     state["active_constraint_ratio"].detach().cpu().numpy().reshape(-1).tolist()
                 )
+                if "probe_kkt_stationarity_residual_inf" in state:
+                    probe_kkt_residual_infs.extend(
+                        state["probe_kkt_stationarity_residual_inf"]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .reshape(-1)
+                        .tolist()
+                    )
                 if "turnover_violation" in state:
                     turnover_violations.extend(
                         state["turnover_violation"].detach().cpu().numpy().reshape(-1).tolist()
@@ -722,6 +789,7 @@ class EXP_KKT(Exp_Basic):
         diagnostics = {
             "Protocol": self.protocol,
             "LossMode": self.loss_mode,
+            "CVaRVariant": str(getattr(self.args, "cvar_variant", "sit")),
             "TestLoss": float(np.mean(total_losses)) if total_losses else math.nan,
             "PredictionLoss": float(np.mean(prediction_losses))
             if prediction_losses else math.nan,
@@ -740,6 +808,16 @@ class EXP_KKT(Exp_Basic):
             "MeanNetExposure": float(np.mean(net_exposures)),
             "MeanGrossExposure": float(np.mean(gross_exposures)),
             "MeanActiveConstraintRatio": float(np.mean(active_constraint_ratios)),
+            "MeanProbeKKTStationarityResidualInf": (
+                float(np.mean(probe_kkt_residual_infs))
+                if probe_kkt_residual_infs
+                else math.nan
+            ),
+            "MaxProbeKKTStationarityResidualInf": (
+                float(np.max(probe_kkt_residual_infs))
+                if probe_kkt_residual_infs
+                else math.nan
+            ),
             "EvaluationEndDate": str(evaluation_end),
             "MaxTurnoverViolation": float(np.max(turnover_violations))
             if turnover_violations else 0.0,

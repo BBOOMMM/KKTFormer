@@ -4,16 +4,16 @@ The context builder is the stage-2 data boundary for KKTFormer.  It computes
 only quantities that are independent of the neural-network parameters:
 
 * ``H`` rolling log-return paths, one for each SIT horizon token;
-* a shrinkage covariance matrix ``Sigma_t``;
-* price-derived factor exposures ``B_t``;
+* rolling shrinkage covariance matrices ``Sigma_{t+h}``;
+* rolling price-derived factor exposures ``B_{t+h}``;
 * the future simple-return path used only as a training/evaluation target;
 * static constraint and transaction-cost parameters.
 
 For a decision index ``t``, horizon token ``h`` contains the ``W`` prices
 ending at ``t+h``.  Its execution date is ``t+h+1`` and its target is the
 return beginning on that date.  This exactly matches SIT's rolling-path
-layout.  ``Sigma_t`` and ``B_t`` remain point-in-time quantities constructed
-only from prices through ``t``.
+layout.  Each token's covariance and factor exposures are constructed from the
+same rolling price window as that token, so their decision timestamps match.
 """
 
 from dataclasses import dataclass, replace
@@ -318,7 +318,6 @@ def _build_context_at_frame(
     if first_future_index + 1 >= len(frame):
         raise IndexError("not enough future prices after decision_index")
 
-    historical_prices = values[decision_index - W + 1 : decision_index + 1]
     future_end_exclusive = min(first_future_index + H + 1, len(frame))
     future_prices = values[first_future_index:future_end_exclusive]
     future_length = future_prices.shape[0] - 1
@@ -371,17 +370,33 @@ def _build_context_at_frame(
         config.factor_upper, len(config.factor_names), "factor_upper"
     )
 
+    # Risk and factor context must share the timestamp of each horizon token.
+    # Computing these once at t and broadcasting would pair X_{t+h} with
+    # Sigma_t/B_t instead of Sigma_{t+h}/B_{t+h}.
+    sigma_sequence = np.stack(
+        [
+            estimate_covariance(window, epsilon=config.covariance_epsilon)
+            for window in path_prices
+        ],
+        axis=0,
+    )
+    factor_sequence = np.stack(
+        [
+            build_price_factor_exposure(
+                window,
+                cross_sectional_zscore=config.cross_sectional_zscore,
+            )
+            for window in path_prices
+        ],
+        axis=0,
+    )
+
     result = {
         "log_return_path": log_return_path,  # (H, N, W)
         "date_feats": time_features(pd.to_datetime(future_dates[:H]), freq="B").T.astype(np.float32),
         "future_returns": future_returns,  # (H, N), zero-padded only if allowed
-        "Sigma": estimate_covariance(
-            historical_prices, epsilon=config.covariance_epsilon
-        ),
-        "factor_exposure": build_price_factor_exposure(
-            historical_prices,
-            cross_sectional_zscore=config.cross_sectional_zscore,
-        ),
+        "Sigma": sigma_sequence,  # (H, N, N)
+        "factor_exposure": factor_sequence,  # (H, N, K)
         "w_prev": _equal_weight(n_assets),
         "decision_date": np.datetime64(frame.index[decision_index], "ns"),
         "future_dates": future_dates[:H],

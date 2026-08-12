@@ -182,23 +182,27 @@ def portfolio_cvar_loss(
     weights: torch.Tensor,
     future_returns: torch.Tensor,
     alpha: float = 0.95,
+    variant: str = "sit",
     smooth_temperature: float = 1e-3,
     w_prev: Optional[torch.Tensor] = None,
     transaction_cost_rate: Optional[torch.Tensor] = None,
     turnover_penalty: float = 0.0,
     transaction_cost_smoothing: float = 1e-4,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Compute a differentiable CVaR loss over the future return path.
+    """Compute CVaR over the future return path.
 
-    The empirical VaR threshold is detached from the model graph, while the
-    tail excess uses a smooth softplus approximation.  This avoids a hard
-    quantile branch in the training gradient and keeps the loss usable for the
-    short ``H``-day paths used by KKTFormer-v0.
+    ``variant="sit"`` exactly matches the released SIT objective: VaR remains
+    in the computation graph and the tail excess is a hard ReLU.  The
+    detached-VaR softplus approximation is retained as ``variant="smooth"``
+    for ablation experiments.
     """
 
     if not 0.0 < alpha < 1.0:
         raise ValueError("alpha must be in (0, 1)")
-    if smooth_temperature <= 0:
+    variant = str(variant).lower()
+    if variant not in {"sit", "smooth"}:
+        raise ValueError("variant must be one of sit or smooth")
+    if variant == "smooth" and smooth_temperature <= 0:
         raise ValueError("smooth_temperature must be positive")
     sequence_weights = weights.shape == future_returns.shape
     static_weights = weights.shape[:-1] == future_returns.shape[:-2]
@@ -210,13 +214,17 @@ def portfolio_cvar_loss(
     else:
         portfolio_returns = torch.einsum("...hn,...n->...h", future_returns, weights)
     portfolio_losses = -portfolio_returns
-    var = torch.quantile(
-        portfolio_losses.detach(), alpha, dim=-1, keepdim=True
-    )
-    smooth_excess = smooth_temperature * F.softplus(
-        (portfolio_losses - var) / smooth_temperature
-    )
-    cvar = var.squeeze(-1) + smooth_excess.mean(dim=-1) / (1.0 - alpha)
+    if variant == "sit":
+        var = torch.quantile(portfolio_losses, alpha, dim=-1, keepdim=True)
+        excess = F.relu(portfolio_losses - var)
+    else:
+        var = torch.quantile(
+            portfolio_losses.detach(), alpha, dim=-1, keepdim=True
+        )
+        excess = smooth_temperature * F.softplus(
+            (portfolio_losses - var) / smooth_temperature
+        )
+    cvar = var.squeeze(-1) + excess.mean(dim=-1) / (1.0 - alpha)
 
     batch_size = int(future_returns.numel() // (future_returns.shape[-2] * future_returns.shape[-1]))
     if sequence_weights:
