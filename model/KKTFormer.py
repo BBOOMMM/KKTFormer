@@ -1,10 +1,4 @@
-"""KKTFormer-v0 and optimizer-informed decision feedback models.
-
-The stage-4 baseline deliberately uses raw price-derived market windows rather
-than signature caches.  It produces one expected-return vector per portfolio
-decision with shape ``(B, N)``.  Portfolio construction is handled outside the
-model by ``DifferentiablePortfolioOptimizer``.
-"""
+"""KKTFormer with SIT-aligned path, date, and asset token inputs."""
 
 from typing import Dict, Optional, Tuple
 
@@ -13,13 +7,14 @@ import torch.nn as nn
 
 
 class Model(nn.Module):
-    """Temporal-then-asset Transformer for one portfolio decision."""
+    """SIT-aligned sequence-to-sequence decision backbone."""
 
     def __init__(self, configs):
         super().__init__()
         self.num_assets = int(configs.data_pool)
         self.lookback_window = int(configs.window_size)
-        self.input_dim = int(getattr(configs, "input_dim", 1))
+        self.horizon = int(configs.horizon)
+        self.time_feat_dim = int(getattr(configs, "time_feat_dim", 3))
         self.d_model = int(configs.d_model)
         self.n_heads = int(configs.n_heads)
         self.num_layers = int(configs.num_layers)
@@ -29,12 +24,11 @@ class Model(nn.Module):
         if self.d_model % self.n_heads != 0:
             raise ValueError("d_model must be divisible by n_heads")
 
-        self.input_projection = nn.Linear(self.input_dim, self.d_model)
-        self.input_norm = nn.LayerNorm(self.d_model)
-        self.time_position = nn.Parameter(
-            torch.zeros(1, self.lookback_window, self.d_model)
-        )
+        self.path_projection = nn.Linear(self.lookback_window, self.d_model)
+        self.date_projection = nn.Linear(self.time_feat_dim, self.d_model)
         self.asset_embedding = nn.Embedding(self.num_assets, self.d_model)
+        self.concat_projection = nn.Linear(3 * self.d_model, self.d_model)
+        self.input_norm = nn.LayerNorm(self.d_model)
 
         temporal_layer = nn.TransformerEncoderLayer(
             d_model=self.d_model,
@@ -69,72 +63,65 @@ class Model(nn.Module):
             nn.Linear(self.d_model, 1),
         )
 
-        nn.init.normal_(self.time_position, mean=0.0, std=0.02)
+    def encode_inputs(
+        self, log_return_path: torch.Tensor, date_feats: torch.Tensor
+    ) -> torch.Tensor:
+        """Encode ``(B,H,N,W)`` paths with date and asset identity features."""
 
-    def encode_market_window(self, market_window: torch.Tensor) -> torch.Tensor:
-        """Encode a market window into asset representations.
-
-        Args:
-            market_window: ``(B, W, N, F)``.  A three-dimensional
-                ``(B, W, N)`` tensor is accepted and treated as ``F=1``.
-        """
-
-        if not isinstance(market_window, torch.Tensor):
-            raise TypeError("market_window must be a torch.Tensor")
-        if market_window.ndim == 3:
-            market_window = market_window.unsqueeze(-1)
-        if market_window.ndim != 4:
-            raise ValueError("market_window must have shape (B, W, N, F)")
-
-        batch_size, window, num_assets, feature_dim = market_window.shape
+        if log_return_path.ndim != 4:
+            raise ValueError("log_return_path must have shape (B, H, N, W)")
+        batch_size, horizon, num_assets, window = log_return_path.shape
+        if horizon != self.horizon:
+            raise ValueError(f"expected horizon {self.horizon}, got {horizon}")
         if window != self.lookback_window:
-            raise ValueError(
-                f"expected lookback window {self.lookback_window}, got {window}"
-            )
+            raise ValueError(f"expected path width {self.lookback_window}, got {window}")
         if num_assets != self.num_assets:
+            raise ValueError(f"expected {self.num_assets} assets, got {num_assets}")
+        if date_feats.shape != (batch_size, horizon, self.time_feat_dim):
             raise ValueError(
-                f"expected {self.num_assets} assets, got {num_assets}"
+                f"date_feats must have shape (B, H, {self.time_feat_dim})"
             )
-        if feature_dim != self.input_dim:
-            raise ValueError(
-                f"expected input_dim={self.input_dim}, got {feature_dim}"
-            )
-        if not torch.isfinite(market_window).all():
-            raise ValueError("market_window contains NaN or infinite values")
+        if not torch.isfinite(log_return_path).all() or not torch.isfinite(date_feats).all():
+            raise ValueError("model inputs contain NaN or infinite values")
 
-        # Apply temporal attention independently to each asset.
-        x = self.input_projection(market_window)
-        x = self.input_norm(x)
-        x = x.permute(0, 2, 1, 3).contiguous()
-        x = x.reshape(batch_size * num_assets, window, self.d_model)
-        x = x + self.time_position[:, :window]
-        x = self.temporal_encoder(x)
-        x = x.mean(dim=1)
-        x = x.reshape(batch_size, num_assets, self.d_model)
+        path_emb = self.path_projection(log_return_path)
+        date_emb = self.date_projection(date_feats).unsqueeze(2).expand(-1, -1, num_assets, -1)
+        asset_ids = torch.arange(num_assets, device=log_return_path.device)
+        asset_emb = self.asset_embedding(asset_ids).view(1, 1, num_assets, -1).expand(batch_size, horizon, -1, -1)
+        x = self.input_norm(self.concat_projection(torch.cat((path_emb, date_emb, asset_emb), dim=-1)))
 
-        # Then model cross-asset interactions with ordinary self-attention.
-        asset_ids = torch.arange(num_assets, device=market_window.device)
-        x = x + self.asset_embedding(asset_ids).unsqueeze(0)
-        hidden = self.final_norm(self.asset_encoder(x))
-        return hidden
+        # Temporal attention is causal and is applied independently per asset.
+        x = x.permute(0, 2, 1, 3).reshape(batch_size * num_assets, horizon, self.d_model)
+        causal_mask = torch.triu(
+            torch.ones(horizon, horizon, device=x.device, dtype=torch.bool), diagonal=1
+        )
+        x = self.temporal_encoder(x, mask=causal_mask)
+        x = x.reshape(batch_size, num_assets, horizon, self.d_model).permute(0, 2, 1, 3)
+
+        # Asset attention is applied independently at every horizon position.
+        x = x.reshape(batch_size * horizon, num_assets, self.d_model)
+        x = self.final_norm(self.asset_encoder(x))
+        return x.reshape(batch_size, horizon, num_assets, self.d_model)
 
     def predict_from_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Project asset representations to one expected-return vector."""
+        """Project ``(..., N, d_model)`` representations to decision logits."""
 
-        if hidden.ndim != 3 or hidden.shape[-2:] != (
+        if hidden.ndim < 3 or hidden.shape[-2:] != (
             self.num_assets,
             self.d_model,
         ):
             raise ValueError(
-                "hidden must have shape (B, num_assets, d_model)"
+                "hidden must have trailing shape (num_assets, d_model)"
             )
         mu_hat = self.return_head(hidden).squeeze(-1)
         return mu_hat
 
-    def forward(self, market_window: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Encode a market window and return ``(hidden, mu_hat)``."""
+    def forward(
+        self, log_return_path: torch.Tensor, date_feats: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return hidden states and logits with shapes ``(B,H,N,M)/(B,H,N)``."""
 
-        hidden = self.encode_market_window(market_window)
+        hidden = self.encode_inputs(log_return_path, date_feats)
         mu_hat = self.predict_from_hidden(hidden)
         return hidden, mu_hat
 
@@ -160,7 +147,7 @@ class DecisionAwareAssetAttention(nn.Module):
             nn.Linear(d_model, d_model),
             nn.Sigmoid(),
         )
-        self.bias_scale = nn.Parameter(torch.tensor(0.1))
+        self.bias_scale = nn.Parameter(torch.full((n_heads,), 0.1))
 
     def forward(
         self,
@@ -188,7 +175,9 @@ class DecisionAwareAssetAttention(nn.Module):
                 decision_bias = decision_bias.unsqueeze(1)
             if decision_bias.shape[-2:] != (num_assets, num_assets):
                 raise ValueError("decision_bias must have shape (..., N, N)")
-            scores = scores + self.bias_scale * decision_bias
+            if decision_bias.shape[1] not in (1, self.n_heads):
+                raise ValueError("decision_bias head dimension must be 1 or n_heads")
+            scores = scores + self.bias_scale.view(1, -1, 1, 1) * decision_bias
         attention = torch.softmax(scores, dim=-1)
         output = torch.matmul(attention, v)
         output = output.transpose(1, 2).contiguous().view(
@@ -198,8 +187,37 @@ class DecisionAwareAssetAttention(nn.Module):
         return self.norm(hidden + output)
 
 
+class PrimalDualBiasEncoder(nn.Module):
+    """Encode per-asset primal-dual states into low-rank multi-head bias."""
+
+    def __init__(self, input_dim: int, d_model: int, n_heads: int, rank: int):
+        super().__init__()
+        if rank <= 0:
+            raise ValueError("KKT bias rank must be positive")
+        self.n_heads = n_heads
+        self.rank = rank
+        self.norm = nn.LayerNorm(input_dim)
+        self.context = nn.Sequential(
+            nn.Linear(input_dim, d_model), nn.GELU(), nn.LayerNorm(d_model)
+        )
+        self.bias_query = nn.Linear(input_dim, n_heads * rank, bias=False)
+        self.bias_key = nn.Linear(input_dim, n_heads * rank, bias=False)
+
+    def forward(self, features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if features.ndim != 4:
+            raise ValueError("KKT features must have shape (B, H, N, K)")
+        batch, horizon, assets, _ = features.shape
+        z = self.norm(features)
+        context = self.context(z)
+        q = self.bias_query(z).view(batch, horizon, assets, self.n_heads, self.rank)
+        k = self.bias_key(z).view(batch, horizon, assets, self.n_heads, self.rank)
+        bias = torch.einsum("bhiar,bhjar->bhaij", q, k) / (self.rank ** 0.5)
+        scale = bias.abs().mean(dim=(-1, -2), keepdim=True).clamp_min(1e-6)
+        return context, (bias / scale).clamp(-5.0, 5.0)
+
+
 class DecisionAwareModel(nn.Module):
-    """Two-step KKTFormer with dual or Jacobian decision feedback."""
+    """Sequence-to-sequence KKTFormer with primal-dual attention feedback."""
 
     def __init__(self, configs, feedback_mode: str = "dual"):
         super().__init__()
@@ -211,28 +229,26 @@ class DecisionAwareModel(nn.Module):
         self.num_assets = self.backbone.num_assets
         self.d_model = self.backbone.d_model
         self.factor_dim = int(getattr(configs, "factor_dim", 3))
+        self.kkt_feature_dim = 8 + self.factor_dim
+        self.kkt_bias_rank = int(getattr(configs, "kkt_bias_rank", 4))
         self.attention = DecisionAwareAssetAttention(
             d_model=self.d_model,
             n_heads=self.backbone.n_heads,
             dropout=self.backbone.dropout,
         )
         self.refined_norm = nn.LayerNorm(self.d_model)
-        self.decision_context_encoder = nn.Sequential(
-            nn.Linear(4 + self.factor_dim, self.d_model),
-            nn.GELU(),
-            nn.LayerNorm(self.d_model),
+        self.kkt_encoder = PrimalDualBiasEncoder(
+            input_dim=self.kkt_feature_dim,
+            d_model=self.d_model,
+            n_heads=self.backbone.n_heads,
+            rank=self.kkt_bias_rank,
         )
 
     def initial_forward(
-        self, market_window: torch.Tensor
+        self, log_return_path: torch.Tensor, date_feats: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden = self.backbone.encode_market_window(market_window)
+        hidden = self.backbone.encode_inputs(log_return_path, date_feats)
         return hidden, self.backbone.predict_from_hidden(hidden)
-
-    @staticmethod
-    def _normalise_bias(bias: torch.Tensor) -> torch.Tensor:
-        scale = bias.abs().mean(dim=-1, keepdim=True).clamp_min(1e-6)
-        return (bias / scale).clamp(-5.0, 5.0)
 
     def refine(
         self,
@@ -240,13 +256,18 @@ class DecisionAwareModel(nn.Module):
         kkt_state: Dict[str, torch.Tensor],
         factor_exposure: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if hidden.ndim != 4:
+            raise ValueError("hidden must have shape (B, H, N, d_model)")
         weights = kkt_state["weights"]
-        pressure = kkt_state["pressure"]
+        marginal_risk = kkt_state["marginal_risk"]
+        stationarity = kkt_state["stationarity"]
+        lower_dual = kkt_state["lower_dual"]
+        upper_dual = kkt_state["upper_dual"]
         active_lower = kkt_state["active_lower"].to(hidden.dtype)
         active_upper = kkt_state["active_upper"].to(hidden.dtype)
         if factor_exposure is None:
             factor_exposure = torch.zeros(
-                hidden.shape[0],
+                hidden.shape[0], hidden.shape[1],
                 self.num_assets,
                 self.factor_dim,
                 dtype=hidden.dtype,
@@ -259,38 +280,48 @@ class DecisionAwareModel(nn.Module):
                 )
             factor_exposure = factor_exposure.to(dtype=hidden.dtype)
 
-        context_features = torch.cat(
+        kkt_features = torch.cat(
             [
                 weights.unsqueeze(-1),
-                pressure.unsqueeze(-1),
+                marginal_risk.unsqueeze(-1),
+                stationarity.unsqueeze(-1),
+                lower_dual.unsqueeze(-1),
+                upper_dual.unsqueeze(-1),
                 active_lower.unsqueeze(-1),
                 active_upper.unsqueeze(-1),
+                kkt_state["pressure"].unsqueeze(-1),
                 factor_exposure,
             ],
             dim=-1,
         )
-        decision_context = self.decision_context_encoder(context_features)
+        decision_context, decision_bias = self.kkt_encoder(kkt_features)
+        if self.feedback_mode == "jacobian":
+            jacobian = kkt_state["jacobian"]
+            jacobian = jacobian / jacobian.abs().mean(
+                dim=(-1, -2), keepdim=True
+            ).clamp_min(1e-6)
+            decision_bias = decision_bias + jacobian.clamp(-5.0, 5.0).unsqueeze(2)
 
-        if self.feedback_mode == "dual":
-            pressure_norm = self._normalise_bias(pressure)
-            decision_bias = pressure_norm.unsqueeze(-1) * pressure_norm.unsqueeze(-2)
-        else:
-            decision_bias = self._normalise_bias(kkt_state["jacobian"])
-
+        batch, horizon, assets, width = hidden.shape
         refined_hidden = self.attention(
-            hidden,
-            decision_context,
-            decision_bias=decision_bias,
+            hidden.reshape(batch * horizon, assets, width),
+            decision_context.reshape(batch * horizon, assets, width),
+            decision_bias=decision_bias.reshape(
+                batch * horizon, self.backbone.n_heads, assets, assets
+            ),
         )
-        refined_hidden = self.refined_norm(refined_hidden)
+        refined_hidden = self.refined_norm(refined_hidden).reshape(
+            batch, horizon, assets, width
+        )
         return refined_hidden, self.backbone.predict_from_hidden(refined_hidden)
 
     def forward(
         self,
-        market_window: torch.Tensor,
+        log_return_path: torch.Tensor,
+        date_feats: torch.Tensor,
         kkt_state: Dict[str, torch.Tensor],
         factor_exposure: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        hidden0, mu0 = self.initial_forward(market_window)
+        hidden0, mu0 = self.initial_forward(log_return_path, date_feats)
         hidden1, mu1 = self.refine(hidden0, kkt_state, factor_exposure)
         return hidden0, mu0, hidden1, mu1

@@ -107,7 +107,7 @@ def parse_args():
         "--feedback_mode",
         type=str,
         choices=["none", "dual", "jacobian"],
-        default="none",
+        default="dual",
         help="stage-6 optimizer feedback variant",
     )
     parser.add_argument("--active_tolerance", type=float, default=1e-5)
@@ -117,19 +117,26 @@ def parse_args():
     parser.add_argument("--ff_dim", type=int, default=64)
     parser.add_argument("--dropout", type=float, default=0.1)
 
-    parser.add_argument("--optimizer_iterations", type=int, default=100)
+    parser.add_argument(
+        "--optimizer_iterations",
+        type=int,
+        default=10,
+        help="warm-started final optimizer steps; 10 is sufficient for the default QP",
+    )
+    parser.add_argument("--probe_optimizer_iterations", type=int, default=5)
     parser.add_argument("--projection_iterations", type=int, default=64)
     parser.add_argument("--constraint_projection_iterations", type=int, default=20)
     parser.add_argument(
         "--loss_mode",
         type=str,
         choices=["prediction", "utility", "cvar", "regret", "hybrid"],
-        default="prediction",
-        help="stage-5 training objective",
+        default="cvar",
+        help="end-to-end realized-return objective (sequence KKTFormer requires cvar)",
     )
     parser.add_argument("--prediction_loss", type=str, default="MSE")
     parser.add_argument("--cvar_alpha", type=float, default=0.95)
     parser.add_argument("--cvar_temperature", type=float, default=1e-3)
+    parser.add_argument("--kkt_bias_rank", type=int, default=4)
     parser.add_argument(
         "--prediction_weight",
         type=float,

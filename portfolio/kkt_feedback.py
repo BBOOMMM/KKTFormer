@@ -23,6 +23,7 @@ def compute_kkt_state(
     problem: MinimalPortfolioProblem,
     lower_bounds: torch.Tensor = None,
     active_tolerance: float = 1e-5,
+    compute_jacobian: bool = True,
 ) -> Dict[str, torch.Tensor]:
     """Extract box-constraint dual pressure and local decision sensitivity.
 
@@ -69,6 +70,7 @@ def compute_kkt_state(
     q = 0.5 * (sigma_batch + sigma_batch.transpose(-1, -2))
     q = q + problem.eta * eye.unsqueeze(0)
     gradient = torch.bmm(q, weights.unsqueeze(-1)).squeeze(-1) - mu_hat
+    marginal_risk = torch.bmm(q, weights.unsqueeze(-1)).squeeze(-1)
 
     active_lower = weights <= lower + active_tolerance
     active_upper = weights >= upper - active_tolerance
@@ -85,46 +87,42 @@ def compute_kkt_state(
     # The active set varies per sample, so the small KKT systems are solved in
     # a batch loop.  N is at most a few dozen in the current experiments and
     # this state is only constructed for the feedback pass.
-    jacobian = torch.zeros(
-        batch_size,
-        num_assets,
-        num_assets,
-        dtype=q.dtype,
-        device=q.device,
-    )
-    for batch_index in range(batch_size):
-        free_indices = torch.nonzero(free[batch_index], as_tuple=False).flatten()
-        free_count_item = int(free_indices.numel())
-        if free_count_item == 0:
-            continue
-        q_free = q[batch_index].index_select(0, free_indices).index_select(
-            1, free_indices
-        )
-        ones = torch.ones(
-            free_count_item, 1, dtype=q.dtype, device=q.device
-        )
-        kkt = torch.zeros(
-            free_count_item + 1,
-            free_count_item + 1,
+    jacobian = None
+    if compute_jacobian:
+        jacobian = torch.zeros(
+            batch_size,
+            num_assets,
+            num_assets,
             dtype=q.dtype,
             device=q.device,
         )
-        kkt[:free_count_item, :free_count_item] = q_free
-        kkt[:free_count_item, free_count_item:] = ones
-        kkt[free_count_item:, :free_count_item] = ones.transpose(0, 1)
-        rhs = torch.zeros(
-            free_count_item + 1,
-            free_count_item,
-            dtype=q.dtype,
-            device=q.device,
-        )
-        rhs[:free_count_item, :free_count_item] = torch.eye(
-            free_count_item, dtype=q.dtype, device=q.device
-        )
-        solution = torch.linalg.solve(kkt, rhs)[:free_count_item]
-        jacobian[batch_index][free_indices[:, None], free_indices[None, :]] = solution
+        for batch_index in range(batch_size):
+            free_indices = torch.nonzero(free[batch_index], as_tuple=False).flatten()
+            free_count_item = int(free_indices.numel())
+            if free_count_item == 0:
+                continue
+            q_free = q[batch_index].index_select(0, free_indices).index_select(
+                1, free_indices
+            )
+            ones = torch.ones(free_count_item, 1, dtype=q.dtype, device=q.device)
+            kkt = torch.zeros(
+                free_count_item + 1, free_count_item + 1,
+                dtype=q.dtype, device=q.device,
+            )
+            kkt[:free_count_item, :free_count_item] = q_free
+            kkt[:free_count_item, free_count_item:] = ones
+            kkt[free_count_item:, :free_count_item] = ones.transpose(0, 1)
+            rhs = torch.zeros(
+                free_count_item + 1, free_count_item,
+                dtype=q.dtype, device=q.device,
+            )
+            rhs[:free_count_item, :free_count_item] = torch.eye(
+                free_count_item, dtype=q.dtype, device=q.device
+            )
+            solution = torch.linalg.solve(kkt, rhs)[:free_count_item]
+            jacobian[batch_index][free_indices[:, None], free_indices[None, :]] = solution
 
-    return {
+    result = {
         "weights": weights,
         "active_lower": active_lower,
         "active_upper": active_upper,
@@ -132,7 +130,10 @@ def compute_kkt_state(
         "lower_dual": lower_dual,
         "upper_dual": upper_dual,
         "pressure": pressure,
-        "jacobian": jacobian,
         "budget_dual": nu.squeeze(-1),
         "stationarity": stationarity,
+        "marginal_risk": marginal_risk,
     }
+    if jacobian is not None:
+        result["jacobian"] = jacobian
+    return result

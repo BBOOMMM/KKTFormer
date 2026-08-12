@@ -200,10 +200,15 @@ def portfolio_cvar_loss(
         raise ValueError("alpha must be in (0, 1)")
     if smooth_temperature <= 0:
         raise ValueError("smooth_temperature must be positive")
-    if weights.shape[:-1] != future_returns.shape[:-2]:
-        raise ValueError("weights and future_returns have incompatible batch shapes")
+    sequence_weights = weights.shape == future_returns.shape
+    static_weights = weights.shape[:-1] == future_returns.shape[:-2]
+    if not (sequence_weights or static_weights):
+        raise ValueError("weights must be (...,N) or (...,H,N) matching future_returns")
 
-    portfolio_returns = torch.einsum("...hn,...n->...h", future_returns, weights)
+    if sequence_weights:
+        portfolio_returns = (future_returns * weights).sum(dim=-1)
+    else:
+        portfolio_returns = torch.einsum("...hn,...n->...h", future_returns, weights)
     portfolio_losses = -portfolio_returns
     var = torch.quantile(
         portfolio_losses.detach(), alpha, dim=-1, keepdim=True
@@ -213,15 +218,37 @@ def portfolio_cvar_loss(
     )
     cvar = var.squeeze(-1) + smooth_excess.mean(dim=-1) / (1.0 - alpha)
 
-    batch_size = int(weights.numel() // weights.shape[-1])
-    if w_prev is None:
-        turnover = torch.zeros(batch_size, dtype=weights.dtype, device=weights.device)
-        delta = torch.zeros_like(weights).reshape(batch_size, weights.shape[-1])
+    batch_size = int(future_returns.numel() // (future_returns.shape[-2] * future_returns.shape[-1]))
+    if sequence_weights:
+        if w_prev is None:
+            first_delta = torch.zeros_like(weights[..., 0, :])
+        elif w_prev.shape == weights.shape[:-2] + (weights.shape[-1],):
+            first_delta = weights[..., 0, :] - w_prev
+        elif w_prev.shape == weights.shape:
+            first_delta = weights[..., 0, :] - w_prev[..., 0, :]
+        else:
+            raise ValueError("w_prev must have shape (...,N) or (...,H,N)")
+        later_delta = weights[..., 1:, :] - weights[..., :-1, :]
+        delta_path = torch.cat((first_delta.unsqueeze(-2), later_delta), dim=-2)
+        turnover = delta_path.abs().sum(dim=(-1, -2)).reshape(batch_size)
+        smooth_norm = (
+            torch.sqrt(delta_path.square() + transaction_cost_smoothing**2)
+            - transaction_cost_smoothing
+        ).sum(dim=(-1, -2)).reshape(batch_size)
+        quadratic_norm = delta_path.square().sum(dim=(-1, -2)).reshape(batch_size)
     else:
-        if w_prev.shape != weights.shape:
-            raise ValueError("w_prev must have the same shape as weights")
-        delta = (weights - w_prev).reshape(batch_size, weights.shape[-1])
+        if w_prev is None:
+            delta = torch.zeros_like(weights).reshape(batch_size, weights.shape[-1])
+        else:
+            if w_prev.shape != weights.shape:
+                raise ValueError("w_prev must have the same shape as weights")
+            delta = (weights - w_prev).reshape(batch_size, weights.shape[-1])
         turnover = delta.abs().sum(dim=-1)
+        smooth_norm = (
+            torch.sqrt(delta.square() + transaction_cost_smoothing**2)
+            - transaction_cost_smoothing
+        ).sum(dim=-1)
+        quadratic_norm = delta.square().sum(dim=-1)
     cost_rate = _broadcast_batch_vector(
         transaction_cost_rate,
         batch_size=batch_size,
@@ -234,11 +261,8 @@ def portfolio_cvar_loss(
     if transaction_cost_smoothing <= 0:
         raise ValueError("transaction_cost_smoothing must be positive")
     transaction_cost = turnover * cost_rate
-    smooth_transaction_cost = cost_rate * (
-        torch.sqrt(delta.square() + transaction_cost_smoothing**2)
-        - transaction_cost_smoothing
-    ).sum(dim=-1)
-    quadratic_turnover = 0.5 * float(turnover_penalty) * delta.square().sum(dim=-1)
+    smooth_transaction_cost = cost_rate * smooth_norm
+    quadratic_turnover = 0.5 * float(turnover_penalty) * quadratic_norm
     total = cvar.reshape(batch_size) + smooth_transaction_cost + quadratic_turnover
     components = {
         "var": var.reshape(batch_size),

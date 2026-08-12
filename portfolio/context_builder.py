@@ -3,18 +3,17 @@
 The context builder is the stage-2 data boundary for KKTFormer.  It computes
 only quantities that are independent of the neural-network parameters:
 
-* a historical log-return market window;
+* ``H`` rolling log-return paths, one for each SIT horizon token;
 * a shrinkage covariance matrix ``Sigma_t``;
 * price-derived factor exposures ``B_t``;
 * the future simple-return path used only as a training/evaluation target;
 * static constraint and transaction-cost parameters.
 
-For a decision index ``t`` the historical price window contains the ``W``
-prices ending at ``t``.  The first prediction/execution date is ``t+1`` and
-its return is ``prices[t+1] / prices[t] - 1``.  Thus the context never uses a
-price after ``t`` to construct ``Sigma_t`` or ``B_t``.  This date convention
-matches SIT: a prediction for execution date ``R`` observes data through
-``R-1`` and evaluates the return from ``R`` to ``R+1``.
+For a decision index ``t``, horizon token ``h`` contains the ``W`` prices
+ending at ``t+h``.  Its execution date is ``t+h+1`` and its target is the
+return beginning on that date.  This exactly matches SIT's rolling-path
+layout.  ``Sigma_t`` and ``B_t`` remain point-in-time quantities constructed
+only from prices through ``t``.
 """
 
 from dataclasses import dataclass, replace
@@ -25,6 +24,7 @@ import numpy as np
 import pandas as pd
 
 from portfolio.problem import MinimalPortfolioProblem
+from utils.timefeatures import time_features
 
 
 DEFAULT_FACTOR_NAMES = ("market_beta", "momentum", "volatility")
@@ -327,29 +327,41 @@ def _build_context_at_frame(
     if future_length < H and not allow_incomplete_future:
         raise IndexError("not enough complete future horizon after decision_index")
 
-    # SIT's path input contains W observed prices.  KKTFormer consumes a
-    # return channel, so preserve the same W-step tensor shape by prepending a
-    # neutral return to the W-1 actual historical log returns.
-    historical_log_returns = _log_returns(historical_prices).astype(np.float32)
-    historical_log_returns = np.concatenate(
-        [np.zeros((1, n_assets), dtype=np.float32), historical_log_returns],
-        axis=0,
+    # Construct H rolling paths, matching SIT's per-horizon token layout.
+    # Each path contains W prices known immediately before that token's
+    # execution date.  The leading zero preserves the exact W-dimensional
+    # representation while retaining W-1 genuine log returns.
+    path_prices = []
+    future_dates = frame.index[first_future_index:future_end_exclusive].to_numpy(
+        dtype="datetime64[ns]"
     )
+    if future_dates.shape[0] < H + 1:
+        future_dates = np.concatenate(
+            [future_dates, np.repeat(future_dates[-1:], H + 1 - future_dates.shape[0])]
+        )
+    for step in range(H):
+        end = decision_index + step
+        available_end = min(end, len(frame) - 1)
+        start = available_end - W + 1
+        if start < 0:
+            raise IndexError("not enough history for rolling log-return path")
+        path = values[start : available_end + 1]
+        if path.shape[0] < W:
+            path = np.concatenate(
+                [path, np.repeat(path[-1:], W - path.shape[0], axis=0)], axis=0
+            )
+        path_prices.append(path)
+    path_prices = np.stack(path_prices, axis=0)
+    log_return_path = np.concatenate(
+        [np.zeros((H, 1, n_assets), dtype=np.float32),
+         np.log(path_prices[:, 1:] / path_prices[:, :-1]).astype(np.float32)],
+        axis=1,
+    ).transpose(0, 2, 1)  # (H, N, W)
     future_returns = _future_simple_returns(future_prices)
     if future_length < H:
         future_returns = np.concatenate(
             [future_returns, np.zeros((H - future_length, n_assets), dtype=np.float32)],
             axis=0,
-        )
-    future_dates = frame.index[first_future_index:future_end_exclusive].to_numpy(
-        dtype="datetime64[ns]"
-    )
-    if future_dates.shape[0] < H + 1:
-        # The loader expects a fixed H-date field.  Padded dates are never
-        # used for realized test returns; they only keep the custom KKT loss
-        # shape valid for the final incomplete context.
-        future_dates = np.concatenate(
-            [future_dates, np.repeat(future_dates[-1:], H + 1 - future_dates.shape[0])]
         )
 
     factor_lower = _normalise_bound_vector(
@@ -360,7 +372,8 @@ def _build_context_at_frame(
     )
 
     result = {
-        "market_window": historical_log_returns[..., None],  # (W, N, 1)
+        "log_return_path": log_return_path,  # (H, N, W)
+        "date_feats": time_features(pd.to_datetime(future_dates[:H]), freq="B").T.astype(np.float32),
         "future_returns": future_returns,  # (H, N), zero-padded only if allowed
         "Sigma": estimate_covariance(
             historical_prices, epsilon=config.covariance_epsilon
@@ -542,7 +555,8 @@ def build_contexts(
     ]
 
     dynamic_keys = {
-        "market_window",
+        "log_return_path",
+        "date_feats",
         "future_returns",
         "Sigma",
         "factor_exposure",

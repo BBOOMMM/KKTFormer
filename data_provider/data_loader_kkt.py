@@ -52,13 +52,14 @@ class Dataset_PortfolioContext(Dataset):
             )
 
         self._validate_context()
-        self.num_assets = int(self.context["market_window"].shape[-2])
-        self.lookback_window = int(self.context["market_window"].shape[-3])
+        self.num_assets = int(self.context["log_return_path"].shape[-2])
+        self.lookback_window = int(self.context["log_return_path"].shape[-1])
         self.horizon = int(self.context["future_returns"].shape[-2])
 
     def _validate_context(self) -> None:
         required = {
-            "market_window",
+            "log_return_path",
+            "date_feats",
             "future_returns",
             "Sigma",
             "factor_exposure",
@@ -74,15 +75,20 @@ class Dataset_PortfolioContext(Dataset):
         if missing:
             raise ValueError(f"context cache is missing fields: {sorted(missing)}")
 
-        n_samples = self.context["market_window"].shape[0]
-        for key in ("future_returns", "Sigma", "factor_exposure", "w_prev", "decision_date", "future_dates"):
+        paths = self.context["log_return_path"]
+        if paths.ndim != 4:
+            raise ValueError("log_return_path must have shape (samples, H, N, W)")
+        if self.context["date_feats"].shape[1:] != (paths.shape[1], 3):
+            raise ValueError("date_feats must have shape (samples, H, 3)")
+        n_samples = paths.shape[0]
+        for key in ("date_feats", "future_returns", "Sigma", "factor_exposure", "w_prev", "decision_date", "future_dates"):
             if self.context[key].shape[0] != n_samples:
                 raise ValueError(f"context field {key} has inconsistent sample count")
         if n_samples == 0:
             raise ValueError("context must contain at least one sample")
 
     def __len__(self) -> int:
-        return int(self.context["market_window"].shape[0])
+        return int(self.context["log_return_path"].shape[0])
 
     def __getitem__(self, index: int):
         context = self.context
@@ -92,8 +98,11 @@ class Dataset_PortfolioContext(Dataset):
             for date in context["future_dates"][index]
         ]
         item = {
-            "market_window": torch.from_numpy(
-                np.asarray(context["market_window"][index], dtype=np.float32)
+            "log_return_path": torch.from_numpy(
+                np.asarray(context["log_return_path"][index], dtype=np.float32)
+            ),
+            "date_feats": torch.from_numpy(
+                np.asarray(context["date_feats"][index], dtype=np.float32)
             ),
             "future_returns": torch.from_numpy(
                 np.asarray(context["future_returns"][index], dtype=np.float32)
