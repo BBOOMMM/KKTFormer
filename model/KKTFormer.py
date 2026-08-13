@@ -245,12 +245,17 @@ class DecisionAwareAssetAttention(nn.Module):
             nn.Sigmoid(),
         )
         self.bias_scale = nn.Parameter(torch.full((n_heads,), 0.1))
+        self.dynamic_query = nn.Linear(d_model, d_model, bias=False)
+        self.dynamic_key = nn.Linear(d_model, d_model, bias=False)
+        self.dynamic_gate_raw = nn.Parameter(torch.zeros(n_heads))
 
     def forward(
         self,
         hidden: torch.Tensor,
         decision_context: torch.Tensor,
         decision_bias: Optional[torch.Tensor] = None,
+        relation_context: Optional[torch.Tensor] = None,
+        dynamic_bias: bool = False,
     ) -> torch.Tensor:
         batch_size, num_assets, _ = hidden.shape
         context = self.context_projection(decision_context)
@@ -267,6 +272,24 @@ class DecisionAwareAssetAttention(nn.Module):
             batch_size, num_assets, self.n_heads, self.head_dim
         ).transpose(1, 2)
         scores = torch.matmul(q, k.transpose(-1, -2)) / (self.head_dim ** 0.5)
+        if dynamic_bias:
+            if relation_context is None:
+                raise ValueError("relation_context is required for dynamic_bias")
+            relation_q = self.dynamic_query(hidden).view(
+                batch_size, num_assets, self.n_heads, self.head_dim
+            ).transpose(1, 2)
+            relation_k = self.dynamic_key(relation_context).view(
+                batch_size, num_assets, self.n_heads, self.head_dim
+            ).transpose(1, 2)
+            dynamic = torch.matmul(
+                relation_q, relation_k.transpose(-1, -2)
+            ) / (self.head_dim ** 0.5)
+            dynamic = dynamic / dynamic.detach().abs().mean(
+                dim=(-1, -2), keepdim=True
+            ).clamp_min(1e-6)
+            scores = scores + torch.tanh(self.dynamic_gate_raw).view(
+                1, -1, 1, 1
+            ) * dynamic.clamp(-5.0, 5.0)
         if decision_bias is not None:
             if decision_bias.ndim == 3:
                 decision_bias = decision_bias.unsqueeze(1)
@@ -323,6 +346,7 @@ class DecisionAwareModel(nn.Module):
             "two_pass",
             "context",
             "bias",
+            "dynamic",
             "dual",
             "jacobian",
         }:
@@ -392,13 +416,14 @@ class DecisionAwareModel(nn.Module):
             dim=-1,
         )
         decision_context, decision_bias = self.kkt_encoder(kkt_features)
+        relation_context = decision_context
         # Keep every two-pass ablation parameter- and architecture-matched.
         # Only the information supplied to the refinement attention changes:
         #   two_pass: neither KKT path; context: hidden/context path only;
         #   bias: attention-score path only; dual: both KKT paths.
-        if self.feedback_mode in {"two_pass", "bias"}:
+        if self.feedback_mode in {"two_pass", "bias", "dynamic"}:
             decision_context = torch.zeros_like(decision_context)
-        if self.feedback_mode in {"two_pass", "context"}:
+        if self.feedback_mode in {"two_pass", "context", "dynamic"}:
             decision_bias = torch.zeros_like(decision_bias)
         if self.feedback_mode == "jacobian":
             jacobian = kkt_state["jacobian"]
@@ -414,6 +439,10 @@ class DecisionAwareModel(nn.Module):
             decision_bias=decision_bias.reshape(
                 batch * horizon, self.backbone.n_heads, assets, assets
             ),
+            relation_context=relation_context.reshape(
+                batch * horizon, assets, width
+            ) if self.feedback_mode == "dynamic" else None,
+            dynamic_bias=self.feedback_mode == "dynamic",
         )
         refined_hidden = self.refined_norm(refined_hidden).reshape(
             batch, horizon, assets, width

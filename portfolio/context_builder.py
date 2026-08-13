@@ -635,8 +635,9 @@ def build_context_cache_from_csv(
     ] = None,
     allow_incomplete_future_splits: Optional[Sequence[str]] = None,
     protocol: str = "sit",
+    input_kind: str = "prices",
 ) -> Dict[str, Path]:
-    """Build train/val/test archives from a Date-indexed price CSV.
+    """Build train/val/test archives from a Date-indexed price or return CSV.
 
     ``rebalance_frequencies`` optionally overrides the frequency per split.
     This is needed when the model is trained on daily decision samples but
@@ -651,6 +652,17 @@ def build_context_cache_from_csv(
         if data_pool <= 0 or data_pool > frame.shape[1]:
             raise ValueError("data_pool must be between 1 and the number of assets")
         frame = frame.iloc[:, :data_pool]
+
+    input_kind = str(input_kind).lower()
+    if input_kind not in {"prices", "returns"}:
+        raise ValueError("input_kind must be one of prices or returns")
+    if input_kind == "returns":
+        values = frame.to_numpy(dtype=np.float64)
+        if not np.isfinite(values).all():
+            raise ValueError("returns contain NaN or infinite values")
+        if (values <= -1.0).any():
+            raise ValueError("simple returns must be greater than -1")
+        frame = (1.0 + frame.astype(np.float64)).cumprod()
 
     if frame.shape[1] != config.problem.num_assets:
         raise ValueError(

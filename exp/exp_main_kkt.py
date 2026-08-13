@@ -25,10 +25,36 @@ from utils.tools import EarlyStopping, adjust_learning_rate
 from utils.sit_protocol import SIT_REBALANCE_DATE_SET, SIT_TEST_RANGE
 
 
+def ensure_feasible_probe_upper_bound(args) -> float:
+    """Give the structural probe a non-degenerate feasible simplex.
+
+    A fixed per-asset cap can become infeasible when the asset pool changes
+    (for example, 10 * 0.05 < 1).  Equality is also uninformative because it
+    forces the probe to the equal-weight portfolio, so retain a tiny amount of
+    feasible room above the equal-weight cap.
+    """
+
+    num_assets = int(args.data_pool)
+    budget_target = float(getattr(args, "budget_target", 1.0))
+    requested = float(getattr(args, "probe_upper_bound", 0.1))
+    minimum = budget_target / num_assets
+    margin = max(abs(minimum) * 1e-5, 1e-8)
+    effective = max(requested, minimum + margin)
+    if effective != requested:
+        print(
+            "[Probe] adjusted probe_upper_bound "
+            f"from {requested:g} to {effective:g}: "
+            f"data_pool={num_assets}, budget_target={budget_target:g}"
+        )
+        args.probe_upper_bound = effective
+    return effective
+
+
 class EXP_KKT(Exp_Basic):
     """KKTFormer-v0 experiment: prediction loss + constrained allocation."""
 
     def __init__(self, args):
+        ensure_feasible_probe_upper_bound(args)
         self.protocol = str(getattr(args, "protocol", "sit")).lower()
         if self.protocol not in {"sit", "native"}:
             raise ValueError("protocol must be one of sit or native")
@@ -38,12 +64,13 @@ class EXP_KKT(Exp_Basic):
             "two_pass",
             "context",
             "bias",
+            "dynamic",
             "dual",
             "jacobian",
         }:
             raise ValueError(
                 "feedback_mode must be one of none, two_pass, context, bias, "
-                "dual, or jacobian"
+                "dynamic, dual, or jacobian"
             )
         self.decision_layer = str(
             getattr(args, "decision_layer", "softmax")
@@ -988,7 +1015,7 @@ class EXP_KKT(Exp_Basic):
             evaluation_end = getattr(self.args, "evaluation_end_date", "2024-12-31")
 
         csv_path = Path(self.args.root_path) / self.args.data_path
-        prices = (
+        data_values = (
             pd.read_csv(csv_path, parse_dates=["Date"])
             .set_index("Date")
             .iloc[:, : self.args.data_pool]
@@ -996,13 +1023,21 @@ class EXP_KKT(Exp_Basic):
         )
         start = pd.Timestamp(evaluation_start)
         end = pd.Timestamp(evaluation_end)
-        start_position = int(prices.index.searchsorted(start, side="left"))
-        end_position = int(prices.index.searchsorted(end, side="right"))
+        start_position = int(data_values.index.searchsorted(start, side="left"))
+        end_position = int(data_values.index.searchsorted(end, side="right"))
         if end_position <= start_position:
             raise RuntimeError("invalid SIT evaluation price range")
         # SIT labels the return P[t+1] / P[t] - 1 with date t.  A backward
-        # pct_change would shift every realized return by one day.
-        forward_returns = prices.shift(-1).divide(prices) - 1.0
+        # pct_change would shift every realized return by one day.  A return
+        # CSV stores that same close-to-close return on its ending date, so
+        # row t+1 is shifted back and labeled by decision date t.
+        input_kind = str(getattr(self.args, "input_kind", "prices")).lower()
+        if input_kind == "returns":
+            forward_returns = data_values.shift(-1)
+        elif input_kind == "prices":
+            forward_returns = data_values.shift(-1).divide(data_values) - 1.0
+        else:
+            raise ValueError("input_kind must be one of prices or returns")
         daily_returns = forward_returns.loc[
             (forward_returns.index >= start) & (forward_returns.index <= end)
         ].dropna()
@@ -1014,6 +1049,11 @@ class EXP_KKT(Exp_Basic):
                 raise RuntimeError("no KKT test predictions were generated")
             last_prediction_date = pd.Timestamp(available_prediction_dates[-1])
             daily_returns = daily_returns.loc[:last_prediction_date]
+        realized_values = daily_returns.to_numpy(dtype=float)
+        if not np.isfinite(realized_values).all():
+            raise RuntimeError("evaluation returns contain NaN or infinite values")
+        if (realized_values <= -1.0).any():
+            raise RuntimeError("evaluation simple returns must be greater than -1")
 
         transaction_cost_bps = float(
             getattr(self.args, "trade_cost_bps", 0.0)
@@ -1172,7 +1212,7 @@ class EXP_KKT(Exp_Basic):
             if factor_exposure_values else 0.0,
             "MaxIndustryExposure": float(np.max(industry_exposure_values))
             if industry_exposure_values else 0.0,
-            "SequentialState": True,
+            "SequentialState": self.sequential_state,
             "NumTestContexts": float(len(event_records)),
             "NumCompleteHorizonContexts": float(len(total_losses)),
             "NumDailyObservations": float(len(daily_series)),

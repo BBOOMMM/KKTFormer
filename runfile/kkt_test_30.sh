@@ -3,22 +3,25 @@
 set -euo pipefail
 
 # Run this script from the KKTFormer repository root:
-#   bash runfile/kkt_test.sh
+#   bash runfile/kkt_test_30.sh
+# Dataset-specific wrappers may override the four KKT_* variables below while
+# inheriting every model, optimizer, loss, and training hyperparameter here.
 
 export CUDA_VISIBLE_DEVICES=0
 
 # -----------------------------------------------------------------------------
 # Experiment paths and protocol
 # -----------------------------------------------------------------------------
-root_path="./asset_data/"
-data_path="full_dataset.csv"
-context_root="./portfolio_context_cache"
+root_path="${KKT_ROOT_PATH:-./asset_data/}"
+data_path="${KKT_DATA_PATH:-full_dataset.csv}"
+context_root="${KKT_CONTEXT_ROOT:-./portfolio_context_cache}"
+input_kind="${KKT_INPUT_KIND:-prices}"
 checkpoints="./checkpoints_kkt/"
 results_path="./results_kkt/"
 log_dir="./logs/"
 
 protocol="sit"                    # sit | native
-data_pool=30
+data_pool="${KKT_DATA_POOL:-30}"
 window_size=60
 horizon=20
 rebalance_frequency=1             # ignored by the SIT protocol
@@ -32,7 +35,7 @@ evaluation_end_date="2024-12-31" # used by the native protocol
 # -----------------------------------------------------------------------------
 upper_bound=1.0
 lower_bound=0.0
-probe_upper_bound=0.05          # structural probe only; final softmax stays unconstrained
+probe_upper_bound="${KKT_PROBE_UPPER_BOUND:-0.05}" # structural probe only
 probe_lower_bound=0.0
 budget_target=1.0
 eta=1e-5
@@ -68,7 +71,7 @@ sequential_state=0                # 1 adds --sequential_state
 # -----------------------------------------------------------------------------
 input_dim=1
 factor_dim=3
-feedback_mode="dual"              # none | two_pass | context | bias | dual | jacobian
+feedback_mode="dynamic"              # none | two_pass | context | bias | dual | jacobian
 decision_layer="softmax"          # softmax (default) | optimizer (legacy ablation)
 active_tolerance=1e-5
 
@@ -108,10 +111,10 @@ temperature=1.0
 # Training and hardware
 # -----------------------------------------------------------------------------
 learning_rate=1e-3
-lradj="type3"
+lradj="type1"
 train_epochs=10
 batch_size=64
-patience=3
+patience=10
 num_workers=0
 itr=1
 seed=2023
@@ -123,7 +126,8 @@ devices="0,1"
 
 # Encode the main architecture choices in the experiment name. run_kkt.py also
 # appends the remaining protocol/optimizer/loss settings to its checkpoint key.
-model_id="kkt_${feedback_mode}_dp${data_pool}_lre${log_return_embed_dim}_de${date_embed_dim}_ae${asset_embed_dim}_dm${d_model}_nh${n_heads}_nl${num_layers}"
+default_model_id="${KKT_MODEL_PREFIX:-kkt}_${feedback_mode}_dp${data_pool}_lre${log_return_embed_dim}_de${date_embed_dim}_ae${asset_embed_dim}_dm${d_model}_nh${n_heads}_nl${num_layers}"
+model_id="${KKT_MODEL_ID:-$default_model_id}"
 
 cmd=(
   python -u run_kkt.py
@@ -131,6 +135,7 @@ cmd=(
   --root_path "$root_path"
   --data_path "$data_path"
   --context_root "$context_root"
+  --input_kind "$input_kind"
   --checkpoints "$checkpoints"
   --results_path "$results_path"
   --log_dir "$log_dir"

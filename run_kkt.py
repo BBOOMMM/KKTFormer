@@ -1,14 +1,32 @@
 """Command-line entry point for KKTFormer-v0."""
 
 import argparse
+import hashlib
 from pprint import pformat
 import random
 
 import numpy as np
 import torch
 
-from exp.exp_main_kkt import EXP_KKT
+from exp.exp_main_kkt import EXP_KKT, ensure_feasible_probe_upper_bound
 from utils.logger import setup_logger
+
+
+def filesystem_safe_setting(setting: str, max_bytes: int = 240) -> str:
+    """Compact an overlong experiment directory component deterministically."""
+
+    encoded = setting.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return setting
+    digest = hashlib.sha256(encoded).hexdigest()[:12]
+    marker = f"_h{digest}_"
+    marker_bytes = len(marker.encode("utf-8"))
+    available = max_bytes - marker_bytes
+    prefix_budget = available // 2
+    suffix_budget = available - prefix_budget
+    prefix = encoded[:prefix_budget].decode("utf-8", errors="ignore")
+    suffix = encoded[-suffix_budget:].decode("utf-8", errors="ignore")
+    return f"{prefix}{marker}{suffix}"
 
 
 def parse_args():
@@ -16,6 +34,12 @@ def parse_args():
     parser.add_argument("--model_id", type=str, default="kkt_v0")
     parser.add_argument("--root_path", type=str, default="./asset_data/")
     parser.add_argument("--data_path", type=str, default="full_dataset.csv")
+    parser.add_argument(
+        "--input_kind",
+        choices=["prices", "returns"],
+        default="prices",
+        help="interpret selected CSV value columns as prices or daily simple returns",
+    )
     parser.add_argument("--context_root", type=str, default="")
     parser.add_argument("--checkpoints", type=str, default="./checkpoints_kkt/")
     parser.add_argument("--results_path", type=str, default="./results_kkt/")
@@ -142,11 +166,12 @@ def parse_args():
     parser.add_argument(
         "--feedback_mode",
         type=str,
-        choices=["none", "two_pass", "context", "bias", "dual", "jacobian"],
+        choices=["none", "two_pass", "context", "bias", "dynamic", "dual", "jacobian"],
         default="dual",
         help=(
             "feedback ablation: none=one-pass, two_pass=matched refinement "
-            "without KKT, context/bias=single KKT path, dual=both KKT paths"
+            "without KKT, context/bias=single KKT path, dynamic=hidden-conditioned "
+            "KKT bias, dual=both KKT paths"
         ),
     )
     parser.add_argument("--active_tolerance", type=float, default=1e-5)
@@ -276,6 +301,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+    # Normalize this dataset-dependent structural-probe constraint before the
+    # experiment key is constructed, so checkpoints record the effective cap.
+    ensure_feasible_probe_upper_bound(args)
     log_path = setup_logger(args.log_dir, args.model_id)
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -309,6 +337,7 @@ def main():
             protocol_frequency = args.rebalance_frequency
         setting = (
             f"{args.model_id}_KKTFormer-v0_{args.protocol}_dp{args.data_pool}"
+            f"_ik{args.input_kind}"
             f"_w{args.window_size}_h{args.horizon}"
             f"_rb{protocol_frequency}"
             f"_trb{train_frequency}_vrb{val_frequency}_teb{test_frequency}"
@@ -330,6 +359,13 @@ def main():
                 f"_pw{args.prediction_weight}_seq",
                 f"_pw{args.prediction_weight}_er{args.entropy_regularization:g}"
                 f"_ee{args.entropy_epsilon:g}_seq",
+            )
+        full_setting = setting
+        setting = filesystem_safe_setting(full_setting)
+        if setting != full_setting:
+            print(
+                f"[Setting] compacted {len(full_setting.encode('utf-8'))}-byte "
+                f"directory name to {len(setting.encode('utf-8'))} bytes: {setting}"
             )
         print("\n" + "=" * 88)
         print(f"Experiment {iteration + 1}/{args.itr}")

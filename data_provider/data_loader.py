@@ -18,7 +18,8 @@ class Dataset_Sig(Dataset):
                  horizon: int = 20,
                  sig_scaler: StandardScaler | None = None,
                  pred_start: str | None = None,
-                 pred_end: str | None = None):
+                 pred_end: str | None = None,
+                 target_kind: str = "prices"):
         super().__init__()
         self.prices        = scaled_df.values.astype(np.float32)
         self.raw_prices    = unscaled_df.values.astype(np.float32)
@@ -30,6 +31,9 @@ class Dataset_Sig(Dataset):
         self.num_assets    = self.D
         self.pred_start = pd.to_datetime(pred_start) if pred_start else None
         self.pred_end   = pd.to_datetime(pred_end)   if pred_end   else None
+        if target_kind not in {"prices", "returns"}:
+            raise ValueError("target_kind must be 'prices' or 'returns'")
+        self.target_kind = target_kind
         self._build_valid_indices()
 
     @staticmethod
@@ -79,17 +83,15 @@ class Dataset_Sig(Dataset):
         x_sigs, cross_sigs = [], []
         for step in range(self.H):
             p_slice = self.prices[w0 + step : w1 + step]   # (W+1, D)
-            x_sigs.append(
-                np.stack([self._sig_level2(p_slice[:, j]) for j in range(self.D)], axis=0)
-            )
-            cross_step = []
-            for j in range(self.D):
-                row = []
-                for k in range(self.D):
-                    row.append(np.array([0.0], dtype=np.float32) if j == k
-                               else self._sig_cross(p_slice[:, j], p_slice[:, k]))
-                cross_step.append(np.stack(row, axis=0))
-            cross_sigs.append(np.stack(cross_step, axis=0))
+            increments = np.diff(p_slice, axis=0, prepend=p_slice[:1])
+            level2 = np.column_stack((
+                p_slice[-1] - p_slice[0],
+                np.sum(p_slice[:-1] * np.diff(p_slice, axis=0), axis=0),
+            )).astype(np.float32)
+            cross = (np.cumsum(increments, axis=0)[:-1].T @ increments[1:]).astype(np.float32)
+            np.fill_diagonal(cross, 0.0)
+            x_sigs.append(level2)
+            cross_sigs.append(cross[..., None])
 
         x_sigs     = np.stack(x_sigs, axis=0)                 # (H, D, 2)
         cross_sigs = np.stack(cross_sigs, axis=0)             # (H, D, D, 1)
@@ -98,8 +100,14 @@ class Dataset_Sig(Dataset):
         # Step 2 future returns & date strings 
         fut_ret, dates = [], []
         for t in range(h0, h1):
-            p_now, p_next = self.raw_prices[t], self.raw_prices[t + 1]
-            fut_ret.append((p_next - p_now) / (p_now + 1e-8))
+            if self.target_kind == "returns":
+                # A return CSV conventionally stores the close-to-close return
+                # on its ending date.  SIT labels date t with the return from
+                # price[t] to price[t+1], so the matching value is row t+1.
+                fut_ret.append(self.raw_prices[t + 1])
+            else:
+                p_now, p_next = self.raw_prices[t], self.raw_prices[t + 1]
+                fut_ret.append((p_next - p_now) / (p_now + 1e-8))
             dates.append(self.dates[t].strftime("%Y-%m-%d")) #  20250723 self.dates[i + self.W + 1]
         fut_ret = np.stack(fut_ret, axis=0).astype(np.float32)  # (H, D)
 

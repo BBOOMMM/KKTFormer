@@ -68,7 +68,7 @@ sequential_state=0                # 1 adds --sequential_state
 # -----------------------------------------------------------------------------
 input_dim=1
 factor_dim=3
-feedback_mode="dual"              # none | two_pass | context | bias | dual | jacobian
+feedback_mode="dynamic"              # none | two_pass | context | bias | dual | jacobian
 decision_layer="softmax"          # softmax (default) | optimizer (legacy ablation)
 active_tolerance=1e-5
 
@@ -89,7 +89,7 @@ probe_optimizer_iterations=50
 projection_iterations=64
 constraint_projection_iterations=20
 
-loss_mode="ktr"                   # cvar | hybrid | ktr (CVaR + KKT tail ranking)
+loss_mode="cvar"                   # cvar | hybrid | ktr (CVaR + KKT tail ranking)
 regret_weight=1.0                  # lambda_regret; used by hybrid
 prediction_loss="MSE"
 cvar_alpha=0.95
@@ -111,7 +111,7 @@ learning_rate=1e-3
 lradj="type1"
 train_epochs=10
 batch_size=64
-patience=3
+patience=10
 num_workers=0
 itr=1
 seed=2023

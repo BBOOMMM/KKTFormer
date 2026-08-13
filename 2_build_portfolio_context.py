@@ -36,6 +36,12 @@ def parse_args():
         help="CSV with a Date column and price columns",
     )
     parser.add_argument(
+        "--input_kind",
+        choices=["prices", "returns"],
+        default="prices",
+        help="interpret selected value columns as prices or daily simple returns",
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="./portfolio_context_cache/pool_30",
@@ -142,6 +148,7 @@ def main():
             else args.rebalance_frequency,
         },
         protocol=args.protocol,
+        input_kind=args.input_kind,
     )
     for split, path in output_paths.items():
         print(f"[{split}] saved context cache: {path}")

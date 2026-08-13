@@ -19,7 +19,8 @@ echo "Running with model_id: $model_id"
 python -u run.py \
   --is_training 1 \
   --root_path ./asset_data/ \
-  --data_path full_dataset_dow.csv \
+  --data_path DOW30_ret.csv \
+  --precomp_root ./signature_cache_dow30_6020 \
   --model_id "$model_id" \
   --model "$model_name" \
   --data FULL \
@@ -40,7 +41,7 @@ python -u run.py \
 wait
 
 
-UDA_VISIBLE_DEVICES=0
+CUDA_VISIBLE_DEVICES=0
 
 dp=20
 dm=32
@@ -59,7 +60,8 @@ echo "Running with model_id: $model_id"
 python -u run.py \
   --is_training 1 \
   --root_path ./asset_data/ \
-  --data_path full_dataset_dow.csv \
+  --data_path DOW30_ret.csv \
+  --precomp_root ./signature_cache_dow30_6020 \
   --model_id "$model_id" \
   --model "$model_name" \
   --data FULL \

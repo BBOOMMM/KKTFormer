@@ -143,12 +143,16 @@ attention_scores = QKᵀ / √d + γ_head × kkt_bias
 | TwoPass-NoKKT | `two_pass` | 是 | 置零 | 置零 |
 | KKT-Context | `context` | 是 | 是 | 置零 |
 | KKT-Bias | `bias` | 是 | 置零 | 是 |
+| Dynamic-KKT | `dynamic` | 是 | 不直接注入 | hidden-conditioned bias |
 | KKT-Full | `dual` | 是 | 是 | 是 |
 
 除 `none` 外的五种 two-pass 模式均实例化相同模块，参数量完全一致。
 `two_pass` 仍执行 Probe→KKT→refinement，但在进入 refinement attention 前将
 `decision_context` 和 `decision_bias` 都严格置零。`jacobian` 在 KKT-Full 上额外
 加入 `∂wᵢ/∂μⱼ`，保留为高成本消融。
+`dynamic` 不把 KKT context 直接加到 hidden，而是用当前 hidden 生成 query、用
+KKT context 生成 relation key，构造 query-conditioned attention bias；其每个 head
+的 gate 以零初始化，训练会自动学习是否使用 KKT 关系。
 
 ## SIT 对齐协议
 
@@ -269,7 +273,7 @@ results_kkt/
 | `--date_embed_dim` | `32` | date feature 经线性层后的维度 |
 | `--asset_embed_dim` | `32` | asset identity embedding 的维度 |
 | `--d_model` | `32` | 三路特征融合后投影到的 Transformer 隐状态维度 |
-| `--feedback_mode` | `dual` | `none`、`two_pass`、`context`、`bias`、`dual` 或 `jacobian`；依次对应 OnePass、TwoPass-NoKKT、KKT-Context、KKT-Bias、KKT-Full 和 Jacobian 消融 |
+| `--feedback_mode` | `dual` | `none`、`two_pass`、`context`、`bias`、`dynamic`、`dual` 或 `jacobian` |
 | `--kkt_bias_rank` | `4` | 每个 head 的 KKT bias 低秩维度 |
 | `--probe_optimizer_iterations` | `5` | 第一阶段 probe optimizer 迭代数 |
 | `--decision_layer` | `softmax` | 最终组合层；`optimizer` 保留为旧版消融 |

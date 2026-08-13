@@ -142,6 +142,14 @@ def data_provider_kkt(args, flag):
         .set_index("Date")
         .iloc[:, : args.data_pool]
     )
+    input_kind = str(getattr(args, "input_kind", "prices")).lower()
+    if input_kind not in {"prices", "returns"}:
+        raise ValueError("input_kind must be one of prices or returns")
+    if input_kind == "returns":
+        values = combined_prices.to_numpy(dtype=np.float64)
+        if not np.isfinite(values).all() or (values <= -1.0).any():
+            raise ValueError("simple returns must be finite and greater than -1")
+        combined_prices = (1.0 + combined_prices.astype(np.float64)).cumprod()
     protocol = str(getattr(args, "protocol", "sit")).lower()
 
     if protocol == "sit":
