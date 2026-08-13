@@ -16,6 +16,7 @@ from exp.exp_basic import Exp_Basic
 from portfolio import (
     DifferentiablePortfolioOptimizer,
     MinimalPortfolioProblem,
+    kkt_tail_ranking_loss,
     portfolio_cvar_loss,
     sequence_decision_regret_loss,
     compute_kkt_state,
@@ -110,11 +111,20 @@ class EXP_KKT(Exp_Basic):
         self.sequential_state = bool(getattr(args, "sequential_state", False))
         self._sequential_previous = None
         self.loss_mode = str(getattr(args, "loss_mode", "cvar")).lower()
-        if self.loss_mode not in {"cvar", "hybrid"}:
-            raise ValueError("sequence KKTFormer supports loss_mode=cvar or hybrid")
+        if self.loss_mode not in {"cvar", "hybrid", "ktr"}:
+            raise ValueError(
+                "sequence KKTFormer supports loss_mode=cvar, hybrid, or ktr"
+            )
+        if self.loss_mode == "ktr" and self.feedback_mode == "none":
+            raise ValueError("loss_mode=ktr requires a KKT probe feedback mode")
+        if self.loss_mode == "ktr" and self.decision_layer != "softmax":
+            raise ValueError("loss_mode=ktr requires decision_layer=softmax")
         self.regret_weight = float(getattr(args, "regret_weight", 0.1))
         if not math.isfinite(self.regret_weight) or self.regret_weight < 0.0:
             raise ValueError("regret_weight must be finite and non-negative")
+        self.ktr_weight = float(getattr(args, "ktr_weight", 0.01))
+        if not math.isfinite(self.ktr_weight) or self.ktr_weight < 0.0:
+            raise ValueError("ktr_weight must be finite and non-negative")
         self.prediction_weight = float(
             getattr(args, "prediction_weight", 0.1)
         )
@@ -461,6 +471,8 @@ class EXP_KKT(Exp_Basic):
         )
         cvar_loss = cvar_batch.mean()
         regret_loss = cvar_loss.detach() * 0.0
+        ktr_loss = cvar_loss.detach() * 0.0
+        ktr_components = None
         oracle_objective = cvar_loss.detach() * 0.0
         mean_return_loss = cvar_loss.detach() * 0.0
         oracle_return_loss = cvar_loss.detach() * 0.0
@@ -505,7 +517,26 @@ class EXP_KKT(Exp_Basic):
             mean_return_loss = regret_components["predicted_return_loss"].mean()
             oracle_return_loss = regret_components["oracle_return_loss"].mean()
 
-        total_loss = cvar_loss + self.regret_weight * regret_loss
+        if self.loss_mode == "ktr":
+            ktr_batch, ktr_components = kkt_tail_ranking_loss(
+                allocation_logits=allocation_logits,
+                weights=weights,
+                future_returns=future_returns,
+                pressure=state["probe_pressure"],
+                tail_alpha=float(getattr(self.args, "ktr_tail_alpha", 0.95)),
+                pressure_scale=float(getattr(self.args, "ktr_pressure_scale", 1.0)),
+                ranking_temperature=float(
+                    getattr(self.args, "ktr_ranking_temperature", 1.0)
+                ),
+                pressure_clip=float(getattr(self.args, "ktr_pressure_clip", 5.0)),
+            )
+            ktr_loss = ktr_batch.mean()
+
+        total_loss = (
+            cvar_loss
+            + self.regret_weight * regret_loss
+            + self.ktr_weight * ktr_loss
+        )
         zero = total_loss.detach() * 0.0
 
         details = {
@@ -515,6 +546,8 @@ class EXP_KKT(Exp_Basic):
             "cvar_loss": cvar_loss,
             "regret_loss": regret_loss,
             "weighted_regret_loss": self.regret_weight * regret_loss,
+            "ktr_loss": ktr_loss,
+            "weighted_ktr_loss": self.ktr_weight * ktr_loss,
             "mean_return_loss": mean_return_loss,
             "oracle_return_loss": oracle_return_loss,
             "risk_loss": zero,
@@ -528,6 +561,19 @@ class EXP_KKT(Exp_Basic):
             "turnover": cvar_components["turnover"].mean(),
             "smooth_transaction_cost": cvar_components["smooth_transaction_cost"].mean(),
         }
+        if ktr_components is not None:
+            details.update(
+                {
+                    "ktr_tail_fraction": ktr_components["tail_fraction"].mean(),
+                    "ktr_mean_pressure": ktr_components["mean_pressure"].mean(),
+                    "ktr_nonzero_pressure_ratio": ktr_components[
+                        "nonzero_pressure_ratio"
+                    ].mean(),
+                    "ktr_mean_pair_weight": ktr_components[
+                        "mean_pair_weight"
+                    ].mean(),
+                }
+            )
         for key in (
             "active_constraint_ratio",
             "turnover_violation",
@@ -584,6 +630,7 @@ class EXP_KKT(Exp_Basic):
         model_optimizer = optim.Adam(
             self.model.parameters(), lr=self.args.learning_rate
         )
+        total_steps = self.args.train_epochs * len(train_loader)
 
         for epoch in range(self.args.train_epochs):
             self.model.train()
@@ -593,13 +640,14 @@ class EXP_KKT(Exp_Basic):
             utility_losses = []
             cvar_losses = []
             regret_losses = []
+            ktr_losses = []
             progress = tqdm(
                 train_loader,
                 desc=f"Train {epoch + 1}/{self.args.train_epochs}",
                 unit="batch",
                 dynamic_ncols=True,
             )
-            for batch in progress:
+            for batch_index, batch in enumerate(progress):
                 model_optimizer.zero_grad(set_to_none=True)
                 previous = self._sequential_previous if self.sequential_state else None
                 loss, _, weights, _, _, details = self._forward_batch(
@@ -607,6 +655,13 @@ class EXP_KKT(Exp_Basic):
                 )
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                adjust_learning_rate(
+                    model_optimizer,
+                    epoch + 1,
+                    self.args,
+                    current_step=epoch * len(train_loader) + batch_index + 1,
+                    total_steps=total_steps,
+                )
                 model_optimizer.step()
                 if self.sequential_state:
                     self._sequential_previous = weights[:, 0].detach()
@@ -615,6 +670,7 @@ class EXP_KKT(Exp_Basic):
                 utility_losses.append(float(details["utility_loss"].item()))
                 cvar_losses.append(float(details["cvar_loss"].item()))
                 regret_losses.append(float(details["regret_loss"].item()))
+                ktr_losses.append(float(details["ktr_loss"].item()))
                 progress.set_postfix(loss=f"{train_losses[-1]:.6f}")
 
             val_loss = self._validation_loss(val_loader, epoch)
@@ -626,6 +682,7 @@ class EXP_KKT(Exp_Basic):
                 f"train_utility={np.mean(utility_losses):.8f} "
                 f"train_cvar={np.mean(cvar_losses):.8f} "
                 f"train_regret={np.mean(regret_losses):.8f} "
+                f"train_ktr={np.mean(ktr_losses):.8f} "
                 f"val_loss={val_loss:.8f}"
             )
             early_stopping(val_loss, self.model, str(checkpoint_dir))
@@ -765,6 +822,7 @@ class EXP_KKT(Exp_Basic):
         utility_losses = []
         cvar_losses = []
         regret_losses = []
+        ktr_losses = []
         event_turnovers = []
         event_transaction_costs = []
         budget_errors = []
@@ -824,6 +882,7 @@ class EXP_KKT(Exp_Basic):
                 regret_losses.extend(
                     [float(details["regret_loss"].item())] * batch_size
                 )
+                ktr_losses.extend([float(details["ktr_loss"].item())] * batch_size)
 
                 # Preserve the exact batch-size-one ordering: samples first,
                 # then horizon tokens. This keeps SIT's first-date dedup rule.
@@ -1040,6 +1099,11 @@ class EXP_KKT(Exp_Basic):
             "DecisionLayer": self.decision_layer,
             "SoftmaxTemperature": self.temperature,
             "RegretWeight": self.regret_weight,
+            "KTRWeight": self.ktr_weight,
+            "KTRTailAlpha": float(getattr(self.args, "ktr_tail_alpha", 0.95)),
+            "KTRPressureScale": float(
+                getattr(self.args, "ktr_pressure_scale", 1.0)
+            ),
             "CVaRVariant": str(getattr(self.args, "cvar_variant", "sit")),
             "EntropyRegularization": self.entropy_regularization,
             "EntropyEpsilon": self.entropy_epsilon,
@@ -1053,6 +1117,7 @@ class EXP_KKT(Exp_Basic):
             "CVaRLoss": float(np.mean(cvar_losses)) if cvar_losses else math.nan,
             "DecisionRegret": float(np.mean(regret_losses))
             if regret_losses else math.nan,
+            "KTRLoss": float(np.mean(ktr_losses)) if ktr_losses else math.nan,
             "MeanTurnover": float(np.mean(event_turnovers))
             if event_turnovers else 0.0,
             "MaxAbsBudgetResidual": float(np.max(np.abs(budget_errors))),

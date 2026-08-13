@@ -8,6 +8,7 @@ from .optimizer_layer import (
 )
 from .losses import (
     decision_regret_loss,
+    kkt_tail_ranking_loss,
     portfolio_cvar_loss,
     portfolio_objective_loss,
     sequence_decision_regret_loss,
@@ -19,6 +20,7 @@ __all__ = [
     "DifferentiablePortfolioOptimizer",
     "MinimalPortfolioProblem",
     "decision_regret_loss",
+    "kkt_tail_ranking_loss",
     "compute_kkt_state",
     "portfolio_cvar_loss",
     "portfolio_objective_loss",

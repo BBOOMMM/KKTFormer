@@ -93,6 +93,7 @@ class EXP_main(Exp_Basic):
 
         time_now   = time.time()
         train_steps = len(train_loader)
+        total_steps = self.args.train_epochs * train_steps
 
         for epoch in range(self.args.train_epochs):
             self.model.train()
@@ -117,6 +118,13 @@ class EXP_main(Exp_Basic):
                     temperature  = self.args.temperature
                 )
                 loss.backward()
+                adjust_learning_rate(
+                    model_optim,
+                    epoch + 1,
+                    self.args,
+                    current_step=epoch * train_steps + i + 1,
+                    total_steps=total_steps,
+                )
                 model_optim.step()
 
                 losses.append(loss.item());  cvars.append(batch_cvar)

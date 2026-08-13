@@ -109,6 +109,7 @@ class EXP_main(Exp_Basic):
         time_now = time.time()
 
         train_steps = len(train_loader)
+        total_steps = self.args.train_epochs * train_steps
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
 
         model_optim = self._select_optimizer()
@@ -150,6 +151,13 @@ class EXP_main(Exp_Basic):
                     time_now = time.time()
 
                 loss.backward()
+                adjust_learning_rate(
+                    model_optim,
+                    epoch + 1,
+                    self.args,
+                    current_step=epoch * train_steps + i + 1,
+                    total_steps=total_steps,
+                )
                 model_optim.step()
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))

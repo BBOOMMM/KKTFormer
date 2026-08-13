@@ -193,9 +193,9 @@ def parse_args():
     parser.add_argument(
         "--loss_mode",
         type=str,
-        choices=["cvar", "hybrid"],
+        choices=["cvar", "hybrid", "ktr"],
         default="cvar",
-        help="CVaR alone or CVaR plus realized decision regret",
+        help="CVaR alone, CVaR plus decision regret, or KKT tail ranking",
     )
     parser.add_argument(
         "--regret_weight",
@@ -213,6 +213,26 @@ def parse_args():
         help="SIT-exact quantile/ReLU objective or detached-VaR smooth ablation",
     )
     parser.add_argument("--cvar_temperature", type=float, default=1e-3)
+    parser.add_argument(
+        "--ktr_weight",
+        type=float,
+        default=0.01,
+        help="lambda_KTR in L = L_CVaR + lambda_KTR * L_KTR",
+    )
+    parser.add_argument(
+        "--ktr_tail_alpha",
+        type=float,
+        default=0.95,
+        help="tail quantile used to select KTR ranking scenarios",
+    )
+    parser.add_argument(
+        "--ktr_pressure_scale",
+        type=float,
+        default=1.0,
+        help="kappa controlling detached KKT pressure pair weights",
+    )
+    parser.add_argument("--ktr_ranking_temperature", type=float, default=1.0)
+    parser.add_argument("--ktr_pressure_clip", type=float, default=5.0)
     parser.add_argument("--kkt_bias_rank", type=int, default=4)
     parser.add_argument(
         "--prediction_weight",
@@ -227,7 +247,13 @@ def parse_args():
         help="fixed temperature of the final softmax allocation head",
     )
     parser.add_argument("--learning_rate", type=float, default=1e-3)
-    parser.add_argument("--lradj", type=str, default="type1")
+    parser.add_argument(
+        "--lradj",
+        type=str,
+        default="type1",
+        choices=("type1", "type2", "type3"),
+        help="type3: 10%% linear warmup, then cosine decay to 0.1x initial LR",
+    )
     parser.add_argument("--train_epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument(
@@ -294,7 +320,9 @@ def main():
             f"_plb{args.probe_lower_bound:g}_pub{args.probe_upper_bound:g}"
             f"_sn{args.signal_normalization}_ss{args.signal_scale:g}"
             f"_lm{args.loss_mode}_cv{args.cvar_variant}"
-            f"_rw{args.regret_weight:g}_pw{args.prediction_weight}"
+            f"_rw{args.regret_weight:g}_kw{args.ktr_weight:g}"
+            f"_ka{args.ktr_tail_alpha:g}_kp{args.ktr_pressure_scale:g}"
+            f"_pw{args.prediction_weight}"
             f"_seq{int(args.sequential_state)}_{iteration}"
         )
         if args.entropy_regularization != 0.0:

@@ -95,6 +95,11 @@ prediction_loss="MSE"
 cvar_alpha=0.95
 cvar_variant="sit"                # sit | smooth
 cvar_temperature=1e-3
+ktr_weight=0.01
+ktr_tail_alpha=0.95
+ktr_pressure_scale=1.0
+ktr_ranking_temperature=1.0
+ktr_pressure_clip=5.0
 kkt_bias_rank=4
 prediction_weight=0.1
 temperature=1.0
@@ -103,7 +108,7 @@ temperature=1.0
 # Training and hardware
 # -----------------------------------------------------------------------------
 learning_rate=1e-3
-lradj="type1"
+lradj="type3"
 train_epochs=10
 batch_size=64
 patience=3

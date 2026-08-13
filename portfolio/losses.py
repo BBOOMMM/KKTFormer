@@ -357,3 +357,107 @@ def portfolio_cvar_loss(
         "total_loss": total,
     }
     return total, components
+
+
+def kkt_tail_ranking_loss(
+    allocation_logits: torch.Tensor,
+    weights: torch.Tensor,
+    future_returns: torch.Tensor,
+    pressure: torch.Tensor,
+    tail_alpha: float = 0.95,
+    pressure_scale: float = 1.0,
+    ranking_temperature: float = 1.0,
+    pressure_clip: float = 5.0,
+    pressure_epsilon: float = 1e-8,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Rank assets on CVaR-tail days with detached KKT pressure weights.
+
+    The tail scenarios and pair labels are targets, not trainable quantities.
+    Likewise, probe pressure only controls credit assignment and is detached so
+    the model cannot reduce this loss by manipulating its sample weights.  Pair
+    losses are averaged (rather than summed) to keep the scale comparable when
+    the number of assets changes.
+
+    Args:
+        allocation_logits: Refined pre-softmax scores with shape ``(B,H,N)``.
+        weights: Final portfolio weights with shape ``(B,H,N)``.
+        future_returns: Realized next-period asset returns, shape ``(B,H,N)``.
+        pressure: Probe ``lower_dual + upper_dual``, shape ``(B,H,N)``.
+        tail_alpha: Quantile used only to select bad portfolio-return days.
+        pressure_scale: Kappa in ``1 + kappa * (p_i + p_j) / 2``.
+        ranking_temperature: Positive temperature for pairwise logit gaps.
+        pressure_clip: Upper bound after mean normalization of pressure.
+    """
+
+    if allocation_logits.ndim != 3:
+        raise ValueError("allocation_logits must have shape (B, H, N)")
+    if weights.shape != allocation_logits.shape:
+        raise ValueError("weights must have the same shape as allocation_logits")
+    if future_returns.shape != allocation_logits.shape:
+        raise ValueError("future_returns must have the same shape as allocation_logits")
+    if pressure.shape != allocation_logits.shape:
+        raise ValueError("pressure must have the same shape as allocation_logits")
+    if allocation_logits.shape[-1] < 2:
+        raise ValueError("KKT tail ranking requires at least two assets")
+    if not 0.0 < tail_alpha < 1.0:
+        raise ValueError("tail_alpha must be in (0, 1)")
+    if pressure_scale < 0.0:
+        raise ValueError("pressure_scale must be non-negative")
+    if ranking_temperature <= 0.0:
+        raise ValueError("ranking_temperature must be positive")
+    if pressure_clip <= 0.0:
+        raise ValueError("pressure_clip must be positive")
+    if pressure_epsilon <= 0.0:
+        raise ValueError("pressure_epsilon must be positive")
+
+    # CVaR identifies the bad time steps, but KTR must not alter the original
+    # CVaR graph through its discrete scenario selection.
+    with torch.no_grad():
+        portfolio_losses = -(weights.detach() * future_returns.detach()).sum(dim=-1)
+        tail_var = torch.quantile(
+            portfolio_losses, tail_alpha, dim=-1, keepdim=True
+        )
+        tail_mask = (portfolio_losses >= tail_var).to(allocation_logits.dtype)
+
+        detached_pressure = pressure.detach().clamp_min(0.0)
+        pressure_mean = detached_pressure.mean(dim=-1, keepdim=True)
+        normalized_pressure = (
+            detached_pressure / (pressure_mean + pressure_epsilon)
+        ).clamp(max=pressure_clip)
+
+        asset_count = allocation_logits.shape[-1]
+        pair_i, pair_j = torch.triu_indices(
+            asset_count,
+            asset_count,
+            offset=1,
+            device=allocation_logits.device,
+        )
+        return_gap = future_returns.detach()[..., pair_i] - future_returns.detach()[
+            ..., pair_j
+        ]
+        pair_label = torch.sign(return_gap)
+        valid_pair = (pair_label != 0).to(allocation_logits.dtype)
+        pair_weight = 1.0 + pressure_scale * 0.5 * (
+            normalized_pressure[..., pair_i] + normalized_pressure[..., pair_j]
+        )
+
+    logit_gap = allocation_logits[..., pair_i] - allocation_logits[..., pair_j]
+    pair_loss = F.softplus(
+        -pair_label * logit_gap / ranking_temperature
+    )
+    valid_count = valid_pair.sum(dim=-1).clamp_min(1.0)
+    ranking_by_time = (pair_weight * valid_pair * pair_loss).sum(dim=-1) / valid_count
+    tail_count = tail_mask.sum(dim=-1).clamp_min(1.0)
+    ranking_by_sample = (tail_mask * ranking_by_time).sum(dim=-1) / tail_count
+
+    components = {
+        "tail_var": tail_var.squeeze(-1),
+        "tail_fraction": tail_mask.mean(dim=-1),
+        "mean_pressure": detached_pressure.mean(dim=(-1, -2)),
+        "nonzero_pressure_ratio": (detached_pressure > 0).to(
+            allocation_logits.dtype
+        ).mean(dim=(-1, -2)),
+        "mean_pair_weight": pair_weight.mean(dim=(-1, -2)),
+        "ranking_loss": ranking_by_sample,
+    }
+    return ranking_by_sample, components

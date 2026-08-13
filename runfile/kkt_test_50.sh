@@ -51,7 +51,7 @@ turnover_penalty=0.0
 #   tau * sum_i [(w_i + epsilon) log(w_i + epsilon) - epsilon log(epsilon)]
 # tau=0 disables it; positive tau encourages a more diversified portfolio.
 # Supported by every feedback mode.
-entropy_regularization=1e-5           # tau; let the probe reveal box-active geometry
+entropy_regularization=1e-4           # tau; let the probe reveal box-active geometry
 entropy_epsilon=1e-4              # numerical smoothing near w_i=0
 
 max_turnover=""                   # e.g. 0.5; empty disables it
@@ -89,12 +89,17 @@ probe_optimizer_iterations=50
 projection_iterations=64
 constraint_projection_iterations=20
 
-loss_mode="cvar"                  # cvar | hybrid (CVaR + decision regret)
+loss_mode="ktr"                   # cvar | hybrid | ktr (CVaR + KKT tail ranking)
 regret_weight=1.0                  # lambda_regret; used by hybrid
 prediction_loss="MSE"
 cvar_alpha=0.95
 cvar_variant="sit"                # sit | smooth
 cvar_temperature=1e-3
+ktr_weight=0.01
+ktr_tail_alpha=0.95
+ktr_pressure_scale=1.0
+ktr_ranking_temperature=1.0
+ktr_pressure_clip=5.0
 kkt_bias_rank=4
 prediction_weight=0.1
 temperature=0.6
@@ -178,6 +183,11 @@ cmd=(
   --cvar_alpha "$cvar_alpha"
   --cvar_variant "$cvar_variant"
   --cvar_temperature "$cvar_temperature"
+  --ktr_weight "$ktr_weight"
+  --ktr_tail_alpha "$ktr_tail_alpha"
+  --ktr_pressure_scale "$ktr_pressure_scale"
+  --ktr_ranking_temperature "$ktr_ranking_temperature"
+  --ktr_pressure_clip "$ktr_pressure_clip"
   --kkt_bias_rank "$kkt_bias_rank"
   --prediction_weight "$prediction_weight"
   --temperature "$temperature"

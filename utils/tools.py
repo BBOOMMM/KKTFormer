@@ -1,4 +1,5 @@
 import os
+import math
 
 import numpy as np
 import torch
@@ -8,7 +9,34 @@ import pandas as pd
 plt.switch_backend('agg')
 
 
-def adjust_learning_rate(optimizer, epoch, args):
+def adjust_learning_rate(optimizer, epoch, args, current_step=None, total_steps=None):
+    if args.lradj == 'type3':
+        if current_step is None or total_steps is None:
+            return None
+        if total_steps <= 0:
+            raise ValueError('total_steps must be positive for type3 learning rate')
+
+        current_step = min(max(current_step, 1), total_steps)
+        warmup_steps = max(1, int(total_steps * 0.1))
+        if current_step <= warmup_steps:
+            lr = args.learning_rate * current_step / warmup_steps
+        else:
+            decay_steps = max(1, total_steps - warmup_steps)
+            progress = (current_step - warmup_steps) / decay_steps
+            min_lr_ratio = 0.1
+            cosine_ratio = 0.5 * (1.0 + math.cos(math.pi * progress))
+            lr = args.learning_rate * (
+                min_lr_ratio + (1.0 - min_lr_ratio) * cosine_ratio
+            )
+
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+        return lr
+
+    # type1/type2 are epoch-based and are updated by the epoch-end call.
+    if current_step is not None:
+        return None
+
     # lr = args.learning_rate * (0.2 ** (epoch // 2))
     if args.lradj == 'type1':
         lr_adjust = {epoch: args.learning_rate * (0.5 ** ((epoch - 1) // 1))}
@@ -17,11 +45,15 @@ def adjust_learning_rate(optimizer, epoch, args):
             2: 5e-5, 4: 1e-5, 6: 5e-6, 8: 1e-6,
             10: 5e-7, 15: 1e-7, 20: 5e-8
         }
+    else:
+        return None
     if epoch in lr_adjust.keys():
         lr = lr_adjust[epoch]
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
         print('Updating learning rate to {}'.format(lr))
+        return lr
+    return None
 
 
 class EarlyStopping:
