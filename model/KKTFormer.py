@@ -319,8 +319,17 @@ class DecisionAwareModel(nn.Module):
     def __init__(self, configs, feedback_mode: str = "dual"):
         super().__init__()
         feedback_mode = str(feedback_mode).lower()
-        if feedback_mode not in {"dual", "jacobian"}:
-            raise ValueError("feedback_mode must be dual or jacobian")
+        if feedback_mode not in {
+            "two_pass",
+            "context",
+            "bias",
+            "dual",
+            "jacobian",
+        }:
+            raise ValueError(
+                "feedback_mode must be one of two_pass, context, bias, dual, "
+                "or jacobian"
+            )
         self.feedback_mode = feedback_mode
         self.backbone = Model(configs)
         self.num_assets = self.backbone.num_assets
@@ -383,6 +392,14 @@ class DecisionAwareModel(nn.Module):
             dim=-1,
         )
         decision_context, decision_bias = self.kkt_encoder(kkt_features)
+        # Keep every two-pass ablation parameter- and architecture-matched.
+        # Only the information supplied to the refinement attention changes:
+        #   two_pass: neither KKT path; context: hidden/context path only;
+        #   bias: attention-score path only; dual: both KKT paths.
+        if self.feedback_mode in {"two_pass", "bias"}:
+            decision_context = torch.zeros_like(decision_context)
+        if self.feedback_mode in {"two_pass", "context"}:
+            decision_bias = torch.zeros_like(decision_bias)
         if self.feedback_mode == "jacobian":
             jacobian = kkt_state["jacobian"]
             jacobian = jacobian / jacobian.abs().mean(

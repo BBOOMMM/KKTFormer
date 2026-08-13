@@ -32,8 +32,18 @@ class EXP_KKT(Exp_Basic):
         if self.protocol not in {"sit", "native"}:
             raise ValueError("protocol must be one of sit or native")
         self.feedback_mode = str(getattr(args, "feedback_mode", "none")).lower()
-        if self.feedback_mode not in {"none", "dual", "jacobian"}:
-            raise ValueError("feedback_mode must be one of none, dual, jacobian")
+        if self.feedback_mode not in {
+            "none",
+            "two_pass",
+            "context",
+            "bias",
+            "dual",
+            "jacobian",
+        }:
+            raise ValueError(
+                "feedback_mode must be one of none, two_pass, context, bias, "
+                "dual, or jacobian"
+            )
         self.decision_layer = str(
             getattr(args, "decision_layer", "softmax")
         ).lower()

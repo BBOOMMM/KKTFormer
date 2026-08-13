@@ -142,9 +142,12 @@ def parse_args():
     parser.add_argument(
         "--feedback_mode",
         type=str,
-        choices=["none", "dual", "jacobian"],
+        choices=["none", "two_pass", "context", "bias", "dual", "jacobian"],
         default="dual",
-        help="stage-6 optimizer feedback variant",
+        help=(
+            "feedback ablation: none=one-pass, two_pass=matched refinement "
+            "without KKT, context/bias=single KKT path, dual=both KKT paths"
+        ),
     )
     parser.add_argument("--active_tolerance", type=float, default=1e-5)
     parser.add_argument(

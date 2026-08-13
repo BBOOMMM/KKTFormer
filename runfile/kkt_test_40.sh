@@ -50,8 +50,8 @@ turnover_penalty=0.0
 # Entropy regularization in the optimizer and KKT state:
 #   tau * sum_i [(w_i + epsilon) log(w_i + epsilon) - epsilon log(epsilon)]
 # tau=0 disables it; positive tau encourages a more diversified portfolio.
-# Supported by feedback_mode=none, dual, and jacobian.
-entropy_regularization=1e-4           # tau; let the probe reveal box-active geometry
+# Supported by every feedback mode.
+entropy_regularization=1e-5           # tau; let the probe reveal box-active geometry
 entropy_epsilon=1e-4              # numerical smoothing near w_i=0
 
 max_turnover=""                   # e.g. 0.5; empty disables it
@@ -68,7 +68,7 @@ sequential_state=0                # 1 adds --sequential_state
 # -----------------------------------------------------------------------------
 input_dim=1
 factor_dim=3
-feedback_mode="dual"              # none | dual | jacobian
+feedback_mode="dual"              # none | two_pass | context | bias | dual | jacobian
 decision_layer="softmax"          # softmax (default) | optimizer (legacy ablation)
 active_tolerance=1e-5
 

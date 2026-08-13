@@ -134,7 +134,21 @@ kkt_bias: (B,H,num_heads,N,N)
 attention_scores = QKᵀ / √d + γ_head × kkt_bias
 ```
 
-默认 `--feedback_mode dual` 使用高效的 primal-dual KKT bias。`--feedback_mode jacobian` 会额外加入 `∂wᵢ/∂μⱼ`，主要用于高成本消融；`--feedback_mode none` 是不使用 KKT feedback 的基线。
+默认 `--feedback_mode dual` 同时使用 primal-dual context 和 attention bias。
+为排除额外 refinement attention 及参数量带来的混淆，提供以下结构匹配消融：
+
+| 论文名称 | `--feedback_mode` | refinement attention | KKT context | KKT attention bias |
+| --- | --- | :---: | :---: | :---: |
+| OnePass Softmax | `none` | 否 | 否 | 否 |
+| TwoPass-NoKKT | `two_pass` | 是 | 置零 | 置零 |
+| KKT-Context | `context` | 是 | 是 | 置零 |
+| KKT-Bias | `bias` | 是 | 置零 | 是 |
+| KKT-Full | `dual` | 是 | 是 | 是 |
+
+除 `none` 外的五种 two-pass 模式均实例化相同模块，参数量完全一致。
+`two_pass` 仍执行 Probe→KKT→refinement，但在进入 refinement attention 前将
+`decision_context` 和 `decision_bias` 都严格置零。`jacobian` 在 KKT-Full 上额外
+加入 `∂wᵢ/∂μⱼ`，保留为高成本消融。
 
 ## SIT 对齐协议
 
@@ -255,7 +269,7 @@ results_kkt/
 | `--date_embed_dim` | `32` | date feature 经线性层后的维度 |
 | `--asset_embed_dim` | `32` | asset identity embedding 的维度 |
 | `--d_model` | `32` | 三路特征融合后投影到的 Transformer 隐状态维度 |
-| `--feedback_mode` | `dual` | `none`、`dual` 或 `jacobian` |
+| `--feedback_mode` | `dual` | `none`、`two_pass`、`context`、`bias`、`dual` 或 `jacobian`；依次对应 OnePass、TwoPass-NoKKT、KKT-Context、KKT-Bias、KKT-Full 和 Jacobian 消融 |
 | `--kkt_bias_rank` | `4` | 每个 head 的 KKT bias 低秩维度 |
 | `--probe_optimizer_iterations` | `5` | 第一阶段 probe optimizer 迭代数 |
 | `--decision_layer` | `softmax` | 最终组合层；`optimizer` 保留为旧版消融 |
@@ -275,7 +289,7 @@ results_kkt/
 | `--probe_upper_bound` | `0.1` | 仅 structural probe 使用的单资产上界，不约束最终 Softmax 仓位 |
 | `--probe_lower_bound` | `0.0` | 仅 structural probe 使用的单资产下界 |
 | `--turnover_penalty` | `0.0` | 二次换手惩罚 |
-| `--entropy_regularization` | `0.0` | 熵正则强度 `tau`；支持 `none/dual/jacobian` |
+| `--entropy_regularization` | `0.0` | 熵正则强度 `tau`；支持所有 feedback modes |
 | `--entropy_epsilon` | `1e-4` | 熵梯度和 Hessian 在零权重附近的平滑参数 |
 | `--trade_cost_bps` | `0.0` | 测试交易成本；SIT 协议下不进入训练 loss 或 KKT QP |
 | `--max_turnover` | disabled | 最大 L1 换手约束，仅 `feedback_mode=none` |

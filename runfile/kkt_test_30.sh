@@ -5,7 +5,7 @@ set -euo pipefail
 # Run this script from the KKTFormer repository root:
 #   bash runfile/kkt_test.sh
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 
 # -----------------------------------------------------------------------------
 # Experiment paths and protocol
@@ -32,7 +32,7 @@ evaluation_end_date="2024-12-31" # used by the native protocol
 # -----------------------------------------------------------------------------
 upper_bound=1.0
 lower_bound=0.0
-probe_upper_bound=0.1          # structural probe only; final softmax stays unconstrained
+probe_upper_bound=0.05          # structural probe only; final softmax stays unconstrained
 probe_lower_bound=0.0
 budget_target=1.0
 eta=1e-5
@@ -50,7 +50,7 @@ turnover_penalty=0.0
 # Entropy regularization in the optimizer and KKT state:
 #   tau * sum_i [(w_i + epsilon) log(w_i + epsilon) - epsilon log(epsilon)]
 # tau=0 disables it; positive tau encourages a more diversified portfolio.
-# Supported by feedback_mode=none, dual, and jacobian.
+# Supported by every feedback mode.
 entropy_regularization=1e-4           # tau; let the probe reveal box-active geometry
 entropy_epsilon=1e-4              # numerical smoothing near w_i=0
 
@@ -68,7 +68,7 @@ sequential_state=0                # 1 adds --sequential_state
 # -----------------------------------------------------------------------------
 input_dim=1
 factor_dim=3
-feedback_mode="dual"              # none | dual | jacobian
+feedback_mode="dual"              # none | two_pass | context | bias | dual | jacobian
 decision_layer="softmax"          # softmax (default) | optimizer (legacy ablation)
 active_tolerance=1e-5
 
@@ -106,7 +106,7 @@ learning_rate=1e-3
 lradj="type1"
 train_epochs=10
 batch_size=64
-patience=10
+patience=3
 num_workers=0
 itr=1
 seed=2023
