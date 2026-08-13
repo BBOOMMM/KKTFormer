@@ -32,6 +32,8 @@ evaluation_end_date="2024-12-31" # used by the native protocol
 # -----------------------------------------------------------------------------
 upper_bound=1.0
 lower_bound=0.0
+probe_upper_bound=0.1          # structural probe only; final softmax stays unconstrained
+probe_lower_bound=0.0
 budget_target=1.0
 eta=1e-5
 covariance_epsilon=1e-6
@@ -49,7 +51,7 @@ turnover_penalty=0.0
 #   tau * sum_i [(w_i + epsilon) log(w_i + epsilon) - epsilon log(epsilon)]
 # tau=0 disables it; positive tau encourages a more diversified portfolio.
 # Supported by feedback_mode=none, dual, and jacobian.
-entropy_regularization=1e-4       # tau
+entropy_regularization=1e-4           # tau; let the probe reveal box-active geometry
 entropy_epsilon=1e-4              # numerical smoothing near w_i=0
 
 max_turnover=""                   # e.g. 0.5; empty disables it
@@ -135,6 +137,8 @@ cmd=(
   --evaluation_end_date "$evaluation_end_date"
   --upper_bound "$upper_bound"
   --lower_bound "$lower_bound"
+  --probe_upper_bound "$probe_upper_bound"
+  --probe_lower_bound "$probe_lower_bound"
   --budget_target "$budget_target"
   --eta "$eta"
   --covariance_epsilon "$covariance_epsilon"

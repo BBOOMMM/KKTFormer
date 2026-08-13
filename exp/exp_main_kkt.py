@@ -56,6 +56,19 @@ class EXP_KKT(Exp_Basic):
             lower_bound=getattr(args, "lower_bound", 0.0),
             budget_target=getattr(args, "budget_target", 1.0),
         )
+        # The optimizer is a structural probe when feedback is enabled.  Its
+        # box geometry is intentionally independent of the final allocator's
+        # feasible set (a unit-simplex softmax by default).
+        self.probe_problem = MinimalPortfolioProblem(
+            num_assets=args.data_pool,
+            lookback_window=args.window_size,
+            horizon=args.horizon,
+            rebalance_frequency=problem_rebalance_frequency,
+            eta=args.eta,
+            upper_bound=getattr(args, "probe_upper_bound", 0.1),
+            lower_bound=getattr(args, "probe_lower_bound", 0.0),
+            budget_target=getattr(args, "budget_target", 1.0),
+        )
         self.portfolio_optimizer = DifferentiablePortfolioOptimizer(
             self.problem,
             num_iterations=args.optimizer_iterations,
@@ -66,7 +79,7 @@ class EXP_KKT(Exp_Basic):
             entropy_epsilon=getattr(args, "entropy_epsilon", 1e-4),
         )
         self.probe_optimizer = DifferentiablePortfolioOptimizer(
-            self.problem,
+            self.probe_problem,
             num_iterations=getattr(args, "probe_optimizer_iterations", 5),
             bisection_steps=args.projection_iterations,
             constraint_projection_iterations=getattr(
@@ -291,6 +304,16 @@ class EXP_KKT(Exp_Basic):
         w_prev_flat = repeat_horizon(w_prev)
         lower_flat = repeat_horizon(lower_bounds)
         upper_flat = repeat_horizon(upper_bounds)
+        probe_lower_flat = torch.as_tensor(
+            self.probe_problem.lower_bounds,
+            dtype=sigma.dtype,
+            device=self.device,
+        ).expand(batch_size * horizon, -1)
+        probe_upper_flat = torch.as_tensor(
+            self.probe_problem.upper_bounds,
+            dtype=sigma.dtype,
+            device=self.device,
+        ).expand(batch_size * horizon, -1)
         factor_flat = factor_sequence.reshape(
             batch_size * horizon, num_assets, factor_sequence.shape[-1]
         )
@@ -344,18 +367,21 @@ class EXP_KKT(Exp_Basic):
             hidden0, raw_mu0 = model_core.initial_forward(log_return_path, date_feats)
             mu0 = model_core.normalize_signal(raw_mu0, sigma)
             mu0_flat = mu0.reshape(batch_size * horizon, num_assets)
+            probe_optimizer_kwargs = dict(optimizer_kwargs)
+            probe_optimizer_kwargs["lower_bounds"] = probe_lower_flat
+            probe_optimizer_kwargs["upper_bounds"] = probe_upper_flat
             probe_weights, _ = self.probe_optimizer(
                 mu_hat=mu0_flat,
                 sigma=sigma_flat,
-                **optimizer_kwargs,
+                **probe_optimizer_kwargs,
             )
             kkt_state_flat = compute_kkt_state(
                 mu_hat=mu0_flat,
                 sigma=sigma_flat,
                 weights=probe_weights,
-                upper_bounds=upper_flat,
-                problem=self.problem,
-                lower_bounds=lower_flat,
+                upper_bounds=probe_upper_flat,
+                problem=self.probe_problem,
+                lower_bounds=probe_lower_flat,
                 active_tolerance=float(
                     getattr(self.args, "active_tolerance", 1e-5)
                 ),
@@ -398,6 +424,11 @@ class EXP_KKT(Exp_Basic):
             ]
             state["probe_entropy_gradient"] = kkt_state["entropy_gradient"]
             state["probe_entropy_curvature"] = kkt_state["entropy_curvature"]
+            state["probe_active_lower"] = kkt_state["active_lower"]
+            state["probe_active_upper"] = kkt_state["active_upper"]
+            state["probe_lower_dual"] = kkt_state["lower_dual"]
+            state["probe_upper_dual"] = kkt_state["upper_dual"]
+            state["probe_pressure"] = kkt_state["pressure"]
 
         cvar_batch, cvar_components = portfolio_cvar_loss(
             weights=weights,
@@ -739,6 +770,11 @@ class EXP_KKT(Exp_Basic):
         factor_exposure_values = []
         industry_exposure_values = []
         probe_kkt_residual_infs = []
+        probe_active_lower = []
+        probe_active_upper = []
+        probe_lower_duals = []
+        probe_upper_duals = []
+        probe_pressures = []
         asset_names = [f"Asset_{i}" for i in range(self.args.data_pool)]
         held_weights = torch.zeros(
             1, self.args.data_pool, dtype=torch.float32, device=self.device
@@ -829,6 +865,21 @@ class EXP_KKT(Exp_Basic):
                         .numpy()
                         .reshape(-1)
                         .tolist()
+                    )
+                    probe_active_lower.extend(
+                        state["probe_active_lower"].detach().cpu().numpy().reshape(-1).tolist()
+                    )
+                    probe_active_upper.extend(
+                        state["probe_active_upper"].detach().cpu().numpy().reshape(-1).tolist()
+                    )
+                    probe_lower_duals.extend(
+                        state["probe_lower_dual"].detach().cpu().numpy().reshape(-1).tolist()
+                    )
+                    probe_upper_duals.extend(
+                        state["probe_upper_dual"].detach().cpu().numpy().reshape(-1).tolist()
+                    )
+                    probe_pressures.extend(
+                        state["probe_pressure"].detach().cpu().numpy().reshape(-1).tolist()
                     )
                 if "turnover_violation" in state:
                     turnover_violations.extend(
@@ -982,6 +1033,8 @@ class EXP_KKT(Exp_Basic):
             "CVaRVariant": str(getattr(self.args, "cvar_variant", "sit")),
             "EntropyRegularization": self.entropy_regularization,
             "EntropyEpsilon": self.entropy_epsilon,
+            "ProbeLowerBound": float(self.probe_problem.lower_bounds[0]),
+            "ProbeUpperBound": float(self.probe_problem.upper_bounds[0]),
             "TestLoss": float(np.mean(total_losses)) if total_losses else math.nan,
             "PredictionLoss": float(np.mean(prediction_losses))
             if prediction_losses else math.nan,
@@ -1009,6 +1062,27 @@ class EXP_KKT(Exp_Basic):
                 float(np.max(probe_kkt_residual_infs))
                 if probe_kkt_residual_infs
                 else math.nan
+            ),
+            "ProbeActiveLowerRatio": (
+                float(np.mean(probe_active_lower)) if probe_active_lower else math.nan
+            ),
+            "ProbeActiveUpperRatio": (
+                float(np.mean(probe_active_upper)) if probe_active_upper else math.nan
+            ),
+            "MeanAbsProbeAlpha": (
+                float(np.mean(np.abs(probe_lower_duals)))
+                if probe_lower_duals else math.nan
+            ),
+            "MeanAbsProbeBeta": (
+                float(np.mean(np.abs(probe_upper_duals)))
+                if probe_upper_duals else math.nan
+            ),
+            "MeanProbePressure": (
+                float(np.mean(probe_pressures)) if probe_pressures else math.nan
+            ),
+            "ProbePressureAbove1e-6Ratio": (
+                float(np.mean(np.asarray(probe_pressures) > 1e-6))
+                if probe_pressures else math.nan
             ),
             "EvaluationEndDate": str(evaluation_end),
             "MaxTurnoverViolation": float(np.max(turnover_violations))

@@ -272,6 +272,8 @@ results_kkt/
 | `--signal_normalization_epsilon` | `1e-6` | signal 标准化数值稳定项 |
 | `--upper_bound` | `1.0` | 单资产仓位上界 |
 | `--lower_bound` | `0.0` | 单资产仓位下界 |
+| `--probe_upper_bound` | `0.1` | 仅 structural probe 使用的单资产上界，不约束最终 Softmax 仓位 |
+| `--probe_lower_bound` | `0.0` | 仅 structural probe 使用的单资产下界 |
 | `--turnover_penalty` | `0.0` | 二次换手惩罚 |
 | `--entropy_regularization` | `0.0` | 熵正则强度 `tau`；支持 `none/dual/jacobian` |
 | `--entropy_epsilon` | `1e-4` | 熵梯度和 Hessian 在零权重附近的平滑参数 |
@@ -282,6 +284,12 @@ results_kkt/
 | `--industry_lower/upper` | disabled | 行业暴露上下界，仅 `feedback_mode=none` |
 
 默认最终仓位由独立 allocation head 和 softmax 直接产生，只严格保证非负及权重和为 1。
+probe optimizer 使用独立的 box bounds，因此可以通过较紧的
+`--probe_upper_bound` 产生有信息量的 active set 和 upper-bound shadow price，
+而不会触发 softmax 最终组合的硬约束校验。`test_diagnostics.csv` 额外报告
+`ProbeActiveLowerRatio`、`ProbeActiveUpperRatio`、`MeanAbsProbeAlpha`、
+`MeanAbsProbeBeta`、
+`MeanProbePressure` 和 `ProbePressureAbove1e-6Ratio`。
 单资产上下界、总换手、风格/行业暴露等硬约束实验需要切回优化器消融：
 
 ```bash

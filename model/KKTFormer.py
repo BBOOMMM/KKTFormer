@@ -100,6 +100,7 @@ class Model(nn.Module):
             nn.Dropout(self.dropout),
             nn.Linear(self.d_model, 1),
         )
+        # self.return_head = nn.Linear(self.d_model, 1, bias=True)
         # Keep allocation logits separate from the risk-scaled return signal.
         # The latter is deliberately tiny and would make a direct softmax
         # nearly uniform; this head is free to learn the concentration scale.
@@ -109,6 +110,7 @@ class Model(nn.Module):
             nn.Dropout(self.dropout),
             nn.Linear(self.d_model, 1),
         )
+        # self.allocation_head = nn.Linear(self.d_model, 1, bias=True)
 
     def encode_inputs(
         self, log_return_path: torch.Tensor, date_feats: torch.Tensor

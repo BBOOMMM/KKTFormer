@@ -67,6 +67,18 @@ def parse_args():
     )
     parser.add_argument("--upper_bound", type=float, default=1.0)
     parser.add_argument("--lower_bound", type=float, default=0.0)
+    parser.add_argument(
+        "--probe_upper_bound",
+        type=float,
+        default=0.1,
+        help="per-asset upper bound used only by the structural probe optimizer",
+    )
+    parser.add_argument(
+        "--probe_lower_bound",
+        type=float,
+        default=0.0,
+        help="per-asset lower bound used only by the structural probe optimizer",
+    )
     parser.add_argument("--budget_target", type=float, default=1.0)
     parser.add_argument("--eta", type=float, default=1e-3)
     parser.add_argument("--covariance_epsilon", type=float, default=1e-6)
@@ -276,6 +288,7 @@ def main():
             f"_nh{args.n_heads}_nl{args.num_layers}"
             f"_oi{args.optimizer_iterations}_fb{args.feedback_mode}"
             f"_dl{args.decision_layer}_tp{args.temperature:g}"
+            f"_plb{args.probe_lower_bound:g}_pub{args.probe_upper_bound:g}"
             f"_sn{args.signal_normalization}_ss{args.signal_scale:g}"
             f"_lm{args.loss_mode}_cv{args.cvar_variant}"
             f"_rw{args.regret_weight:g}_pw{args.prediction_weight}"
