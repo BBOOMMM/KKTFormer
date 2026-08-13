@@ -37,7 +37,7 @@ eta=1e-5
 covariance_epsilon=1e-6
 
 signal_normalization="risk"       # risk | none
-signal_scale=0.05
+signal_scale=0.12
 signal_normalization_epsilon=1e-6
 
 trade_cost_bps=0.0
@@ -95,7 +95,7 @@ cvar_variant="sit"                # sit | smooth
 cvar_temperature=1e-3
 kkt_bias_rank=4
 prediction_weight=0.1
-temperature=1.0
+temperature=0.60
 
 # -----------------------------------------------------------------------------
 # Training and hardware
