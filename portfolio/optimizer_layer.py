@@ -38,6 +38,7 @@ class RiskBudgetedAllocator(nn.Module):
         self,
         temperature: float = 1.0,
         turnover_aversion: float = 0.0,
+        turnover_smoothing: float = 1.0,
         entropy_epsilon: float = 1e-4,
     ) -> None:
         super().__init__()
@@ -45,10 +46,13 @@ class RiskBudgetedAllocator(nn.Module):
             raise ValueError("temperature must be finite and positive")
         if turnover_aversion < 0 or not math.isfinite(float(turnover_aversion)):
             raise ValueError("turnover_aversion must be finite and non-negative")
+        if not 0.0 < turnover_smoothing <= 1.0 or not math.isfinite(float(turnover_smoothing)):
+            raise ValueError("turnover_smoothing must be in (0, 1]")
         if entropy_epsilon <= 0 or not math.isfinite(float(entropy_epsilon)):
             raise ValueError("entropy_epsilon must be finite and positive")
         self.temperature = float(temperature)
         self.turnover_aversion = float(turnover_aversion)
+        self.turnover_smoothing = float(turnover_smoothing)
         self.entropy_epsilon = float(entropy_epsilon)
 
     def forward(
@@ -64,28 +68,63 @@ class RiskBudgetedAllocator(nn.Module):
             weights = proposal
             turnover = torch.zeros_like(proposal[..., 0])
         else:
-            if w_prev.shape != proposal.shape:
-                raise ValueError("w_prev must have the same shape as logits")
-            turnover = (proposal - w_prev).abs().sum(dim=-1)
-            # This is the closed-form proximal blend for a quadratic turnover
-            # aversion.  It is intentionally bounded in [0, 1] and therefore
-            # cannot destabilize the simplex policy.
-            blend = 1.0 / (1.0 + self.turnover_aversion)
-            if max_turnover is not None:
-                cap = torch.as_tensor(
-                    max_turnover, dtype=proposal.dtype, device=proposal.device
+            blend = self.turnover_smoothing / (1.0 + self.turnover_aversion)
+
+            def blend_one(next_proposal, previous):
+                raw_turnover = (next_proposal - previous).abs().sum(dim=-1)
+                local_blend = torch.full_like(raw_turnover, blend)
+                if max_turnover is not None:
+                    cap = torch.as_tensor(
+                        max_turnover,
+                        dtype=next_proposal.dtype,
+                        device=next_proposal.device,
+                    )
+                    while cap.ndim < raw_turnover.ndim:
+                        cap = cap.unsqueeze(-1)
+                    cap = cap.clamp_min(1e-6).squeeze(-1)
+                    cap_blend = torch.minimum(
+                        torch.ones_like(raw_turnover),
+                        cap / raw_turnover.clamp_min(1e-6),
+                    )
+                    local_blend = local_blend * cap_blend
+                result = previous + local_blend.unsqueeze(-1) * (
+                    next_proposal - previous
                 )
-                while cap.ndim < proposal.ndim - 1:
-                    cap = cap.unsqueeze(-1)
-                cap = cap.clamp_min(1e-6)
-                cap_blend = torch.minimum(
-                    torch.ones_like(turnover), cap.squeeze(-1) / turnover.clamp_min(1e-6)
+                return result, (result - previous).abs().sum(dim=-1)
+
+            # When horizon tokens are available, recursively smooth them from
+            # the previous portfolio.  This prevents every token from jumping
+            # independently away from the same equal-weight anchor.
+            sequence_shape = proposal.shape[:-1]
+            if (
+                proposal.ndim >= 3
+                and w_prev.shape == proposal.shape[:-2] + (proposal.shape[-1],)
+            ):
+                path_weights = []
+                path_turnover = []
+                previous = w_prev
+                for horizon_index in range(proposal.shape[-2]):
+                    next_weights, next_turnover = blend_one(
+                        proposal[..., horizon_index, :], previous
+                    )
+                    path_weights.append(next_weights)
+                    path_turnover.append(next_turnover)
+                    previous = next_weights
+                weights = torch.stack(path_weights, dim=-2)
+                turnover = torch.stack(path_turnover, dim=-1)
+                previous_path = torch.cat(
+                    (w_prev.unsqueeze(-2), weights[..., :-1, :]), dim=-2
                 )
-                blend = blend * cap_blend
-            weights = w_prev + blend * (proposal - w_prev)
-            turnover = (weights - w_prev).abs().sum(dim=-1)
+                proposal_turnover = (proposal - previous_path).abs().sum(dim=-1)
+            elif w_prev.shape == proposal.shape:
+                weights, turnover = blend_one(proposal, w_prev)
+                proposal_turnover = (proposal - w_prev).abs().sum(dim=-1)
+            else:
+                raise ValueError(
+                    "w_prev must match logits or the leading batch shape plus an asset dimension"
+                )
         state = {
-            "proposal_turnover": turnover,
+            "proposal_turnover": proposal_turnover if w_prev is not None else turnover,
             "proposal_entropy": (
                 -proposal * torch.log(proposal.clamp_min(self.entropy_epsilon))
             ).sum(dim=-1),
@@ -93,6 +132,11 @@ class RiskBudgetedAllocator(nn.Module):
                 (weights - proposal).abs().sum(dim=-1)
                 if w_prev is not None
                 else torch.zeros_like(turnover)
+            ),
+            "turnover_smoothing": torch.as_tensor(
+                self.turnover_smoothing,
+                dtype=proposal.dtype,
+                device=proposal.device,
             ),
         }
         return weights, state

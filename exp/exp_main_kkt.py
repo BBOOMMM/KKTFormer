@@ -77,9 +77,15 @@ class EXP_KKT(Exp_Basic):
         self.decision_layer = str(
             getattr(args, "decision_layer", "softmax")
         ).lower()
-        if self.decision_layer not in {"softmax", "optimizer", "risk_budget"}:
+        if self.decision_layer not in {
+            "softmax",
+            "optimizer",
+            "risk_budget",
+            "risk_optimizer",
+        }:
             raise ValueError(
-                "decision_layer must be one of softmax, optimizer, or risk_budget"
+                "decision_layer must be one of softmax, optimizer, risk_budget, "
+                "or risk_optimizer"
             )
         self.temperature = float(getattr(args, "temperature", 1.0))
         if not math.isfinite(self.temperature) or self.temperature <= 0.0:
@@ -134,12 +140,18 @@ class EXP_KKT(Exp_Basic):
         )
         self.entropy_epsilon = float(getattr(args, "entropy_epsilon", 1e-4))
         self.turnover_penalty = float(getattr(args, "turnover_penalty", 0.0))
+        self.turnover_smoothing = float(
+            getattr(args, "turnover_smoothing", 1.0)
+        )
+        if not 0.0 < self.turnover_smoothing <= 1.0:
+            raise ValueError("turnover_smoothing must be in (0, 1]")
         self.risk_turnover_aversion = float(
             getattr(args, "risk_turnover_aversion", 0.0)
         )
         self.risk_allocator = RiskBudgetedAllocator(
             temperature=self.temperature,
             turnover_aversion=self.risk_turnover_aversion,
+            turnover_smoothing=self.turnover_smoothing,
             entropy_epsilon=self.entropy_epsilon,
         )
         self.transaction_cost_smoothing = float(
@@ -167,6 +179,17 @@ class EXP_KKT(Exp_Basic):
         self.prediction_weight = float(
             getattr(args, "prediction_weight", 0.1)
         )
+        self.forecast_weight = float(
+            getattr(args, "forecast_weight", 0.0)
+        )
+        if not math.isfinite(self.forecast_weight) or self.forecast_weight < 0.0:
+            raise ValueError("forecast_weight must be finite and non-negative")
+
+    @staticmethod
+    def _cross_sectional_zscore(value):
+        centered = value - value.mean(dim=-1, keepdim=True)
+        scale = value.std(dim=-1, unbiased=False, keepdim=True)
+        return centered / scale.clamp_min(1e-6)
 
     def _build_model(self):
         model_module = self.model_dict["KKTFormer"]
@@ -405,8 +428,42 @@ class EXP_KKT(Exp_Basic):
             "gross_exposure_limit": self.gross_exposure_limit,
             "entropy_regularization": self.entropy_regularization,
         }
-        self._validate_feedback_problem(optimizer_kwargs)
+        # The probe and the final decision solve different roles.  KKT
+        # feedback is intentionally kept tied to the small box-constrained
+        # probe, while the final optimizer may enforce richer portfolio
+        # constraints.  This lets the representation see primal-dual
+        # geometry without silently dropping factor/turnover constraints at
+        # execution time.
+        probe_constraint_kwargs = dict(optimizer_kwargs)
+        for name in (
+            "factor_lower",
+            "factor_upper",
+            "industry_lower",
+            "industry_upper",
+            "max_turnover",
+            "gross_exposure_limit",
+        ):
+            probe_constraint_kwargs[name] = None
+        self._validate_feedback_problem(probe_constraint_kwargs)
         self._validate_softmax_problem(optimizer_kwargs, lower_flat, upper_flat)
+        if self.decision_layer == "risk_budget":
+            unsupported_final = [
+                name
+                for name in (
+                    "factor_lower",
+                    "factor_upper",
+                    "industry_lower",
+                    "industry_upper",
+                    "max_turnover",
+                    "gross_exposure_limit",
+                )
+                if optimizer_kwargs[name] is not None
+            ]
+            if unsupported_final:
+                raise ValueError(
+                    "decision_layer=risk_budget cannot enforce hard constraints: "
+                    + ", ".join(unsupported_final)
+                )
 
         def reshape_state(flat_state):
             result = {}
@@ -426,7 +483,7 @@ class EXP_KKT(Exp_Basic):
             hidden0, raw_mu0 = model_core.initial_forward(log_return_path, date_feats)
             mu0 = model_core.normalize_signal(raw_mu0, sigma)
             mu0_flat = mu0.reshape(batch_size * horizon, num_assets)
-            probe_optimizer_kwargs = dict(optimizer_kwargs)
+            probe_optimizer_kwargs = dict(probe_constraint_kwargs)
             probe_optimizer_kwargs["lower_bounds"] = probe_lower_flat
             probe_optimizer_kwargs["upper_bounds"] = probe_upper_flat
             probe_weights, _ = self.probe_optimizer(
@@ -473,23 +530,44 @@ class EXP_KKT(Exp_Basic):
                 kkt_state=(kkt_state if self.feedback_mode != "none" else None),
             )
             weights_flat, allocator_state = self.risk_allocator(
-                allocation_logits.reshape(batch_size * horizon, num_assets),
-                w_prev=w_prev_flat,
+                allocation_logits,
+                w_prev=w_prev,
                 max_turnover=self.max_turnover,
             )
-            weights = weights_flat.reshape(batch_size, horizon, num_assets)
+            weights = weights_flat
+            weights_flat = weights.reshape(batch_size * horizon, num_assets)
             state = reshape_state(
                 self._softmax_state(
                     weights_flat, lower_flat, upper_flat, w_prev_flat
                 )
             )
             for key, value in allocator_state.items():
-                state[f"risk_{key}"] = reshape_state({"value": value})[
-                    "value"
-                ]
+                if isinstance(value, torch.Tensor) and value.shape == (batch_size, horizon):
+                    state[f"risk_{key}"] = value
+                elif (
+                    isinstance(value, torch.Tensor)
+                    and value.ndim > 0
+                    and value.shape[0] == batch_size * horizon
+                ):
+                    state[f"risk_{key}"] = reshape_state({"value": value})[
+                        "value"
+                    ]
         else:
+            # ``risk_optimizer`` uses the multi-route decision signal as the
+            # linear term of the final constrained QP.  Unlike a forecast MSE
+            # head, its scale is normalized to the covariance risk scale and
+            # receives gradients only through the realized portfolio loss.
+            if self.decision_layer == "risk_optimizer":
+                decision_signal = model_core.risk_budget_logits(
+                    log_return_path,
+                    allocation_hidden,
+                    kkt_state=(kkt_state if self.feedback_mode != "none" else None),
+                )
+                optimizer_mu = model_core.normalize_signal(decision_signal, sigma)
+            else:
+                optimizer_mu = mu_hat
             weights_flat, state_flat = self.portfolio_optimizer(
-                mu_hat=mu_hat.reshape(batch_size * horizon, num_assets),
+                mu_hat=optimizer_mu.reshape(batch_size * horizon, num_assets),
                 sigma=sigma_flat,
                 initial_weights=initial_weights,
                 **optimizer_kwargs,
@@ -530,6 +608,13 @@ class EXP_KKT(Exp_Basic):
             transaction_cost_smoothing=self.transaction_cost_smoothing,
         )
         cvar_loss = cvar_batch.mean()
+        # Train the return head on the same next-day cross section that is
+        # executed by the SIT evaluator. Standardization removes the
+        # arbitrary scale of the head and turns this into an alpha-ranking
+        # objective rather than a volatility-magnitude objective.
+        forecast_target = self._cross_sectional_zscore(future_returns)
+        forecast_prediction = self._cross_sectional_zscore(raw_mu_hat)
+        forecast_loss = (forecast_prediction - forecast_target).square().mean()
         risk_budget_loss = cvar_loss.detach() * 0.0
         risk_budget_components = None
         if self.loss_mode == "risk_budget":
@@ -620,6 +705,7 @@ class EXP_KKT(Exp_Basic):
             objective_loss
             + self.regret_weight * regret_loss
             + self.ktr_weight * ktr_loss
+            + self.forecast_weight * forecast_loss
         )
         zero = total_loss.detach() * 0.0
 
@@ -628,6 +714,7 @@ class EXP_KKT(Exp_Basic):
             "prediction_loss": zero,
             "utility_loss": zero,
             "cvar_loss": cvar_loss,
+            "forecast_loss": forecast_loss,
             "risk_budget_loss": risk_budget_loss,
             "regret_loss": regret_loss,
             "weighted_regret_loss": self.regret_weight * regret_loss,

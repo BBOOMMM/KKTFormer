@@ -106,6 +106,9 @@ def parse_args():
     parser.add_argument("--budget_target", type=float, default=1.0)
     parser.add_argument("--eta", type=float, default=1e-3)
     parser.add_argument("--covariance_epsilon", type=float, default=1e-6)
+    parser.add_argument("--covariance_robustness", type=float, default=0.35)
+    parser.add_argument("--covariance_decay", type=float, default=0.98)
+    parser.add_argument("--covariance_winsor_quantile", type=float, default=0.05)
     parser.add_argument(
         "--signal_normalization",
         type=str,
@@ -136,6 +139,12 @@ def parse_args():
     )
     parser.add_argument("--transaction_cost_smoothing", type=float, default=1e-4)
     parser.add_argument("--turnover_penalty", type=float, default=0.0)
+    parser.add_argument(
+        "--turnover_smoothing",
+        type=float,
+        default=1.0,
+        help="EMA step for sequential risk-budget allocations; lower means smoother turnover",
+    )
     parser.add_argument(
         "--risk_turnover_aversion",
         type=float,
@@ -215,11 +224,12 @@ def parse_args():
     parser.add_argument(
         "--decision_layer",
         type=str,
-        choices=["softmax", "optimizer", "risk_budget"],
+        choices=["softmax", "optimizer", "risk_budget", "risk_optimizer"],
         default="softmax",
         help=(
             "final portfolio layer; risk_budget combines multi-scale "
-            "risk-momentum logits with a turnover-aware allocator"
+            "risk-momentum logits with a turnover-aware allocator, while "
+            "risk_optimizer feeds the same signal into the constrained QP"
         ),
     )
     parser.add_argument("--projection_iterations", type=int, default=64)
@@ -284,6 +294,12 @@ def parse_args():
         help="prediction-loss weight for hybrid regret training",
     )
     parser.add_argument(
+        "--forecast_weight",
+        type=float,
+        default=0.0,
+        help="weight of the cross-sectional next-day forecast-ranking loss",
+    )
+    parser.add_argument(
         "--temperature",
         type=float,
         default=1.0,
@@ -292,8 +308,30 @@ def parse_args():
     parser.add_argument(
         "--risk_momentum_lookback",
         type=int,
-        default=120,
+        default=60,
         help="number of genuine return observations used by the risk prior",
+    )
+    parser.add_argument(
+        "--risk_scale_windows",
+        type=str,
+        default="20,40,60",
+        help="comma-separated causal sub-windows for learned risk-scale fusion",
+    )
+    parser.add_argument(
+        "--risk_score_normalization",
+        type=str,
+        choices=["zscore", "raw"],
+        default="zscore",
+        help=(
+            "risk-budget score geometry: zscore removes cross-sectional scale; "
+            "raw preserves causal return/volatility scale for temperature-aware allocation"
+        ),
+    )
+    parser.add_argument(
+        "--risk_score_epsilon",
+        type=float,
+        default=1e-4,
+        help="causal volatility floor added to raw return/volatility risk scores",
     )
     parser.add_argument(
         "--risk_momentum_short_weight",
@@ -306,6 +344,30 @@ def parse_args():
         type=float,
         default=0.0,
         help="learned Transformer allocation residual added to risk prior",
+    )
+    parser.add_argument(
+        "--risk_forecast_weight",
+        type=float,
+        default=0.0,
+        help="weight of the gated standardized return forecast in risk-budget logits",
+    )
+    parser.add_argument(
+        "--risk_contrarian_weight",
+        type=float,
+        default=0.35,
+        help="strength of the learned short-horizon reversal decision route",
+    )
+    parser.add_argument(
+        "--risk_defensive_weight",
+        type=float,
+        default=0.15,
+        help="strength of the learned downside-risk decision route",
+    )
+    parser.add_argument(
+        "--risk_prior_bias",
+        type=float,
+        default=0.4,
+        help="initial logit of the learned risk-prior gate",
     )
     parser.add_argument("--risk_downside_weight", type=float, default=0.25)
     parser.add_argument("--risk_drawdown_weight", type=float, default=0.10)
@@ -389,7 +451,14 @@ def main():
             f"_dl{args.decision_layer}_tp{args.temperature:g}"
             f"_rml{args.risk_momentum_lookback}_rms{args.risk_momentum_short_weight:g}"
             f"_rmr{args.risk_momentum_residual_weight:g}"
+            f"_rfw{args.risk_forecast_weight:g}_fpw{args.forecast_weight:g}"
+            f"_rcw{args.risk_contrarian_weight:g}_rdw{args.risk_defensive_weight:g}"
+            f"_rmsw{args.risk_scale_windows.replace(',', '-')}"
+            f"_rsn{args.risk_score_normalization}"
+            f"_rse{args.risk_score_epsilon:g}"
             f"_rta{args.risk_turnover_aversion:g}"
+            f"_ts{args.turnover_smoothing:g}"
+            f"_cr{args.covariance_robustness:g}_cd{args.covariance_decay:g}"
             f"_krs{args.kkt_risk_scale:g}"
             f"_plb{args.probe_lower_bound:g}_pub{args.probe_upper_bound:g}"
             f"_sn{args.signal_normalization}_ss{args.signal_scale:g}"

@@ -5,21 +5,21 @@ set -euo pipefail
 # Run this script from the KKTFormer repository root:
 #   bash runfile/kkt_test_50.sh
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 
 # -----------------------------------------------------------------------------
 # Experiment paths and protocol
 # -----------------------------------------------------------------------------
 root_path="./asset_data/"
 data_path="full_dataset.csv"
-context_root="./portfolio_context_cache_riskmom121"
+context_root="./portfolio_context_cache_robust60"
 checkpoints="./checkpoints_kkt/"
 results_path="./results_kkt/"
 log_dir="./logs/"
 
 protocol="sit"                    # sit | native
 data_pool=50
-window_size=121                  # 120 genuine returns + leading sentinel
+window_size=60                   # fair SIT-aligned lookback window
 horizon=20
 rebalance_frequency=1             # ignored by the SIT protocol
 train_rebalance_frequency=""      # empty: use rebalance_frequency
@@ -32,11 +32,14 @@ evaluation_end_date="2024-12-31" # used by the native protocol
 # -----------------------------------------------------------------------------
 upper_bound=1.0
 lower_bound=0.0
-probe_upper_bound=0.04            # non-degenerate KKT probe geometry for N=50
+probe_upper_bound=0.0201          # nearly active KKT box geometry for N=50
 probe_lower_bound=0.0
 budget_target=1.0
 eta=1e-3
 covariance_epsilon=1e-6
+covariance_robustness=0.35        # diagonal shrinkage after robustification
+covariance_decay=0.98             # causal recency weighting
+covariance_winsor_quantile=0.05   # causal tail clipping per asset
 
 signal_normalization="risk"       # risk | none
 signal_scale=0.12
@@ -45,19 +48,20 @@ signal_normalization_epsilon=1e-6
 trade_cost_bps=0.0
 transaction_cost_bps=""           # empty: use trade_cost_bps
 transaction_cost_smoothing=1e-4
-turnover_penalty=0.0
+turnover_penalty=0.02             # smooth path-level turnover objective
+turnover_smoothing=1.0            # preserve the first causal risk-budget decision
 
 # Entropy regularization in the optimizer and KKT state:
 #   tau * sum_i [(w_i + epsilon) log(w_i + epsilon) - epsilon log(epsilon)]
 # tau=0 disables it; positive tau encourages a more diversified portfolio.
 # Supported by every feedback mode.
-entropy_regularization=1e-4           # tau; let the probe reveal box-active geometry
+entropy_regularization=0               # probe retains KKT risk; final QP stays non-negative
 entropy_epsilon=1e-4              # numerical smoothing near w_i=0
 
-max_turnover=""                   # e.g. 0.5; empty disables it
+max_turnover=""                    # risk-budget allocator uses causal policy proposals
 gross_exposure_limit=""           # e.g. 1.0; empty disables it
-factor_lower=""                   # e.g. -0.2,-0.2,-0.2
-factor_upper=""                   # e.g. 0.2,0.2,0.2
+factor_lower=""
+factor_upper=""
 industry_exposure_path=""         # empty disables industry constraints
 industry_lower=""                 # scalar or comma-separated bounds
 industry_upper=""                 # scalar or comma-separated bounds
@@ -68,8 +72,8 @@ sequential_state=0                # 1 adds --sequential_state
 # -----------------------------------------------------------------------------
 input_dim=1
 factor_dim=3
-feedback_mode="dynamic"          # hidden-conditioned KKT attention plus risk-budget gate
-decision_layer="risk_budget"      # multi-scale risk-momentum + learned residual
+feedback_mode="dual"             # KKT context and low-rank bias paths together
+decision_layer="risk_budget"      # KKT-aware differentiable risk-budget policy
 active_tolerance=1e-5
 
 log_return_embed_dim=32
@@ -85,14 +89,15 @@ dropout=0.0
 # Differentiable optimizer and objective
 # -----------------------------------------------------------------------------
 optimizer_iterations=100
-probe_optimizer_iterations=10
+probe_optimizer_iterations=30
 projection_iterations=64
 constraint_projection_iterations=20
 
-loss_mode="risk_budget"           # CVaR + smooth downside/drawdown decision loss
-regret_weight=1.0                  # lambda_regret; used by hybrid
-prediction_loss="MSE"
-cvar_alpha=0.99
+loss_mode="hybrid"                # CVaR + detached decision-regret oracle
+regret_weight=0.01                 # lambda_regret; oracle is not a prediction loss
+prediction_loss="NONE"             # kept only for CLI compatibility; never used
+prediction_weight=0.0
+cvar_alpha=0.95
 cvar_variant="sit"                # sit | smooth
 cvar_temperature=1e-3
 ktr_weight=0.01
@@ -101,23 +106,30 @@ ktr_pressure_scale=1.0
 ktr_ranking_temperature=1.0
 ktr_pressure_clip=5.0
 kkt_bias_rank=3
-prediction_weight=0.1
-temperature=0.50
-risk_momentum_lookback=120
-risk_momentum_short_weight=0.0
-risk_momentum_residual_weight=0.005
+temperature=0.02                  # avoid GPU-sensitive near-corner allocation jumps
+risk_momentum_lookback=60         # do not introduce a hidden >60-day lookback
+risk_scale_windows="20"          # 20-day causal scale selected by the risk-budget gate
+risk_score_normalization="raw"   # preserve return/volatility scale for temperature-aware allocation
+risk_score_epsilon=1e-4           # stabilizes the raw risk score without flattening its scale
+risk_momentum_short_weight=0.15   # short-horizon trend correction
+risk_momentum_residual_weight=0.0 # no prediction residual in the causal policy
+risk_forecast_weight=0.0           # prediction route disabled for end-to-end policy
+risk_prior_bias=-0.8               # favor learned alpha when 60d prior is noisy
 risk_turnover_aversion=0.0
 risk_downside_weight=0.25
 risk_drawdown_weight=0.10
 risk_smoothing_temperature=0.01
-kkt_risk_scale=0.10                # stronger direct KKT risk-budget correction
+kkt_risk_scale=0.0                 # KKT remains active through dual attention feedback
+forecast_weight=0.0                # prediction loss is explicitly disabled
+risk_contrarian_weight=0.0         # isolate the causal trend route for this run
+risk_defensive_weight=1.0          # explicit downside-risk budget correction
 
 # -----------------------------------------------------------------------------
 # Training and hardware
 # -----------------------------------------------------------------------------
 learning_rate=1e-3
 lradj="type1"
-train_epochs=10                    # let the dynamic KKT path converge beyond one pass
+train_epochs=1                     # causal risk route has no prediction head to pretrain
 batch_size=128
 patience=4
 num_workers=0
@@ -131,7 +143,7 @@ devices="0,1"
 
 # Encode the main architecture choices in the experiment name. run_kkt.py also
 # appends the remaining protocol/optimizer/loss settings to its checkpoint key.
-model_id="kkt_riskbudget_multiscale_dp${data_pool}_w${window_size}_rm${risk_momentum_lookback}_res${risk_momentum_residual_weight}"
+model_id="kkt_decision_regret_factor_turnover_dp${data_pool}_w${window_size}"
 
 cmd=(
   conda run --no-capture-output -n alden python -u run_kkt.py
@@ -155,12 +167,16 @@ cmd=(
   --budget_target "$budget_target"
   --eta "$eta"
   --covariance_epsilon "$covariance_epsilon"
+  --covariance_robustness "$covariance_robustness"
+  --covariance_decay "$covariance_decay"
+  --covariance_winsor_quantile "$covariance_winsor_quantile"
   --signal_normalization "$signal_normalization"
   --signal_scale "$signal_scale"
   --signal_normalization_epsilon "$signal_normalization_epsilon"
   --trade_cost_bps "$trade_cost_bps"
   --transaction_cost_smoothing "$transaction_cost_smoothing"
   --turnover_penalty "$turnover_penalty"
+  --turnover_smoothing "$turnover_smoothing"
   --risk_turnover_aversion "$risk_turnover_aversion"
   --entropy_regularization "$entropy_regularization"
   --entropy_epsilon "$entropy_epsilon"
@@ -189,6 +205,7 @@ cmd=(
   --loss_mode "$loss_mode"
   --regret_weight "$regret_weight"
   --prediction_loss "$prediction_loss"
+  --forecast_weight "$forecast_weight"
   --cvar_alpha "$cvar_alpha"
   --cvar_variant "$cvar_variant"
   --cvar_temperature "$cvar_temperature"
@@ -202,8 +219,15 @@ cmd=(
   --prediction_weight "$prediction_weight"
   --temperature "$temperature"
   --risk_momentum_lookback "$risk_momentum_lookback"
+  --risk_scale_windows "$risk_scale_windows"
+  --risk_score_normalization "$risk_score_normalization"
+  --risk_score_epsilon "$risk_score_epsilon"
   --risk_momentum_short_weight "$risk_momentum_short_weight"
   --risk_momentum_residual_weight "$risk_momentum_residual_weight"
+  --risk_forecast_weight "$risk_forecast_weight"
+  --risk_contrarian_weight "$risk_contrarian_weight"
+  --risk_defensive_weight "$risk_defensive_weight"
+  --risk_prior_bias "$risk_prior_bias"
   --risk_downside_weight "$risk_downside_weight"
   --risk_drawdown_weight "$risk_drawdown_weight"
   --risk_smoothing_temperature "$risk_smoothing_temperature"

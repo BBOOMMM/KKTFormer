@@ -37,18 +37,42 @@ class Model(nn.Module):
             getattr(configs, "signal_normalization_epsilon", 1e-6)
         )
         self.eta = float(getattr(configs, "eta", 1e-3))
-        # A long-horizon risk-momentum prior supplies a second inductive bias
-        # that is independent of signature/path attention.  The input path is
-        # stored as [zero, log returns], hence a 121-point path contains 120
-        # genuine observations.
+        # Risk statistics are deliberately bounded by the model input window.
+        # The path is stored as [zero, log returns], so a 60-point path has 59
+        # genuine observations.  Several sub-windows provide a multi-scale
+        # prior without importing any history outside the SIT window.
         self.risk_momentum_lookback = int(
-            getattr(configs, "risk_momentum_lookback", 120)
+            getattr(configs, "risk_momentum_lookback", self.lookback_window)
         )
         self.risk_momentum_short_weight = float(
             getattr(configs, "risk_momentum_short_weight", 0.0)
         )
         self.risk_momentum_residual_weight = float(
             getattr(configs, "risk_momentum_residual_weight", 0.0)
+        )
+        self.risk_forecast_weight = float(
+            getattr(configs, "risk_forecast_weight", 0.0)
+        )
+        # The 60-point window contains several distinct decision regimes.  A
+        # trend-only prior is brittle when a recent rally is exhausted, while
+        # a pure low-volatility rule gives up too much return.  The policy
+        # therefore learns a convex mixture of trend, short-horizon reversal,
+        # and downside-risk signals.  These are decision features, not a
+        # prediction target, and are trained only through the portfolio loss.
+        self.risk_contrarian_weight = float(
+            getattr(configs, "risk_contrarian_weight", 0.35)
+        )
+        self.risk_defensive_weight = float(
+            getattr(configs, "risk_defensive_weight", 0.15)
+        )
+        self.risk_prior_bias = float(
+            getattr(configs, "risk_prior_bias", 0.4)
+        )
+        self.risk_score_normalization = str(
+            getattr(configs, "risk_score_normalization", "zscore")
+        ).lower()
+        self.risk_score_epsilon = float(
+            getattr(configs, "risk_score_epsilon", 1e-4)
         )
 
         if self.d_model % self.n_heads != 0:
@@ -61,6 +85,10 @@ class Model(nn.Module):
             raise ValueError("input embedding dimensions must be positive")
         if self.signal_normalization not in {"risk", "none"}:
             raise ValueError("signal_normalization must be risk or none")
+        if self.risk_score_normalization not in {"zscore", "raw"}:
+            raise ValueError("risk_score_normalization must be zscore or raw")
+        if self.risk_score_epsilon <= 0:
+            raise ValueError("risk_score_epsilon must be positive")
         if self.signal_scale <= 0:
             raise ValueError("signal_scale must be positive")
         if self.signal_normalization_epsilon <= 0:
@@ -71,6 +99,23 @@ class Model(nn.Module):
             raise ValueError("risk_momentum_short_weight must be in [0, 1]")
         if self.risk_momentum_residual_weight < 0:
             raise ValueError("risk_momentum_residual_weight cannot be negative")
+        if self.risk_forecast_weight < 0:
+            raise ValueError("risk_forecast_weight cannot be negative")
+        if self.risk_contrarian_weight < 0 or self.risk_defensive_weight < 0:
+            raise ValueError("risk signal weights cannot be negative")
+
+        raw_scales = getattr(configs, "risk_scale_windows", "20,40,60")
+        if isinstance(raw_scales, str):
+            scale_values = [item.strip() for item in raw_scales.split(",") if item.strip()]
+        else:
+            scale_values = list(raw_scales)
+        self.risk_scale_windows = tuple(sorted({int(item) for item in scale_values}))
+        if not self.risk_scale_windows or any(item <= 0 for item in self.risk_scale_windows):
+            raise ValueError("risk_scale_windows must contain positive windows")
+        if any(item > self.lookback_window for item in self.risk_scale_windows):
+            raise ValueError(
+                "risk_scale_windows cannot exceed the model lookback window"
+            )
 
         fusion_input_dim = (
             self.log_return_embed_dim
@@ -130,6 +175,43 @@ class Model(nn.Module):
             nn.Linear(self.d_model, 1),
         )
         # self.allocation_head = nn.Linear(self.d_model, 1, bias=True)
+        gate_width = max(16, self.d_model // 2)
+        scale_count = len(self.risk_scale_windows)
+        self.risk_scale_gate = nn.Sequential(
+            nn.LayerNorm(self.d_model + scale_count),
+            nn.Linear(self.d_model + scale_count, gate_width),
+            nn.GELU(),
+            nn.Linear(gate_width, scale_count),
+        )
+        self.risk_signal_gate = nn.Sequential(
+            nn.LayerNorm(self.d_model + 3),
+            nn.Linear(self.d_model + 3, gate_width),
+            nn.GELU(),
+            nn.Linear(gate_width, 3),
+        )
+        self.risk_prior_gate = nn.Sequential(
+            nn.LayerNorm(self.d_model + 2),
+            nn.Linear(self.d_model + 2, gate_width),
+            nn.GELU(),
+            nn.Linear(gate_width, 1),
+        )
+        self.risk_forecast_gate = nn.Sequential(
+            nn.LayerNorm(self.d_model + 3),
+            nn.Linear(self.d_model + 3, gate_width),
+            nn.GELU(),
+            nn.Linear(gate_width, 1),
+        )
+        # Start with a balanced prior/residual mixture.  The gate is trained
+        # per asset and per horizon token instead of fixing the old 0.005
+        # residual coefficient globally.
+        nn.init.constant_(self.risk_prior_gate[-1].bias, self.risk_prior_bias)
+        nn.init.constant_(self.risk_forecast_gate[-1].bias, -0.5)
+        # A stable warm start: trend remains the main route, while the two
+        # additional routes can be learned from the end-to-end objective.
+        with torch.no_grad():
+            self.risk_signal_gate[-1].bias.copy_(
+                torch.tensor([1.0, -0.25, -1.0])
+            )
 
     def encode_inputs(
         self, log_return_path: torch.Tensor, date_feats: torch.Tensor
@@ -202,14 +284,11 @@ class Model(nn.Module):
         hidden: torch.Tensor,
         kkt_state: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        """Return risk-budget logits plus a learned allocation residual.
+        """Return multi-scale risk-budget logits with a learned prior gate.
 
-        The prior is a cross-sectional risk-adjusted trend score,
-        ``sum(r) / std(r)``, computed at several scales.  It is not a
-        signature-path interaction and therefore gives KKTFormer a genuinely
-        different source of inductive bias.  The residual head remains fully
-        trainable and can be enabled gradually with
-        ``risk_momentum_residual_weight``.
+        Every statistic is computed from the supplied causal path.  The model
+        learns both which of the 20/40/60-style scales to trust and how much
+        to mix the risk prior with the Transformer allocation residual.
         """
 
         if log_return_path.ndim != 4:
@@ -219,26 +298,123 @@ class Model(nn.Module):
         # The leading zero is a representation sentinel, not a return.
         returns = torch.expm1(log_return_path[..., 1:])
         available = returns.shape[-1]
-        long_window = min(self.risk_momentum_lookback, available)
-        long_returns = returns[..., -long_window:]
+        max_window = min(self.risk_momentum_lookback, available)
 
-        def score(window):
+        def raw_score(window):
             return window.sum(dim=-1) / window.std(
                 dim=-1, unbiased=False
+            ).add(self.risk_score_epsilon)
+
+        def score(window):
+            value = raw_score(window)
+            centered = value - value.mean(dim=-1, keepdim=True)
+            return centered / value.std(
+                dim=-1, unbiased=False, keepdim=True
             ).clamp_min(self.signal_normalization_epsilon)
 
-        long_score = score(long_returns)
-        if self.risk_momentum_short_weight > 0.0:
-            short_window = max(5, min(long_window // 3, available))
-            short_score = score(returns[..., -short_window:])
-            prior = (
-                (1.0 - self.risk_momentum_short_weight) * long_score
-                + self.risk_momentum_short_weight * short_score
-            )
+        scale_scores = []
+        scale_raw_scores = []
+        for requested in self.risk_scale_windows:
+            scale = min(requested, max_window)
+            scale_scores.append(score(returns[..., -scale:]))
+            scale_raw_scores.append(raw_score(returns[..., -scale:]))
+        scores = torch.stack(scale_scores, dim=-1)
+        raw_scores = torch.stack(scale_raw_scores, dim=-1)
+        scale_gate_input = torch.cat((hidden, scores), dim=-1)
+        scale_weights = torch.softmax(self.risk_scale_gate(scale_gate_input), dim=-1)
+        if self.risk_score_normalization == "raw":
+            trend = (scale_weights * raw_scores).sum(dim=-1)
         else:
-            prior = long_score
+            trend = (scale_weights * scores).sum(dim=-1)
+            trend = trend - trend.mean(dim=-1, keepdim=True)
+            trend = trend / trend.std(
+                dim=-1, unbiased=False, keepdim=True
+            ).clamp_min(self.signal_normalization_epsilon)
+
+        # Short-term reversal is computed from the same causal 60-point path.
+        # It complements, rather than replaces, the multi-scale trend route.
+        short_scale = min(max(5, max_window // 4), available)
+        short_returns = returns[..., -short_scale:]
+        short_trend = score(short_returns)
+        reversal = (
+            -raw_score(short_returns)
+            if self.risk_score_normalization == "raw"
+            else -score(short_returns)
+        )
+        # Prefer assets with a smaller recent downside semivariance when the
+        # learned gate enters a defensive regime.
+        # Defensive exposure is tactical rather than a second long-horizon
+        # trend estimate.  Keeping it on the 20-day decision scale avoids
+        # mixing a slow 59-day volatility regime into the raw risk temperature.
+        defensive_window = min(20, max_window)
+        downside = torch.sqrt(
+            torch.mean(
+                torch.relu(-returns[..., -defensive_window:]).square(), dim=-1
+            )
+        )
+        defensive = -downside
+        defensive = defensive - defensive.mean(dim=-1, keepdim=True)
+        defensive = defensive / defensive.std(
+            dim=-1, unbiased=False, keepdim=True
+        ).clamp_min(self.signal_normalization_epsilon)
+        signal_features = torch.stack((trend, reversal, defensive), dim=-1)
+        signal_gate_input = torch.cat((hidden, signal_features), dim=-1)
+        signal_weights = torch.softmax(
+            self.risk_signal_gate(signal_gate_input), dim=-1
+        )
+        # The trend route is the identifiable base policy.  The gates only
+        # control the strength of the complementary reversal/defensive
+        # corrections; multiplying the trend by its gate would make the
+        # portfolio temperature depend on an arbitrary hidden-state gate.
+        defensive_gate = (
+            torch.ones_like(signal_weights[..., 2])
+            if self.risk_score_normalization == "raw"
+            else signal_weights[..., 2]
+        )
+        prior = (
+            trend
+            + self.risk_momentum_short_weight * short_trend
+            + self.risk_contrarian_weight * signal_weights[..., 1] * reversal
+            + self.risk_defensive_weight * defensive_gate * defensive
+        )
+        if self.risk_score_normalization != "raw":
+            prior = prior - prior.mean(dim=-1, keepdim=True)
+            prior = prior / prior.std(
+                dim=-1, unbiased=False, keepdim=True
+            ).clamp_min(self.signal_normalization_epsilon)
+
         learned_residual = self.allocation_logits_from_hidden(hidden)
-        return prior + self.risk_momentum_residual_weight * learned_residual
+        residual = self.risk_momentum_residual_weight * learned_residual
+        residual = residual - residual.mean(dim=-1, keepdim=True)
+        residual = residual / residual.std(
+            dim=-1, unbiased=False, keepdim=True
+        ).clamp_min(self.signal_normalization_epsilon)
+        gate_features = torch.cat(
+            (hidden, prior.unsqueeze(-1), scores.mean(dim=-1, keepdim=True)), dim=-1
+        )
+        prior_weight = torch.sigmoid(self.risk_prior_gate(gate_features)).squeeze(-1)
+        forecast = self.predict_from_hidden(hidden)
+        forecast = forecast - forecast.mean(dim=-1, keepdim=True)
+        forecast = forecast / forecast.std(
+            dim=-1, unbiased=False, keepdim=True
+        ).clamp_min(self.signal_normalization_epsilon)
+        forecast_features = torch.cat(
+            (
+                hidden,
+                prior.unsqueeze(-1),
+                residual.unsqueeze(-1),
+                forecast.unsqueeze(-1),
+            ),
+            dim=-1,
+        )
+        forecast_gate = torch.sigmoid(
+            self.risk_forecast_gate(forecast_features)
+        ).squeeze(-1)
+        if self.risk_momentum_residual_weight == 0.0:
+            blended = prior
+        else:
+            blended = prior_weight * prior + (1.0 - prior_weight) * residual
+        return blended + self.risk_forecast_weight * forecast_gate * forecast
 
     def normalize_signal(
         self, raw_signal: torch.Tensor, sigma: torch.Tensor

@@ -81,6 +81,9 @@ def parse_args():
     parser.add_argument("--lower_bound", type=float, default=0.0)
     parser.add_argument("--budget_target", type=float, default=1.0)
     parser.add_argument("--covariance_epsilon", type=float, default=1e-6)
+    parser.add_argument("--covariance_robustness", type=float, default=0.35)
+    parser.add_argument("--covariance_decay", type=float, default=0.98)
+    parser.add_argument("--covariance_winsor_quantile", type=float, default=0.05)
     parser.add_argument("--transaction_cost_bps", type=float, default=0.0)
     parser.add_argument("--factor_lower", type=str, default="")
     parser.add_argument("--factor_upper", type=str, default="")
@@ -123,6 +126,9 @@ def main():
     config = PortfolioContextConfig(
         problem=problem,
         covariance_epsilon=args.covariance_epsilon,
+        covariance_robustness=args.covariance_robustness,
+        covariance_decay=args.covariance_decay,
+        covariance_winsor_quantile=args.covariance_winsor_quantile,
         transaction_cost_bps=args.transaction_cost_bps,
         factor_lower=parse_bound(args.factor_lower),
         factor_upper=parse_bound(args.factor_upper),

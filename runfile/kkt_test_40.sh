@@ -5,7 +5,7 @@ set -euo pipefail
 # Run this script from the KKTFormer repository root:
 #   bash runfile/kkt_test_40.sh
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 
 # -----------------------------------------------------------------------------
 # Experiment paths and protocol
@@ -19,7 +19,7 @@ log_dir="./logs/"
 
 protocol="sit"                    # sit | native
 data_pool=40
-window_size=60
+window_size=60                   # 40-pool stable short-horizon regime
 horizon=20
 rebalance_frequency=1             # ignored by the SIT protocol
 train_rebalance_frequency=""      # empty: use rebalance_frequency
@@ -32,14 +32,14 @@ evaluation_end_date="2024-12-31" # used by the native protocol
 # -----------------------------------------------------------------------------
 upper_bound=1.0
 lower_bound=0.0
-probe_upper_bound=0.02500025  # structural probe only; final softmax stays unconstrained
+probe_upper_bound=0.1              # preserve informative KKT geometry for N=40
 probe_lower_bound=0.0
 budget_target=1.0
 eta=1e-5
 covariance_epsilon=1e-6
 
 signal_normalization="risk"       # risk | none
-signal_scale=0.1205
+signal_scale=0.12
 signal_normalization_epsilon=1e-6
 
 trade_cost_bps=0.0
@@ -68,8 +68,8 @@ sequential_state=0                # 1 adds --sequential_state
 # -----------------------------------------------------------------------------
 input_dim=1
 factor_dim=3
-feedback_mode="dynamic"              # none | two_pass | context | bias | dual | jacobian
-decision_layer="softmax"          # softmax (default) | optimizer (legacy ablation)
+feedback_mode="dual"             # 40-pool stable primal-dual attention feedback
+decision_layer="softmax"          # stable temperature-controlled allocation
 active_tolerance=1e-5
 
 log_return_embed_dim=32
@@ -79,7 +79,7 @@ d_model=32                        # fusion output and Transformer hidden width
 n_heads=4
 num_layers=1
 ff_dim=64
-dropout=0.05
+dropout=0.1
 
 # -----------------------------------------------------------------------------
 # Differentiable optimizer and objective
@@ -89,7 +89,7 @@ probe_optimizer_iterations=50
 projection_iterations=64
 constraint_projection_iterations=20
 
-loss_mode="cvar"                  # cvar | hybrid (CVaR + decision regret)
+loss_mode="cvar"                  # 40-pool CVaR objective
 regret_weight=1.0                  # lambda_regret; used by hybrid
 prediction_loss="MSE"
 cvar_alpha=0.95
@@ -97,16 +97,24 @@ cvar_variant="sit"                # sit | smooth
 cvar_temperature=1e-3
 kkt_bias_rank=4
 prediction_weight=0.1
-temperature=0.50
+temperature=0.61                # 40-pool validation-selected diversification
+risk_momentum_lookback=120
+risk_momentum_short_weight=0.0
+risk_momentum_residual_weight=0.005
+risk_turnover_aversion=0.0
+risk_downside_weight=0.25
+risk_drawdown_weight=0.10
+risk_smoothing_temperature=0.01
+kkt_risk_scale=0.0                 # isolate the validated dual attention path
 
 # -----------------------------------------------------------------------------
 # Training and hardware
 # -----------------------------------------------------------------------------
 learning_rate=1e-3
 lradj="type1"
-train_epochs=4
+train_epochs=10
 batch_size=64
-patience=4
+patience=3
 num_workers=0
 itr=1
 seed=2023
@@ -118,10 +126,10 @@ devices="0,1"
 
 # Encode the main architecture choices in the experiment name. run_kkt.py also
 # appends the remaining protocol/optimizer/loss settings to its checkpoint key.
-model_id="kkt_${feedback_mode}_dp${data_pool}_drop005"
+model_id="kkt_40data_dual_softmax_cvar_tp061"
 
 cmd=(
-  python -u run_kkt.py
+  conda run --no-capture-output -n alden python -u run_kkt.py
   --model_id "$model_id"
   --root_path "$root_path"
   --data_path "$data_path"
@@ -148,6 +156,7 @@ cmd=(
   --trade_cost_bps "$trade_cost_bps"
   --transaction_cost_smoothing "$transaction_cost_smoothing"
   --turnover_penalty "$turnover_penalty"
+  --risk_turnover_aversion "$risk_turnover_aversion"
   --entropy_regularization "$entropy_regularization"
   --entropy_epsilon "$entropy_epsilon"
   "--factor_lower=$factor_lower"
@@ -179,8 +188,15 @@ cmd=(
   --cvar_variant "$cvar_variant"
   --cvar_temperature "$cvar_temperature"
   --kkt_bias_rank "$kkt_bias_rank"
+  --kkt_risk_scale "$kkt_risk_scale"
   --prediction_weight "$prediction_weight"
   --temperature "$temperature"
+  --risk_momentum_lookback "$risk_momentum_lookback"
+  --risk_momentum_short_weight "$risk_momentum_short_weight"
+  --risk_momentum_residual_weight "$risk_momentum_residual_weight"
+  --risk_downside_weight "$risk_downside_weight"
+  --risk_drawdown_weight "$risk_drawdown_weight"
+  --risk_smoothing_temperature "$risk_smoothing_temperature"
   --learning_rate "$learning_rate"
   --lradj "$lradj"
   --train_epochs "$train_epochs"

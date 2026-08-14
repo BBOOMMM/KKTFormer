@@ -36,6 +36,9 @@ class PortfolioContextConfig:
 
     problem: MinimalPortfolioProblem
     covariance_epsilon: float = 1e-6
+    covariance_robustness: float = 0.35
+    covariance_decay: float = 0.98
+    covariance_winsor_quantile: float = 0.05
     transaction_cost_bps: float = 0.0
     factor_names: Tuple[str, ...] = DEFAULT_FACTOR_NAMES
     cross_sectional_zscore: bool = True
@@ -49,6 +52,12 @@ class PortfolioContextConfig:
     def __post_init__(self) -> None:
         if self.covariance_epsilon <= 0:
             raise ValueError("covariance_epsilon must be positive")
+        if not 0.0 <= self.covariance_robustness <= 1.0:
+            raise ValueError("covariance_robustness must be in [0, 1]")
+        if not 0.0 < self.covariance_decay <= 1.0:
+            raise ValueError("covariance_decay must be in (0, 1]")
+        if not 0.0 <= self.covariance_winsor_quantile < 0.5:
+            raise ValueError("covariance_winsor_quantile must be in [0, 0.5)")
         if self.transaction_cost_bps < 0:
             raise ValueError("transaction_cost_bps cannot be negative")
         if tuple(self.factor_names) != DEFAULT_FACTOR_NAMES:
@@ -136,26 +145,57 @@ def _cross_sectional_zscore(values: np.ndarray) -> np.ndarray:
 def estimate_covariance(
     price_window: np.ndarray,
     epsilon: float = 1e-6,
+    robustness: float = 0.35,
+    decay: float = 0.98,
+    winsor_quantile: float = 0.05,
 ) -> np.ndarray:
-    """Estimate a positive-definite covariance matrix from past prices.
+    """Estimate a robust positive-definite covariance matrix from past prices.
 
-    Ledoit-Wolf shrinkage is used when scikit-learn is available.  The NumPy
-    sample covariance is a fallback so context generation remains usable in a
-    lightweight environment.  A symmetric epsilon diagonal is always added.
+    The estimator is deliberately causal and uses only ``price_window``.  It
+    first winsorizes returns, applies recency weights, and then shrinks the
+    weighted covariance towards its diagonal.  This is more stable than a
+    raw sample covariance when the 60-day window is close to the 50-asset
+    cross-section.
     """
 
     if epsilon <= 0:
         raise ValueError("epsilon must be positive")
+    if not 0.0 <= robustness <= 1.0:
+        raise ValueError("robustness must be in [0, 1]")
+    if not 0.0 < decay <= 1.0:
+        raise ValueError("decay must be in (0, 1]")
+    if not 0.0 <= winsor_quantile < 0.5:
+        raise ValueError("winsor_quantile must be in [0, 0.5)")
     returns = _log_returns(np.asarray(price_window, dtype=np.float64))
     if returns.shape[0] < 2:
         raise ValueError("at least two historical returns are required")
 
-    try:
-        from sklearn.covariance import LedoitWolf
+    # Per-asset winsorization limits the influence of one-day shocks without
+    # looking outside the causal window.  The quantile is intentionally small
+    # so the estimator remains responsive in short windows.
+    if winsor_quantile > 0.0:
+        lower = np.quantile(returns, winsor_quantile, axis=0)
+        upper = np.quantile(returns, 1.0 - winsor_quantile, axis=0)
+        returns = np.clip(returns, lower, upper)
 
-        covariance = LedoitWolf().fit(returns).covariance_
-    except ImportError:
-        covariance = np.cov(returns, rowvar=False, ddof=1)
+    # Exponential recency weights retain the most recent regime while keeping
+    # enough effective observations for a 50-asset covariance estimate.
+    sample_count = returns.shape[0]
+    weights = np.power(
+        float(decay), np.arange(sample_count - 1, -1, -1, dtype=np.float64)
+    )
+    weights /= weights.sum()
+    center = (weights[:, None] * returns).sum(axis=0, keepdims=True)
+    centered = returns - center
+    effective_dof = 1.0 - np.square(weights).sum()
+    covariance = (centered * weights[:, None]).T @ centered
+    covariance /= max(effective_dof, 1e-6)
+
+    # Diagonal shrinkage controls noisy cross-asset correlations.  The
+    # diagonal target preserves each asset's robust volatility estimate.
+    diagonal_target = np.diag(np.diag(covariance))
+    covariance = (1.0 - float(robustness)) * covariance
+    covariance += float(robustness) * diagonal_target
 
     covariance = np.asarray(covariance, dtype=np.float64)
     if covariance.ndim == 0:
@@ -375,7 +415,13 @@ def _build_context_at_frame(
     # Sigma_t/B_t instead of Sigma_{t+h}/B_{t+h}.
     sigma_sequence = np.stack(
         [
-            estimate_covariance(window, epsilon=config.covariance_epsilon)
+            estimate_covariance(
+                window,
+                epsilon=config.covariance_epsilon,
+                robustness=config.covariance_robustness,
+                decay=config.covariance_decay,
+                winsor_quantile=config.covariance_winsor_quantile,
+            )
             for window in path_prices
         ],
         axis=0,

@@ -199,6 +199,11 @@ def data_provider_kkt(args, flag):
     context_config = PortfolioContextConfig(
         problem=problem,
         covariance_epsilon=args.covariance_epsilon,
+        covariance_robustness=getattr(args, "covariance_robustness", 0.35),
+        covariance_decay=getattr(args, "covariance_decay", 0.98),
+        covariance_winsor_quantile=getattr(
+            args, "covariance_winsor_quantile", 0.05
+        ),
         transaction_cost_bps=float(
             getattr(args, "trade_cost_bps", 0.0)
             if getattr(args, "transaction_cost_bps", None) is None
