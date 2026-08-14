@@ -108,28 +108,30 @@ ktr_pressure_clip=5.0
 kkt_bias_rank=3
 temperature=0.02                  # avoid GPU-sensitive near-corner allocation jumps
 risk_momentum_lookback=60         # do not introduce a hidden >60-day lookback
-risk_scale_windows="20"          # 20-day causal scale selected by the risk-budget gate
+risk_scale_windows="20,40,60"        # trainable multi-scale gate within W=60
 risk_score_normalization="raw"   # preserve return/volatility scale for temperature-aware allocation
 risk_score_epsilon=1e-4           # stabilizes the raw risk score without flattening its scale
+risk_multiscale_residual_weight=0.001 # bounded correction around the 20d base scale
+risk_defensive_gate_floor=0.95      # small but genuine learned downside modulation
 risk_momentum_short_weight=0.15   # short-horizon trend correction
-risk_momentum_residual_weight=0.0 # no prediction residual in the causal policy
+risk_momentum_residual_weight=0.05    # bounded learned Transformer allocation residual
 risk_forecast_weight=0.0           # prediction route disabled for end-to-end policy
-risk_prior_bias=-0.8               # favor learned alpha when 60d prior is noisy
+risk_prior_bias=-0.8                # former successful baseline
 risk_turnover_aversion=0.0
 risk_downside_weight=0.25
 risk_drawdown_weight=0.10
 risk_smoothing_temperature=0.01
-kkt_risk_scale=0.0                 # KKT remains active through dual attention feedback
+kkt_risk_scale=0.001               # isolated nonzero direct KKT-conditioned feedback
 forecast_weight=0.0                # prediction loss is explicitly disabled
-risk_contrarian_weight=0.0         # isolate the causal trend route for this run
-risk_defensive_weight=1.0          # explicit downside-risk budget correction
+risk_contrarian_weight=0.0         # isolate the learned trend/KKT interaction
+risk_defensive_weight=1.0          # learned downside-risk budget correction
 
 # -----------------------------------------------------------------------------
 # Training and hardware
 # -----------------------------------------------------------------------------
 learning_rate=1e-3
 lradj="type1"
-train_epochs=1                     # causal risk route has no prediction head to pretrain
+train_epochs=2                     # decision-policy training, no prediction pretext task
 batch_size=128
 patience=4
 num_workers=0
@@ -222,6 +224,8 @@ cmd=(
   --risk_scale_windows "$risk_scale_windows"
   --risk_score_normalization "$risk_score_normalization"
   --risk_score_epsilon "$risk_score_epsilon"
+  --risk_multiscale_residual_weight "$risk_multiscale_residual_weight"
+  --risk_defensive_gate_floor "$risk_defensive_gate_floor"
   --risk_momentum_short_weight "$risk_momentum_short_weight"
   --risk_momentum_residual_weight "$risk_momentum_residual_weight"
   --risk_forecast_weight "$risk_forecast_weight"

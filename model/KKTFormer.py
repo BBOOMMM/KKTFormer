@@ -74,6 +74,12 @@ class Model(nn.Module):
         self.risk_score_epsilon = float(
             getattr(configs, "risk_score_epsilon", 1e-4)
         )
+        self.risk_multiscale_residual_weight = float(
+            getattr(configs, "risk_multiscale_residual_weight", 1.0)
+        )
+        self.risk_defensive_gate_floor = float(
+            getattr(configs, "risk_defensive_gate_floor", 0.0)
+        )
 
         if self.d_model % self.n_heads != 0:
             raise ValueError("d_model must be divisible by n_heads")
@@ -89,6 +95,10 @@ class Model(nn.Module):
             raise ValueError("risk_score_normalization must be zscore or raw")
         if self.risk_score_epsilon <= 0:
             raise ValueError("risk_score_epsilon must be positive")
+        if not 0.0 <= self.risk_multiscale_residual_weight <= 1.0:
+            raise ValueError("risk_multiscale_residual_weight must be in [0, 1]")
+        if not 0.0 <= self.risk_defensive_gate_floor < 1.0:
+            raise ValueError("risk_defensive_gate_floor must be in [0, 1)")
         if self.signal_scale <= 0:
             raise ValueError("signal_scale must be positive")
         if self.signal_normalization_epsilon <= 0:
@@ -174,6 +184,22 @@ class Model(nn.Module):
             nn.Dropout(self.dropout),
             nn.Linear(self.d_model, 1),
         )
+        # A separate decision residual is zero-initialized.  Risk-budget
+        # policies therefore start from the causal prior rather than a random
+        # alpha ranking, while the final layer is free to learn from CVaR and
+        # decision regret once portfolio gradients arrive.
+        # Do not let adding this zero-start branch perturb the initialization
+        # of the existing gates under a fixed experiment seed.
+        residual_rng_state = torch.get_rng_state()
+        self.risk_residual_head = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model),
+            nn.GELU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.d_model, 1),
+        )
+        nn.init.zeros_(self.risk_residual_head[-1].weight)
+        nn.init.zeros_(self.risk_residual_head[-1].bias)
+        torch.set_rng_state(residual_rng_state)
         # self.allocation_head = nn.Linear(self.d_model, 1, bias=True)
         gate_width = max(16, self.d_model // 2)
         scale_count = len(self.risk_scale_windows)
@@ -183,6 +209,16 @@ class Model(nn.Module):
             nn.GELU(),
             nn.Linear(gate_width, scale_count),
         )
+        # Warm-start the multi-scale gate toward the empirically stable
+        # decision-scale route while retaining a trainable gate for 40/60-day
+        # regimes.  This avoids replacing the causal prior with an arbitrary
+        # random convex mixture at the first end-to-end update.
+        if scale_count > 1:
+            scale_bias = torch.zeros(scale_count)
+            for index, window in enumerate(self.risk_scale_windows):
+                scale_bias[index] = -0.06 * float(window - min(self.risk_scale_windows))
+            with torch.no_grad():
+                self.risk_scale_gate[-1].bias.copy_(scale_bias)
         self.risk_signal_gate = nn.Sequential(
             nn.LayerNorm(self.d_model + 3),
             nn.Linear(self.d_model + 3, gate_width),
@@ -323,7 +359,11 @@ class Model(nn.Module):
         scale_gate_input = torch.cat((hidden, scores), dim=-1)
         scale_weights = torch.softmax(self.risk_scale_gate(scale_gate_input), dim=-1)
         if self.risk_score_normalization == "raw":
-            trend = (scale_weights * raw_scores).sum(dim=-1)
+            mixed_trend = (scale_weights * raw_scores).sum(dim=-1)
+            base_trend = raw_scores[..., 0]
+            trend = base_trend + self.risk_multiscale_residual_weight * (
+                mixed_trend - base_trend
+            )
         else:
             trend = (scale_weights * scores).sum(dim=-1)
             trend = trend - trend.mean(dim=-1, keepdim=True)
@@ -366,11 +406,12 @@ class Model(nn.Module):
         # control the strength of the complementary reversal/defensive
         # corrections; multiplying the trend by its gate would make the
         # portfolio temperature depend on an arbitrary hidden-state gate.
-        defensive_gate = (
-            torch.ones_like(signal_weights[..., 2])
-            if self.risk_score_normalization == "raw"
-            else signal_weights[..., 2]
-        )
+        # Keep the defensive gate active in raw-score mode as well: raw mode
+        # changes score geometry, not whether the Transformer can route the
+        # downside signal.
+        defensive_gate = self.risk_defensive_gate_floor + (
+            1.0 - self.risk_defensive_gate_floor
+        ) * signal_weights[..., 2]
         prior = (
             trend
             + self.risk_momentum_short_weight * short_trend
@@ -383,12 +424,17 @@ class Model(nn.Module):
                 dim=-1, unbiased=False, keepdim=True
             ).clamp_min(self.signal_normalization_epsilon)
 
-        learned_residual = self.allocation_logits_from_hidden(hidden)
-        residual = self.risk_momentum_residual_weight * learned_residual
-        residual = residual - residual.mean(dim=-1, keepdim=True)
+        learned_residual = self.risk_residual_head(hidden).squeeze(-1)
+        residual = learned_residual - learned_residual.mean(
+            dim=-1, keepdim=True
+        )
         residual = residual / residual.std(
             dim=-1, unbiased=False, keepdim=True
         ).clamp_min(self.signal_normalization_epsilon)
+        # Apply the coefficient after normalization.  Applying it before the
+        # z-score would cancel the coefficient and turn any nonzero value into
+        # an uncontrolled full-strength residual policy.
+        residual = self.risk_momentum_residual_weight * residual
         gate_features = torch.cat(
             (hidden, prior.unsqueeze(-1), scores.mean(dim=-1, keepdim=True)), dim=-1
         )
@@ -413,7 +459,15 @@ class Model(nn.Module):
         if self.risk_momentum_residual_weight == 0.0:
             blended = prior
         else:
-            blended = prior_weight * prior + (1.0 - prior_weight) * residual
+            # The learned allocation head is a residual policy around the
+            # causal risk prior.  The prior gate controls residual injection,
+            # but never removes the causal baseline entirely:
+            #   blended = prior + (1 - gate) * residual.
+            # This keeps the decision signal identifiable while ensuring the
+            # Transformer representation receives a real portfolio gradient.
+            blended = prior_weight * prior + (1.0 - prior_weight) * (
+                prior + residual
+            )
         return blended + self.risk_forecast_weight * forecast_gate * forecast
 
     def normalize_signal(
@@ -613,7 +667,7 @@ class DecisionAwareModel(nn.Module):
             n_heads=self.backbone.n_heads,
             rank=self.kkt_bias_rank,
         )
-        self.kkt_risk_scale = float(getattr(configs, "kkt_risk_scale", 0.0))
+        self.kkt_risk_scale = float(getattr(configs, "kkt_risk_scale", 0.1))
         if self.kkt_risk_scale < 0:
             raise ValueError("kkt_risk_scale cannot be negative")
         # This gate is deliberately separate from the attention gate.  It

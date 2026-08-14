@@ -334,6 +334,21 @@ def parse_args():
         help="causal volatility floor added to raw return/volatility risk scores",
     )
     parser.add_argument(
+        "--risk_multiscale_residual_weight",
+        type=float,
+        default=1.0,
+        help=(
+            "strength of the learned multi-scale correction around the shortest "
+            "causal risk scale"
+        ),
+    )
+    parser.add_argument(
+        "--risk_defensive_gate_floor",
+        type=float,
+        default=0.0,
+        help="fixed causal floor for the learned downside-risk gate",
+    )
+    parser.add_argument(
         "--risk_momentum_short_weight",
         type=float,
         default=0.0,
