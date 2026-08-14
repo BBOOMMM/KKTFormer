@@ -137,6 +137,12 @@ def parse_args():
     parser.add_argument("--transaction_cost_smoothing", type=float, default=1e-4)
     parser.add_argument("--turnover_penalty", type=float, default=0.0)
     parser.add_argument(
+        "--risk_turnover_aversion",
+        type=float,
+        default=0.0,
+        help="proximal shrinkage strength of risk_budget allocations",
+    )
+    parser.add_argument(
         "--entropy_regularization",
         type=float,
         default=0.0,
@@ -209,18 +215,24 @@ def parse_args():
     parser.add_argument(
         "--decision_layer",
         type=str,
-        choices=["softmax", "optimizer"],
+        choices=["softmax", "optimizer", "risk_budget"],
         default="softmax",
-        help="final portfolio layer; softmax is the default KKTFormer policy",
+        help=(
+            "final portfolio layer; risk_budget combines multi-scale "
+            "risk-momentum logits with a turnover-aware allocator"
+        ),
     )
     parser.add_argument("--projection_iterations", type=int, default=64)
     parser.add_argument("--constraint_projection_iterations", type=int, default=20)
     parser.add_argument(
         "--loss_mode",
         type=str,
-        choices=["cvar", "hybrid", "ktr"],
+        choices=["cvar", "hybrid", "ktr", "risk_budget"],
         default="cvar",
-        help="CVaR alone, CVaR plus decision regret, or KKT tail ranking",
+        help=(
+            "CVaR alone, CVaR plus decision regret, KKT tail ranking, or "
+            "smooth downside/drawdown risk-budget loss"
+        ),
     )
     parser.add_argument(
         "--regret_weight",
@@ -260,6 +272,12 @@ def parse_args():
     parser.add_argument("--ktr_pressure_clip", type=float, default=5.0)
     parser.add_argument("--kkt_bias_rank", type=int, default=4)
     parser.add_argument(
+        "--kkt_risk_scale",
+        type=float,
+        default=0.0,
+        help="direct normalized KKT adjustment scale in risk_budget logits",
+    )
+    parser.add_argument(
         "--prediction_weight",
         type=float,
         default=0.1,
@@ -270,6 +288,29 @@ def parse_args():
         type=float,
         default=1.0,
         help="fixed temperature of the final softmax allocation head",
+    )
+    parser.add_argument(
+        "--risk_momentum_lookback",
+        type=int,
+        default=120,
+        help="number of genuine return observations used by the risk prior",
+    )
+    parser.add_argument(
+        "--risk_momentum_short_weight",
+        type=float,
+        default=0.0,
+        help="optional short-scale risk-momentum blend weight",
+    )
+    parser.add_argument(
+        "--risk_momentum_residual_weight",
+        type=float,
+        default=0.0,
+        help="learned Transformer allocation residual added to risk prior",
+    )
+    parser.add_argument("--risk_downside_weight", type=float, default=0.25)
+    parser.add_argument("--risk_drawdown_weight", type=float, default=0.10)
+    parser.add_argument(
+        "--risk_smoothing_temperature", type=float, default=1e-2
     )
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument(
@@ -346,6 +387,10 @@ def main():
             f"_nh{args.n_heads}_nl{args.num_layers}"
             f"_oi{args.optimizer_iterations}_fb{args.feedback_mode}"
             f"_dl{args.decision_layer}_tp{args.temperature:g}"
+            f"_rml{args.risk_momentum_lookback}_rms{args.risk_momentum_short_weight:g}"
+            f"_rmr{args.risk_momentum_residual_weight:g}"
+            f"_rta{args.risk_turnover_aversion:g}"
+            f"_krs{args.kkt_risk_scale:g}"
             f"_plb{args.probe_lower_bound:g}_pub{args.probe_upper_bound:g}"
             f"_sn{args.signal_normalization}_ss{args.signal_scale:g}"
             f"_lm{args.loss_mode}_cv{args.cvar_variant}"

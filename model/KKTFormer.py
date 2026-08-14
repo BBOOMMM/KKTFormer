@@ -37,6 +37,19 @@ class Model(nn.Module):
             getattr(configs, "signal_normalization_epsilon", 1e-6)
         )
         self.eta = float(getattr(configs, "eta", 1e-3))
+        # A long-horizon risk-momentum prior supplies a second inductive bias
+        # that is independent of signature/path attention.  The input path is
+        # stored as [zero, log returns], hence a 121-point path contains 120
+        # genuine observations.
+        self.risk_momentum_lookback = int(
+            getattr(configs, "risk_momentum_lookback", 120)
+        )
+        self.risk_momentum_short_weight = float(
+            getattr(configs, "risk_momentum_short_weight", 0.0)
+        )
+        self.risk_momentum_residual_weight = float(
+            getattr(configs, "risk_momentum_residual_weight", 0.0)
+        )
 
         if self.d_model % self.n_heads != 0:
             raise ValueError("d_model must be divisible by n_heads")
@@ -52,6 +65,12 @@ class Model(nn.Module):
             raise ValueError("signal_scale must be positive")
         if self.signal_normalization_epsilon <= 0:
             raise ValueError("signal_normalization_epsilon must be positive")
+        if self.risk_momentum_lookback <= 0:
+            raise ValueError("risk_momentum_lookback must be positive")
+        if not 0.0 <= self.risk_momentum_short_weight <= 1.0:
+            raise ValueError("risk_momentum_short_weight must be in [0, 1]")
+        if self.risk_momentum_residual_weight < 0:
+            raise ValueError("risk_momentum_residual_weight cannot be negative")
 
         fusion_input_dim = (
             self.log_return_embed_dim
@@ -176,6 +195,50 @@ class Model(nn.Module):
                 "hidden must have trailing shape (num_assets, d_model)"
             )
         return self.allocation_head(hidden).squeeze(-1)
+
+    def risk_budget_logits(
+        self,
+        log_return_path: torch.Tensor,
+        hidden: torch.Tensor,
+        kkt_state: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """Return risk-budget logits plus a learned allocation residual.
+
+        The prior is a cross-sectional risk-adjusted trend score,
+        ``sum(r) / std(r)``, computed at several scales.  It is not a
+        signature-path interaction and therefore gives KKTFormer a genuinely
+        different source of inductive bias.  The residual head remains fully
+        trainable and can be enabled gradually with
+        ``risk_momentum_residual_weight``.
+        """
+
+        if log_return_path.ndim != 4:
+            raise ValueError("log_return_path must have shape (B, H, N, W)")
+        if hidden.shape[:-1] != log_return_path.shape[:-1]:
+            raise ValueError("hidden and log_return_path have incompatible shapes")
+        # The leading zero is a representation sentinel, not a return.
+        returns = torch.expm1(log_return_path[..., 1:])
+        available = returns.shape[-1]
+        long_window = min(self.risk_momentum_lookback, available)
+        long_returns = returns[..., -long_window:]
+
+        def score(window):
+            return window.sum(dim=-1) / window.std(
+                dim=-1, unbiased=False
+            ).clamp_min(self.signal_normalization_epsilon)
+
+        long_score = score(long_returns)
+        if self.risk_momentum_short_weight > 0.0:
+            short_window = max(5, min(long_window // 3, available))
+            short_score = score(returns[..., -short_window:])
+            prior = (
+                (1.0 - self.risk_momentum_short_weight) * long_score
+                + self.risk_momentum_short_weight * short_score
+            )
+        else:
+            prior = long_score
+        learned_residual = self.allocation_logits_from_hidden(hidden)
+        return prior + self.risk_momentum_residual_weight * learned_residual
 
     def normalize_signal(
         self, raw_signal: torch.Tensor, sigma: torch.Tensor
@@ -374,6 +437,21 @@ class DecisionAwareModel(nn.Module):
             n_heads=self.backbone.n_heads,
             rank=self.kkt_bias_rank,
         )
+        self.kkt_risk_scale = float(getattr(configs, "kkt_risk_scale", 0.0))
+        if self.kkt_risk_scale < 0:
+            raise ValueError("kkt_risk_scale cannot be negative")
+        # This gate is deliberately separate from the attention gate.  It
+        # lets the optimizer state influence the final risk-budget decision
+        # even when the KKT representation is not sufficiently expressive to
+        # improve the intermediate asset-attention hidden state.
+        gate_width = max(8, self.d_model // 2)
+        self.kkt_risk_gate = nn.Sequential(
+            nn.LayerNorm(self.kkt_feature_dim),
+            nn.Linear(self.kkt_feature_dim, gate_width),
+            nn.GELU(),
+            nn.Linear(gate_width, 1),
+        )
+        nn.init.zeros_(self.kkt_risk_gate[-1].bias)
 
     def initial_forward(
         self, log_return_path: torch.Tensor, date_feats: torch.Tensor
@@ -388,6 +466,60 @@ class DecisionAwareModel(nn.Module):
 
     def allocation_logits_from_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.backbone.allocation_logits_from_hidden(hidden)
+
+    def risk_budget_logits(
+        self,
+        log_return_path: torch.Tensor,
+        hidden: torch.Tensor,
+        kkt_state: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        logits = self.backbone.risk_budget_logits(log_return_path, hidden)
+        if kkt_state is None or self.kkt_risk_scale == 0.0:
+            return logits
+
+        required = {
+            "weights",
+            "marginal_risk",
+            "lower_dual",
+            "upper_dual",
+            "active_lower",
+            "active_upper",
+            "pressure",
+        }
+        missing = required.difference(kkt_state)
+        if missing:
+            raise ValueError(f"KKT state is missing risk features: {sorted(missing)}")
+        features = torch.cat(
+            [
+                kkt_state["weights"].unsqueeze(-1),
+                kkt_state["marginal_risk"].unsqueeze(-1),
+                kkt_state["lower_dual"].unsqueeze(-1),
+                kkt_state["upper_dual"].unsqueeze(-1),
+                kkt_state["active_lower"].to(logits.dtype).unsqueeze(-1),
+                kkt_state["active_upper"].to(logits.dtype).unsqueeze(-1),
+                kkt_state["pressure"].unsqueeze(-1),
+            ],
+            dim=-1,
+        )
+
+        def cross_sectional_zscore(value):
+            centered = value - value.mean(dim=-1, keepdim=True)
+            return centered / value.std(
+                dim=-1, unbiased=False, keepdim=True
+            ).clamp_min(1e-6)
+
+        # A signed KKT risk score: avoid high marginal risk and lower-bound
+        # pressure, while retaining assets whose upper-bound multiplier says
+        # that the alpha signal is economically valuable.  The learned gate
+        # controls how much of this score is trusted for each token.
+        kkt_signal = (
+            -cross_sectional_zscore(kkt_state["marginal_risk"])
+            + 0.5 * cross_sectional_zscore(kkt_state["upper_dual"])
+            - 0.5 * cross_sectional_zscore(kkt_state["lower_dual"])
+            - 0.25 * cross_sectional_zscore(kkt_state["pressure"])
+        )
+        gate = torch.sigmoid(self.kkt_risk_gate(features).squeeze(-1))
+        return logits + self.kkt_risk_scale * gate * kkt_signal
 
     def refine(
         self,

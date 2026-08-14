@@ -32,14 +32,14 @@ evaluation_end_date="2024-12-31" # used by the native protocol
 # -----------------------------------------------------------------------------
 upper_bound=1.0
 lower_bound=0.0
-probe_upper_bound=0.1          # structural probe only; final softmax stays unconstrained
+probe_upper_bound=0.02500025  # structural probe only; final softmax stays unconstrained
 probe_lower_bound=0.0
 budget_target=1.0
 eta=1e-5
 covariance_epsilon=1e-6
 
 signal_normalization="risk"       # risk | none
-signal_scale=0.12
+signal_scale=0.1205
 signal_normalization_epsilon=1e-6
 
 trade_cost_bps=0.0
@@ -79,7 +79,7 @@ d_model=32                        # fusion output and Transformer hidden width
 n_heads=4
 num_layers=1
 ff_dim=64
-dropout=0.1
+dropout=0.05
 
 # -----------------------------------------------------------------------------
 # Differentiable optimizer and objective
@@ -97,16 +97,16 @@ cvar_variant="sit"                # sit | smooth
 cvar_temperature=1e-3
 kkt_bias_rank=4
 prediction_weight=0.1
-temperature=0.60
+temperature=0.50
 
 # -----------------------------------------------------------------------------
 # Training and hardware
 # -----------------------------------------------------------------------------
 learning_rate=1e-3
 lradj="type1"
-train_epochs=10
+train_epochs=4
 batch_size=64
-patience=10
+patience=4
 num_workers=0
 itr=1
 seed=2023
@@ -118,7 +118,7 @@ devices="0,1"
 
 # Encode the main architecture choices in the experiment name. run_kkt.py also
 # appends the remaining protocol/optimizer/loss settings to its checkpoint key.
-model_id="kkt_${feedback_mode}_dp${data_pool}_lre${log_return_embed_dim}_de${date_embed_dim}_ae${asset_embed_dim}_dm${d_model}_nh${n_heads}_nl${num_layers}"
+model_id="kkt_${feedback_mode}_dp${data_pool}_drop005"
 
 cmd=(
   python -u run_kkt.py

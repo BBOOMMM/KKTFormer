@@ -23,6 +23,81 @@ from torch import nn
 from portfolio.problem import MinimalPortfolioProblem
 
 
+class RiskBudgetedAllocator(nn.Module):
+    """Differentiable softmax allocator with a turnover-aware proximal step.
+
+    The allocation logits are allowed to contain a risk-budget prior (for
+    example a multi-scale trend/volatility score) and a learned residual.  A
+    plain softmax treats every logit as a pure alpha score; this layer adds the
+    missing portfolio decision geometry by shrinking a proposed allocation
+    towards the current holdings when trading is expensive or a turnover cap
+    is active.  The shrinkage is smooth and keeps the unit-simplex invariant.
+    """
+
+    def __init__(
+        self,
+        temperature: float = 1.0,
+        turnover_aversion: float = 0.0,
+        entropy_epsilon: float = 1e-4,
+    ) -> None:
+        super().__init__()
+        if temperature <= 0 or not math.isfinite(float(temperature)):
+            raise ValueError("temperature must be finite and positive")
+        if turnover_aversion < 0 or not math.isfinite(float(turnover_aversion)):
+            raise ValueError("turnover_aversion must be finite and non-negative")
+        if entropy_epsilon <= 0 or not math.isfinite(float(entropy_epsilon)):
+            raise ValueError("entropy_epsilon must be finite and positive")
+        self.temperature = float(temperature)
+        self.turnover_aversion = float(turnover_aversion)
+        self.entropy_epsilon = float(entropy_epsilon)
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        w_prev: Optional[torch.Tensor] = None,
+        max_turnover=None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if logits.ndim < 1:
+            raise ValueError("logits must have at least one dimension")
+        proposal = torch.softmax(logits / self.temperature, dim=-1)
+        if w_prev is None:
+            weights = proposal
+            turnover = torch.zeros_like(proposal[..., 0])
+        else:
+            if w_prev.shape != proposal.shape:
+                raise ValueError("w_prev must have the same shape as logits")
+            turnover = (proposal - w_prev).abs().sum(dim=-1)
+            # This is the closed-form proximal blend for a quadratic turnover
+            # aversion.  It is intentionally bounded in [0, 1] and therefore
+            # cannot destabilize the simplex policy.
+            blend = 1.0 / (1.0 + self.turnover_aversion)
+            if max_turnover is not None:
+                cap = torch.as_tensor(
+                    max_turnover, dtype=proposal.dtype, device=proposal.device
+                )
+                while cap.ndim < proposal.ndim - 1:
+                    cap = cap.unsqueeze(-1)
+                cap = cap.clamp_min(1e-6)
+                cap_blend = torch.minimum(
+                    torch.ones_like(turnover), cap.squeeze(-1) / turnover.clamp_min(1e-6)
+                )
+                blend = blend * cap_blend
+            weights = w_prev + blend * (proposal - w_prev)
+            turnover = (weights - w_prev).abs().sum(dim=-1)
+        state = {
+            "proposal_turnover": turnover,
+            "proposal_entropy": (
+                -proposal * torch.log(proposal.clamp_min(self.entropy_epsilon))
+            ).sum(dim=-1),
+            "turnover_shrinkage": (
+                (weights - proposal).abs().sum(dim=-1)
+                if w_prev is not None
+                else torch.zeros_like(turnover)
+            ),
+        }
+        return weights, state
+
+
 def _as_batch_scalar(
     value,
     batch_size: int,

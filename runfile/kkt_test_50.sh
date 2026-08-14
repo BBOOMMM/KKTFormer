@@ -5,21 +5,21 @@ set -euo pipefail
 # Run this script from the KKTFormer repository root:
 #   bash runfile/kkt_test_50.sh
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 
 # -----------------------------------------------------------------------------
 # Experiment paths and protocol
 # -----------------------------------------------------------------------------
 root_path="./asset_data/"
 data_path="full_dataset.csv"
-context_root="./portfolio_context_cache"
+context_root="./portfolio_context_cache_riskmom121"
 checkpoints="./checkpoints_kkt/"
 results_path="./results_kkt/"
 log_dir="./logs/"
 
 protocol="sit"                    # sit | native
 data_pool=50
-window_size=60
+window_size=121                  # 120 genuine returns + leading sentinel
 horizon=20
 rebalance_frequency=1             # ignored by the SIT protocol
 train_rebalance_frequency=""      # empty: use rebalance_frequency
@@ -32,10 +32,10 @@ evaluation_end_date="2024-12-31" # used by the native protocol
 # -----------------------------------------------------------------------------
 upper_bound=1.0
 lower_bound=0.0
-probe_upper_bound=0.1          # structural probe only; final softmax stays unconstrained
+probe_upper_bound=0.04            # non-degenerate KKT probe geometry for N=50
 probe_lower_bound=0.0
 budget_target=1.0
-eta=1e-5
+eta=1e-3
 covariance_epsilon=1e-6
 
 signal_normalization="risk"       # risk | none
@@ -68,8 +68,8 @@ sequential_state=0                # 1 adds --sequential_state
 # -----------------------------------------------------------------------------
 input_dim=1
 factor_dim=3
-feedback_mode="dynamic"              # none | two_pass | context | bias | dual | jacobian
-decision_layer="softmax"          # softmax (default) | optimizer (legacy ablation)
+feedback_mode="dynamic"          # hidden-conditioned KKT attention plus risk-budget gate
+decision_layer="risk_budget"      # multi-scale risk-momentum + learned residual
 active_tolerance=1e-5
 
 log_return_embed_dim=32
@@ -77,22 +77,22 @@ date_embed_dim=8
 asset_embed_dim=8
 d_model=32                        # fusion output and Transformer hidden width
 n_heads=4
-num_layers=2
+num_layers=1
 ff_dim=64
-dropout=0.1
+dropout=0.0
 
 # -----------------------------------------------------------------------------
 # Differentiable optimizer and objective
 # -----------------------------------------------------------------------------
 optimizer_iterations=100
-probe_optimizer_iterations=50
+probe_optimizer_iterations=10
 projection_iterations=64
 constraint_projection_iterations=20
 
-loss_mode="cvar"                   # cvar | hybrid | ktr (CVaR + KKT tail ranking)
+loss_mode="risk_budget"           # CVaR + smooth downside/drawdown decision loss
 regret_weight=1.0                  # lambda_regret; used by hybrid
 prediction_loss="MSE"
-cvar_alpha=0.95
+cvar_alpha=0.99
 cvar_variant="sit"                # sit | smooth
 cvar_temperature=1e-3
 ktr_weight=0.01
@@ -100,18 +100,26 @@ ktr_tail_alpha=0.95
 ktr_pressure_scale=1.0
 ktr_ranking_temperature=1.0
 ktr_pressure_clip=5.0
-kkt_bias_rank=4
+kkt_bias_rank=3
 prediction_weight=0.1
-temperature=0.6
+temperature=0.50
+risk_momentum_lookback=120
+risk_momentum_short_weight=0.0
+risk_momentum_residual_weight=0.005
+risk_turnover_aversion=0.0
+risk_downside_weight=0.25
+risk_drawdown_weight=0.10
+risk_smoothing_temperature=0.01
+kkt_risk_scale=0.10                # stronger direct KKT risk-budget correction
 
 # -----------------------------------------------------------------------------
 # Training and hardware
 # -----------------------------------------------------------------------------
 learning_rate=1e-3
 lradj="type1"
-train_epochs=10
-batch_size=64
-patience=10
+train_epochs=10                    # let the dynamic KKT path converge beyond one pass
+batch_size=128
+patience=4
 num_workers=0
 itr=1
 seed=2023
@@ -123,10 +131,10 @@ devices="0,1"
 
 # Encode the main architecture choices in the experiment name. run_kkt.py also
 # appends the remaining protocol/optimizer/loss settings to its checkpoint key.
-model_id="kkt_${feedback_mode}_dp${data_pool}_lre${log_return_embed_dim}_de${date_embed_dim}_ae${asset_embed_dim}_dm${d_model}_nh${n_heads}_nl${num_layers}"
+model_id="kkt_riskbudget_multiscale_dp${data_pool}_w${window_size}_rm${risk_momentum_lookback}_res${risk_momentum_residual_weight}"
 
 cmd=(
-  python -u run_kkt.py
+  conda run --no-capture-output -n alden python -u run_kkt.py
   --model_id "$model_id"
   --root_path "$root_path"
   --data_path "$data_path"
@@ -153,6 +161,7 @@ cmd=(
   --trade_cost_bps "$trade_cost_bps"
   --transaction_cost_smoothing "$transaction_cost_smoothing"
   --turnover_penalty "$turnover_penalty"
+  --risk_turnover_aversion "$risk_turnover_aversion"
   --entropy_regularization "$entropy_regularization"
   --entropy_epsilon "$entropy_epsilon"
   "--factor_lower=$factor_lower"
@@ -189,8 +198,15 @@ cmd=(
   --ktr_ranking_temperature "$ktr_ranking_temperature"
   --ktr_pressure_clip "$ktr_pressure_clip"
   --kkt_bias_rank "$kkt_bias_rank"
+  --kkt_risk_scale "$kkt_risk_scale"
   --prediction_weight "$prediction_weight"
   --temperature "$temperature"
+  --risk_momentum_lookback "$risk_momentum_lookback"
+  --risk_momentum_short_weight "$risk_momentum_short_weight"
+  --risk_momentum_residual_weight "$risk_momentum_residual_weight"
+  --risk_downside_weight "$risk_downside_weight"
+  --risk_drawdown_weight "$risk_drawdown_weight"
+  --risk_smoothing_temperature "$risk_smoothing_temperature"
   --learning_rate "$learning_rate"
   --lradj "$lradj"
   --train_epochs "$train_epochs"

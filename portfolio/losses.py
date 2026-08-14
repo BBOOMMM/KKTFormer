@@ -359,6 +359,78 @@ def portfolio_cvar_loss(
     return total, components
 
 
+def portfolio_risk_budget_loss(
+    weights: torch.Tensor,
+    future_returns: torch.Tensor,
+    alpha: float = 0.95,
+    downside_temperature: float = 1e-2,
+    drawdown_temperature: float = 1e-2,
+    downside_weight: float = 0.25,
+    drawdown_weight: float = 0.10,
+    w_prev: Optional[torch.Tensor] = None,
+    turnover_weight: float = 0.0,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Smooth decision-focused risk-budget objective.
+
+    This objective complements CVaR with two path-level terms that are useful
+    for an actual portfolio: a soft downside semideviation and a smooth
+    maximum drawdown surrogate.  The latter is computed on cumulative log
+    wealth, so it is differentiable through every allocation in the horizon.
+    A quadratic turnover term makes the same decision layer usable when a
+    trading budget is supplied.  It is deliberately scale-normalized by the
+    horizon and does not replace the hard constraints in the optimizer.
+    """
+
+    if weights.shape != future_returns.shape:
+        raise ValueError("weights and future_returns must both have shape (..., H, N)")
+    if downside_temperature <= 0 or drawdown_temperature <= 0:
+        raise ValueError("risk smoothing temperatures must be positive")
+    if min(downside_weight, drawdown_weight, turnover_weight) < 0:
+        raise ValueError("risk objective weights cannot be negative")
+    portfolio_returns = (weights * future_returns).sum(dim=-1)
+    losses = -portfolio_returns
+    var = torch.quantile(losses, alpha, dim=-1, keepdim=True)
+    cvar = var.squeeze(-1) + torch.relu(losses - var).mean(dim=-1) / (1.0 - alpha)
+
+    # ``softplus`` is a smooth positive-part operator and avoids the zero
+    # gradient region of a hard downside mask during early training.
+    downside = downside_temperature * torch.nn.functional.softplus(
+        -portfolio_returns / downside_temperature
+    ).mean(dim=-1)
+    log_wealth = torch.log1p(portfolio_returns.clamp(min=-0.99)).cumsum(dim=-1)
+    running_peak = torch.cummax(log_wealth, dim=-1).values
+    drawdown = running_peak - log_wealth
+    smooth_max_drawdown = drawdown_temperature * torch.logsumexp(
+        drawdown / drawdown_temperature, dim=-1
+    )
+
+    if w_prev is None:
+        turnover = torch.zeros_like(cvar)
+    else:
+        first = (weights[..., 0, :] - w_prev).square().sum(dim=-1)
+        later = (
+            (weights[..., 1:, :] - weights[..., :-1, :]).square().sum(dim=-1)
+            if weights.shape[-2] > 1
+            else torch.zeros_like(first).unsqueeze(-1)
+        )
+        turnover = (first + later.sum(dim=-1)) / float(weights.shape[-2])
+
+    total = (
+        cvar
+        + float(downside_weight) * downside
+        + float(drawdown_weight) * smooth_max_drawdown
+        + float(turnover_weight) * turnover
+    )
+    return total, {
+        "cvar": cvar,
+        "var": var.squeeze(-1),
+        "downside": downside,
+        "smooth_max_drawdown": smooth_max_drawdown,
+        "turnover": turnover,
+        "total_loss": total,
+    }
+
+
 def kkt_tail_ranking_loss(
     allocation_logits: torch.Tensor,
     weights: torch.Tensor,

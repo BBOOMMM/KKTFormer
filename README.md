@@ -1,6 +1,6 @@
 # KKTFormer
 
-KKTFormer 是一个面向资产配置的端到端决策模型。模型先用 Transformer 提取时间和资产交互特征，再通过可微投资组合优化器得到初始仓位及近似 KKT 状态；这些 primal-dual 信息会被编码为多头注意力偏置，最终由独立的 softmax allocation head 直接生成组合仓位。
+KKTFormer 是一个面向资产配置的端到端决策模型。模型先用 Transformer 提取时间和资产交互特征，再通过可微投资组合优化器得到初始仓位及近似 KKT 状态；这些 primal-dual 信息会被编码为多头注意力偏置，最终由独立的 softmax allocation head 直接生成组合仓位。当前还提供 `risk_budget` 扩展：用多尺度风险动量先验和可学习残差生成决策 logits，并通过换手感知分配器输出仓位。
 
 本仓库同时保留了上游 Signature-Informed Transformer（SIT）的部分代码，用于公平对照。KKTFormer 的实验协议默认向 SIT 对齐，但模型输入、KKT 模块、约束和可微优化策略属于 KKTFormer。
 
@@ -39,6 +39,27 @@ realized returns (B,H,N)
         ↓
 end-to-end CVaR loss
 ```
+
+`--decision_layer risk_budget` 使用另一条决策路径：
+
+```text
+121-point causal path → 120 simple-return observations
+        ↓
+sum(return) / std(return) at long/short scales
+        ↓
+risk-momentum prior + learned allocation residual
+        ↓
+temperature softmax → turnover-aware proximal simplex allocator
+```
+
+该先验不依赖 signature-path interaction；121 个价格点对应 120 个真实收益观测，
+因此能够覆盖比默认 60 点 SIT 路径更长的趋势-风险尺度。分配器仍严格保持非负和预算
+约束，并可通过 `--risk_turnover_aversion` 与 `--max_turnover` 抑制换手。
+
+当 `--feedback_mode dual` 且 `--kkt_risk_scale>0` 时，KKT probe 产生的
+`marginal_risk`、上下界 dual、active-set 和 pressure 会进入独立的 risk gate，直接
+调制 risk-budget logits。50 资产池不能使用接近 `1/N` 的 probe 上界；例如本实验使用
+`probe_upper_bound=0.04`，避免 probe 退化为等权解。
 
 默认 `--cvar_variant sit` 与发布版 SIT 使用完全相同的训练目标：VaR 由
 `torch.quantile` 计算且不 detach，tail excess 使用 `ReLU(L - VaR)`。原先的
@@ -276,10 +297,15 @@ results_kkt/
 | `--feedback_mode` | `dual` | `none`、`two_pass`、`context`、`bias`、`dynamic`、`dual` 或 `jacobian` |
 | `--kkt_bias_rank` | `4` | 每个 head 的 KKT bias 低秩维度 |
 | `--probe_optimizer_iterations` | `5` | 第一阶段 probe optimizer 迭代数 |
-| `--decision_layer` | `softmax` | 最终组合层；`optimizer` 保留为旧版消融 |
+| `--decision_layer` | `softmax` | 最终组合层；`optimizer` 为约束优化消融，`risk_budget` 为风险动量决策层 |
 | `--temperature` | `1.0` | 最终 allocation softmax 的固定温度 |
 | `--optimizer_iterations` | `10` | optimizer 消融或 hybrid oracle 的迭代数 |
-| `--loss_mode` | `cvar` | `cvar` 或 `hybrid`（CVaR + decision regret） |
+| `--loss_mode` | `cvar` | `cvar`、`hybrid`、`ktr` 或 `risk_budget` |
+| `--risk_momentum_lookback` | `120` | 风险动量先验使用的真实收益长度 |
+| `--risk_momentum_short_weight` | `0.0` | 短尺度风险动量混合权重 |
+| `--risk_momentum_residual_weight` | `0.0` | Transformer allocation residual 权重 |
+| `--risk_turnover_aversion` | `0.0` | 风险预算分配器的换手近端收缩强度 |
+| `--kkt_risk_scale` | `0.0` | KKT state 对 risk-budget logits 的直接调制强度 |
 | `--regret_weight` | `0.1` | hybrid 中的 `lambda_regret`；应只用验证集选择 |
 | `--cvar_alpha` | `0.95` | CVaR 置信水平 |
 | `--cvar_variant` | `sit` | `sit` 完全复刻原版 quantile + ReLU；`smooth` 为消融 |
@@ -316,6 +342,20 @@ probe optimizer 使用独立的 box bounds，因此可以通过较紧的
 
 optimizer 模式会从 probe 仓位 warm start，并显著降低训练速度。默认 softmax 模式下，
 probe 的所有 `B×H` 优化问题仍以一次张量批处理运行，不会在 Python 中逐 token 调用优化器。
+
+### 风险预算决策目标
+
+设置 `--loss_mode risk_budget` 后，训练目标为：
+
+```text
+L = CVaR + λ_downside · softplus(-r / T)
+          + λ_drawdown · softmax_t(max_drawdown_t / T)
+          + λ_turnover · ||w_t - w_{t-1}||²
+```
+
+它把 CVaR 的尾部约束与 horizon 内的 downside、路径回撤和换手代价联合起来，
+仍然对仓位和风险动量 logits 可微。对应参数为 `--risk_downside_weight`、
+`--risk_drawdown_weight` 和 `--risk_smoothing_temperature`。
 
 ### CVaR + 决策遗憾
 

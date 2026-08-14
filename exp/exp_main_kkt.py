@@ -18,6 +18,8 @@ from portfolio import (
     MinimalPortfolioProblem,
     kkt_tail_ranking_loss,
     portfolio_cvar_loss,
+    portfolio_risk_budget_loss,
+    RiskBudgetedAllocator,
     sequence_decision_regret_loss,
     compute_kkt_state,
 )
@@ -75,8 +77,10 @@ class EXP_KKT(Exp_Basic):
         self.decision_layer = str(
             getattr(args, "decision_layer", "softmax")
         ).lower()
-        if self.decision_layer not in {"softmax", "optimizer"}:
-            raise ValueError("decision_layer must be one of softmax or optimizer")
+        if self.decision_layer not in {"softmax", "optimizer", "risk_budget"}:
+            raise ValueError(
+                "decision_layer must be one of softmax, optimizer, or risk_budget"
+            )
         self.temperature = float(getattr(args, "temperature", 1.0))
         if not math.isfinite(self.temperature) or self.temperature <= 0.0:
             raise ValueError("temperature must be finite and positive")
@@ -130,6 +134,14 @@ class EXP_KKT(Exp_Basic):
         )
         self.entropy_epsilon = float(getattr(args, "entropy_epsilon", 1e-4))
         self.turnover_penalty = float(getattr(args, "turnover_penalty", 0.0))
+        self.risk_turnover_aversion = float(
+            getattr(args, "risk_turnover_aversion", 0.0)
+        )
+        self.risk_allocator = RiskBudgetedAllocator(
+            temperature=self.temperature,
+            turnover_aversion=self.risk_turnover_aversion,
+            entropy_epsilon=self.entropy_epsilon,
+        )
         self.transaction_cost_smoothing = float(
             getattr(args, "transaction_cost_smoothing", 1e-4)
         )
@@ -138,9 +150,9 @@ class EXP_KKT(Exp_Basic):
         self.sequential_state = bool(getattr(args, "sequential_state", False))
         self._sequential_previous = None
         self.loss_mode = str(getattr(args, "loss_mode", "cvar")).lower()
-        if self.loss_mode not in {"cvar", "hybrid", "ktr"}:
+        if self.loss_mode not in {"cvar", "hybrid", "ktr", "risk_budget"}:
             raise ValueError(
-                "sequence KKTFormer supports loss_mode=cvar, hybrid, or ktr"
+                "sequence KKTFormer supports loss_mode=cvar, hybrid, ktr, or risk_budget"
             )
         if self.loss_mode == "ktr" and self.feedback_mode == "none":
             raise ValueError("loss_mode=ktr requires a KKT probe feedback mode")
@@ -454,6 +466,27 @@ class EXP_KKT(Exp_Basic):
                     weights_flat, lower_flat, upper_flat, w_prev_flat
                 )
             )
+        elif self.decision_layer == "risk_budget":
+            allocation_logits = model_core.risk_budget_logits(
+                log_return_path,
+                allocation_hidden,
+                kkt_state=(kkt_state if self.feedback_mode != "none" else None),
+            )
+            weights_flat, allocator_state = self.risk_allocator(
+                allocation_logits.reshape(batch_size * horizon, num_assets),
+                w_prev=w_prev_flat,
+                max_turnover=self.max_turnover,
+            )
+            weights = weights_flat.reshape(batch_size, horizon, num_assets)
+            state = reshape_state(
+                self._softmax_state(
+                    weights_flat, lower_flat, upper_flat, w_prev_flat
+                )
+            )
+            for key, value in allocator_state.items():
+                state[f"risk_{key}"] = reshape_state({"value": value})[
+                    "value"
+                ]
         else:
             weights_flat, state_flat = self.portfolio_optimizer(
                 mu_hat=mu_hat.reshape(batch_size * horizon, num_assets),
@@ -497,6 +530,29 @@ class EXP_KKT(Exp_Basic):
             transaction_cost_smoothing=self.transaction_cost_smoothing,
         )
         cvar_loss = cvar_batch.mean()
+        risk_budget_loss = cvar_loss.detach() * 0.0
+        risk_budget_components = None
+        if self.loss_mode == "risk_budget":
+            risk_budget_batch, risk_budget_components = portfolio_risk_budget_loss(
+                weights=weights,
+                future_returns=future_returns,
+                alpha=float(getattr(self.args, "cvar_alpha", 0.95)),
+                downside_temperature=float(
+                    getattr(self.args, "risk_smoothing_temperature", 1e-2)
+                ),
+                drawdown_temperature=float(
+                    getattr(self.args, "risk_smoothing_temperature", 1e-2)
+                ),
+                downside_weight=float(
+                    getattr(self.args, "risk_downside_weight", 0.25)
+                ),
+                drawdown_weight=float(
+                    getattr(self.args, "risk_drawdown_weight", 0.10)
+                ),
+                w_prev=w_prev,
+                turnover_weight=float(self.turnover_penalty),
+            )
+            risk_budget_loss = risk_budget_batch.mean()
         regret_loss = cvar_loss.detach() * 0.0
         ktr_loss = cvar_loss.detach() * 0.0
         ktr_components = None
@@ -559,8 +615,9 @@ class EXP_KKT(Exp_Basic):
             )
             ktr_loss = ktr_batch.mean()
 
+        objective_loss = risk_budget_loss if self.loss_mode == "risk_budget" else cvar_loss
         total_loss = (
-            cvar_loss
+            objective_loss
             + self.regret_weight * regret_loss
             + self.ktr_weight * ktr_loss
         )
@@ -571,6 +628,7 @@ class EXP_KKT(Exp_Basic):
             "prediction_loss": zero,
             "utility_loss": zero,
             "cvar_loss": cvar_loss,
+            "risk_budget_loss": risk_budget_loss,
             "regret_loss": regret_loss,
             "weighted_regret_loss": self.regret_weight * regret_loss,
             "ktr_loss": ktr_loss,
@@ -588,6 +646,16 @@ class EXP_KKT(Exp_Basic):
             "turnover": cvar_components["turnover"].mean(),
             "smooth_transaction_cost": cvar_components["smooth_transaction_cost"].mean(),
         }
+        if risk_budget_components is not None:
+            details.update(
+                {
+                    "risk_downside": risk_budget_components["downside"].mean(),
+                    "risk_smooth_max_drawdown": risk_budget_components[
+                        "smooth_max_drawdown"
+                    ].mean(),
+                    "risk_turnover": risk_budget_components["turnover"].mean(),
+                }
+            )
         if ktr_components is not None:
             details.update(
                 {
