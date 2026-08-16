@@ -93,8 +93,13 @@ probe_optimizer_iterations=30
 projection_iterations=64
 constraint_projection_iterations=20
 
-loss_mode="hybrid"                # CVaR + detached decision-regret oracle
+loss_mode="ktr"                   # CVaR + detached decision-regret + KTR
 regret_weight=0.12                 # validated 40-pool decision-policy weight
+ktr_weight=0.0001                  # small scale: KTR is added to the CVaR/regret objective
+ktr_tail_alpha=0.80
+ktr_pressure_scale=1.0
+ktr_ranking_temperature=1.0
+ktr_pressure_clip=5.0
 prediction_loss="NONE"            # prediction route is explicitly disabled
 cvar_alpha=0.95
 cvar_variant="sit"                # sit | smooth
@@ -201,6 +206,11 @@ cmd=(
   --constraint_projection_iterations "$constraint_projection_iterations"
   --loss_mode "$loss_mode"
   --regret_weight "$regret_weight"
+  --ktr_weight "$ktr_weight"
+  --ktr_tail_alpha "$ktr_tail_alpha"
+  --ktr_pressure_scale "$ktr_pressure_scale"
+  --ktr_ranking_temperature "$ktr_ranking_temperature"
+  --ktr_pressure_clip "$ktr_pressure_clip"
   --prediction_loss "$prediction_loss"
   --cvar_alpha "$cvar_alpha"
   --cvar_variant "$cvar_variant"
