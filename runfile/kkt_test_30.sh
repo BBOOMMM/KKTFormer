@@ -83,10 +83,10 @@ active_tolerance=1e-5
 log_return_embed_dim=32
 date_embed_dim=8
 asset_embed_dim=8
-d_model=64                        # capacity tuned for the 30-pool cross-section
+d_model=32                        # same Transformer width as the 40/50 scripts
 n_heads=4
 num_layers=1
-ff_dim=128
+ff_dim=64
 dropout=0.0
 
 # -----------------------------------------------------------------------------
@@ -135,9 +135,9 @@ forecast_weight=0.0
 # -----------------------------------------------------------------------------
 learning_rate=1e-3
 lradj="type1"
-train_epochs=2
+train_epochs=5                   # training-only adjustment; model capacity unchanged
 batch_size=128
-patience=4
+patience=6
 num_workers=0
 itr=1
 seed=2023
