@@ -5,7 +5,7 @@ set -euo pipefail
 # Run this script from the KKTFormer repository root:
 #   bash runfile/kkt_test_50.sh
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES="${KKT_CUDA_VISIBLE_DEVICES:-0}"
 
 # -----------------------------------------------------------------------------
 # Experiment paths and protocol
@@ -93,28 +93,28 @@ probe_optimizer_iterations=30
 projection_iterations=64
 constraint_projection_iterations=20
 
-loss_mode="hybrid"                # CVaR + detached decision-regret oracle
-regret_weight=0.01                 # lambda_regret; oracle is not a prediction loss
+loss_mode="${KKT_LOSS_MODE:-ktr}" # CVaR + detached decision-regret + KTR
+regret_weight="${KKT_REGRET_WEIGHT:-0.01}" # lambda_regret; oracle is not a prediction loss
 prediction_loss="NONE"             # kept only for CLI compatibility; never used
 prediction_weight=0.0
 cvar_alpha=0.95
 cvar_variant="sit"                # sit | smooth
 cvar_temperature=1e-3
-ktr_weight=0.01
-ktr_tail_alpha=0.95
-ktr_pressure_scale=1.0
-ktr_ranking_temperature=1.0
-ktr_pressure_clip=5.0
+ktr_weight="${KKT_KTR_WEIGHT:-0.0001}"
+ktr_tail_alpha="${KKT_KTR_TAIL_ALPHA:-0.80}"
+ktr_pressure_scale="${KKT_KTR_PRESSURE_SCALE:-1.0}"
+ktr_ranking_temperature="${KKT_KTR_RANKING_TEMPERATURE:-1.0}"
+ktr_pressure_clip="${KKT_KTR_PRESSURE_CLIP:-5.0}"
 kkt_bias_rank=3
-temperature=0.02                  # avoid GPU-sensitive near-corner allocation jumps
+temperature="${KKT_TEMPERATURE:-0.02}" # avoid GPU-sensitive near-corner allocation jumps
 risk_momentum_lookback=60         # do not introduce a hidden >60-day lookback
 risk_scale_windows="20,40,60"        # trainable multi-scale gate within W=60
 risk_score_normalization="raw"   # preserve return/volatility scale for temperature-aware allocation
 risk_score_epsilon=1e-4           # stabilizes the raw risk score without flattening its scale
 risk_multiscale_residual_weight=0.001 # bounded correction around the 20d base scale
 risk_defensive_gate_floor=0.95      # small but genuine learned downside modulation
-risk_momentum_short_weight=0.15   # short-horizon trend correction
-risk_momentum_residual_weight=0.05    # bounded learned Transformer allocation residual
+risk_momentum_short_weight="${KKT_RISK_SHORT_WEIGHT:-0.15}" # short-horizon trend correction
+risk_momentum_residual_weight="${KKT_RISK_RESIDUAL_WEIGHT:-0.05}" # bounded learned Transformer allocation residual
 risk_forecast_weight=0.0           # prediction route disabled for end-to-end policy
 risk_prior_bias=-0.8                # former successful baseline
 risk_turnover_aversion=0.0
@@ -123,17 +123,17 @@ risk_drawdown_weight=0.10
 risk_smoothing_temperature=0.01
 kkt_risk_scale=0.001               # isolated nonzero direct KKT-conditioned feedback
 forecast_weight=0.0                # prediction loss is explicitly disabled
-risk_contrarian_weight=0.0         # isolate the learned trend/KKT interaction
-risk_defensive_weight=1.0          # learned downside-risk budget correction
+risk_contrarian_weight="${KKT_RISK_CONTRARIAN_WEIGHT:-0.0}" # isolate the learned trend/KKT interaction
+risk_defensive_weight="${KKT_RISK_DEFENSIVE_WEIGHT:-1.0}" # learned downside-risk budget correction
 
 # -----------------------------------------------------------------------------
 # Training and hardware
 # -----------------------------------------------------------------------------
-learning_rate=1e-3
+learning_rate="${KKT_LEARNING_RATE:-1e-3}"
 lradj="type1"
-train_epochs=2                     # decision-policy training, no prediction pretext task
-batch_size=128
-patience=4
+train_epochs="${KKT_TRAIN_EPOCHS:-2}" # decision-policy training, no prediction pretext task
+batch_size="${KKT_BATCH_SIZE:-128}"
+patience="${KKT_PATIENCE:-4}"
 num_workers=0
 itr=1
 seed=2023
@@ -145,7 +145,7 @@ devices="0,1"
 
 # Encode the main architecture choices in the experiment name. run_kkt.py also
 # appends the remaining protocol/optimizer/loss settings to its checkpoint key.
-model_id="kkt_decision_regret_factor_turnover_dp${data_pool}_w${window_size}"
+model_id="${KKT_MODEL_ID:-kkt_decision_regret_factor_turnover_dp${data_pool}_w${window_size}}"
 
 cmd=(
   conda run --no-capture-output -n alden python -u run_kkt.py
