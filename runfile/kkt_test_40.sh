@@ -12,7 +12,7 @@ export CUDA_VISIBLE_DEVICES=0
 # -----------------------------------------------------------------------------
 root_path="./asset_data/"
 data_path="full_dataset.csv"
-context_root="./portfolio_context_cache"
+context_root="./portfolio_context_cache_robust60"
 checkpoints="./checkpoints_kkt/"
 results_path="./results_kkt/"
 log_dir="./logs/"
@@ -32,11 +32,14 @@ evaluation_end_date="2024-12-31" # used by the native protocol
 # -----------------------------------------------------------------------------
 upper_bound=1.0
 lower_bound=0.0
-probe_upper_bound=0.1              # preserve informative KKT geometry for N=40
+probe_upper_bound=0.045            # validated 40-pool KKT probe geometry
 probe_lower_bound=0.0
 budget_target=1.0
-eta=1e-5
+eta=1e-3
 covariance_epsilon=1e-6
+covariance_robustness=0.35
+covariance_decay=0.98
+covariance_winsor_quantile=0.05
 
 signal_normalization="risk"       # risk | none
 signal_scale=0.12
@@ -45,13 +48,14 @@ signal_normalization_epsilon=1e-6
 trade_cost_bps=0.0
 transaction_cost_bps=""           # empty: use trade_cost_bps
 transaction_cost_smoothing=1e-4
-turnover_penalty=0.0
+turnover_penalty=0.02
+turnover_smoothing=1.0
 
 # Entropy regularization in the optimizer and KKT state:
 #   tau * sum_i [(w_i + epsilon) log(w_i + epsilon) - epsilon log(epsilon)]
 # tau=0 disables it; positive tau encourages a more diversified portfolio.
 # Supported by every feedback mode.
-entropy_regularization=1e-4           # tau; let the probe reveal box-active geometry
+entropy_regularization=0             # keep the KKT risk signal unperturbed
 entropy_epsilon=1e-4              # numerical smoothing near w_i=0
 
 max_turnover=""                   # e.g. 0.5; empty disables it
@@ -69,7 +73,7 @@ sequential_state=0                # 1 adds --sequential_state
 input_dim=1
 factor_dim=3
 feedback_mode="dual"             # 40-pool stable primal-dual attention feedback
-decision_layer="softmax"          # stable temperature-controlled allocation
+decision_layer="risk_budget"      # KKT-aware differentiable risk-budget policy
 active_tolerance=1e-5
 
 log_return_embed_dim=32
@@ -79,42 +83,52 @@ d_model=32                        # fusion output and Transformer hidden width
 n_heads=4
 num_layers=1
 ff_dim=64
-dropout=0.1
+dropout=0.0
 
 # -----------------------------------------------------------------------------
 # Differentiable optimizer and objective
 # -----------------------------------------------------------------------------
 optimizer_iterations=100
-probe_optimizer_iterations=50
+probe_optimizer_iterations=30
 projection_iterations=64
 constraint_projection_iterations=20
 
-loss_mode="cvar"                  # 40-pool CVaR objective
-regret_weight=1.0                  # lambda_regret; used by hybrid
-prediction_loss="MSE"
+loss_mode="hybrid"                # CVaR + detached decision-regret oracle
+regret_weight=0.12                 # validated 40-pool decision-policy weight
+prediction_loss="NONE"            # prediction route is explicitly disabled
 cvar_alpha=0.95
 cvar_variant="sit"                # sit | smooth
 cvar_temperature=1e-3
-kkt_bias_rank=4
-prediction_weight=0.1
-temperature=0.61                # 40-pool validation-selected diversification
-risk_momentum_lookback=120
-risk_momentum_short_weight=0.0
-risk_momentum_residual_weight=0.005
+kkt_bias_rank=3
+prediction_weight=0.0
+temperature=0.22                  # validated 40-pool risk-budget temperature
+risk_momentum_lookback=60
+risk_scale_windows="20,40,60"
+risk_score_normalization="raw"
+risk_score_epsilon=1e-4
+risk_multiscale_residual_weight=0.001
+risk_defensive_gate_floor=0.95
+risk_momentum_short_weight=0.15
+risk_momentum_residual_weight=0.5
+risk_forecast_weight=0.0
+risk_contrarian_weight=1.0
+risk_defensive_weight=0.25
+risk_prior_bias=-0.8
 risk_turnover_aversion=0.0
 risk_downside_weight=0.25
 risk_drawdown_weight=0.10
 risk_smoothing_temperature=0.01
-kkt_risk_scale=0.0                 # isolate the validated dual attention path
+kkt_risk_scale=0.001               # direct KKT state enters decision logits
+forecast_weight=0.0
 
 # -----------------------------------------------------------------------------
 # Training and hardware
 # -----------------------------------------------------------------------------
 learning_rate=1e-3
 lradj="type1"
-train_epochs=10
-batch_size=64
-patience=3
+train_epochs=2
+batch_size=128
+patience=4
 num_workers=0
 itr=1
 seed=2023
@@ -126,7 +140,7 @@ devices="0,1"
 
 # Encode the main architecture choices in the experiment name. run_kkt.py also
 # appends the remaining protocol/optimizer/loss settings to its checkpoint key.
-model_id="kkt_40data_dual_softmax_cvar_tp061"
+model_id="kkt_decision_regret_factor_turnover_dp40_w60"
 
 cmd=(
   conda run --no-capture-output -n alden python -u run_kkt.py
@@ -150,12 +164,16 @@ cmd=(
   --budget_target "$budget_target"
   --eta "$eta"
   --covariance_epsilon "$covariance_epsilon"
+  --covariance_robustness "$covariance_robustness"
+  --covariance_decay "$covariance_decay"
+  --covariance_winsor_quantile "$covariance_winsor_quantile"
   --signal_normalization "$signal_normalization"
   --signal_scale "$signal_scale"
   --signal_normalization_epsilon "$signal_normalization_epsilon"
   --trade_cost_bps "$trade_cost_bps"
   --transaction_cost_smoothing "$transaction_cost_smoothing"
   --turnover_penalty "$turnover_penalty"
+  --turnover_smoothing "$turnover_smoothing"
   --risk_turnover_aversion "$risk_turnover_aversion"
   --entropy_regularization "$entropy_regularization"
   --entropy_epsilon "$entropy_epsilon"
@@ -187,6 +205,12 @@ cmd=(
   --cvar_alpha "$cvar_alpha"
   --cvar_variant "$cvar_variant"
   --cvar_temperature "$cvar_temperature"
+  --forecast_weight "$forecast_weight"
+  --risk_scale_windows "$risk_scale_windows"
+  --risk_score_normalization "$risk_score_normalization"
+  --risk_score_epsilon "$risk_score_epsilon"
+  --risk_multiscale_residual_weight "$risk_multiscale_residual_weight"
+  --risk_defensive_gate_floor "$risk_defensive_gate_floor"
   --kkt_bias_rank "$kkt_bias_rank"
   --kkt_risk_scale "$kkt_risk_scale"
   --prediction_weight "$prediction_weight"
@@ -194,6 +218,10 @@ cmd=(
   --risk_momentum_lookback "$risk_momentum_lookback"
   --risk_momentum_short_weight "$risk_momentum_short_weight"
   --risk_momentum_residual_weight "$risk_momentum_residual_weight"
+  --risk_forecast_weight "$risk_forecast_weight"
+  --risk_contrarian_weight "$risk_contrarian_weight"
+  --risk_defensive_weight "$risk_defensive_weight"
+  --risk_prior_bias "$risk_prior_bias"
   --risk_downside_weight "$risk_downside_weight"
   --risk_drawdown_weight "$risk_drawdown_weight"
   --risk_smoothing_temperature "$risk_smoothing_temperature"
