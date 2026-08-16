@@ -168,8 +168,10 @@ class EXP_KKT(Exp_Basic):
             )
         if self.loss_mode == "ktr" and self.feedback_mode == "none":
             raise ValueError("loss_mode=ktr requires a KKT probe feedback mode")
-        if self.loss_mode == "ktr" and self.decision_layer != "softmax":
-            raise ValueError("loss_mode=ktr requires decision_layer=softmax")
+        # KTR ranks the allocation logits produced by either the original
+        # softmax head or the KKT-aware risk-budget head.  Keeping this
+        # compatible with risk_budget lets KTR supervise the same dual,
+        # multi-scale decision policy used by the other asset pools.
         self.regret_weight = float(getattr(args, "regret_weight", 0.1))
         if not math.isfinite(self.regret_weight) or self.regret_weight < 0.0:
             raise ValueError("regret_weight must be finite and non-negative")
@@ -645,7 +647,7 @@ class EXP_KKT(Exp_Basic):
         mean_return_loss = cvar_loss.detach() * 0.0
         oracle_return_loss = cvar_loss.detach() * 0.0
 
-        if self.loss_mode == "hybrid":
+        if self.loss_mode in {"hybrid", "ktr"}:
             # The hindsight oracle sees the realized next-period return for
             # each causal token. It starts from the detached model decision,
             # uses the exact same feasible set, and never receives gradients.
