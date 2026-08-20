@@ -5,7 +5,7 @@ set -euo pipefail
 # Run this script from the KKTFormer repository root:
 #   bash runfile/kkt_test_40.sh
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 
 # -----------------------------------------------------------------------------
 # Experiment paths and protocol
@@ -14,8 +14,8 @@ root_path="./asset_data/"
 data_path="full_dataset.csv"
 context_root="./portfolio_context_cache_robust60"
 checkpoints="./checkpoints_kkt/"
-results_path="./results_kkt/"
-log_dir="./logs/"
+results_path="./results_kkt_final/"
+log_dir="./logs_kkt_final/"
 
 protocol="sit"                    # sit | native
 data_pool=40
@@ -135,8 +135,7 @@ train_epochs=2
 batch_size=128
 patience=4
 num_workers=0
-itr=1
-seed=2023
+seed="${KKT_SEED:-2023,2024,2025}"
 
 use_gpu=1
 gpu=0
@@ -241,7 +240,6 @@ cmd=(
   --batch_size "$batch_size"
   --patience "$patience"
   --num_workers "$num_workers"
-  --itr "$itr"
   --seed "$seed"
   --use_gpu "$use_gpu"
   --gpu "$gpu"

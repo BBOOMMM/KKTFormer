@@ -12,6 +12,26 @@ from exp.exp_main_kkt import EXP_KKT, ensure_feasible_probe_upper_bound
 from utils.logger import setup_logger
 
 
+def parse_seed_list(value: str) -> list[int]:
+    pieces = [piece.strip() for piece in str(value).split(",") if piece.strip()]
+    if not pieces:
+        raise argparse.ArgumentTypeError("--seed must contain at least one integer seed")
+    try:
+        return [int(piece) for piece in pieces]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "--seed expects an integer or comma-separated integers, e.g. 2023,2024,2025"
+        ) from exc
+
+
+def set_random_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def filesystem_safe_setting(setting: str, max_bytes: int = 240) -> str:
     """Compact an overlong experiment directory component deterministically."""
 
@@ -407,8 +427,12 @@ def parse_args():
     )
     parser.add_argument("--patience", type=int, default=3)
     parser.add_argument("--num_workers", type=int, default=0)
-    parser.add_argument("--itr", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=2023)
+    parser.add_argument(
+        "--seed",
+        type=parse_seed_list,
+        default=[2023],
+        help="integer seed or comma-separated seeds, e.g. 2023,2024,2025",
+    )
 
     parser.add_argument("--use_gpu", type=int, default=1)
     parser.add_argument("--gpu", type=int, default=0)
@@ -423,16 +447,24 @@ def main():
     # experiment key is constructed, so checkpoints record the effective cap.
     ensure_feasible_probe_upper_bound(args)
     log_path = setup_logger(args.log_dir, args.model_id)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    seed_values = list(args.seed)
+    args.seed_list = seed_values
     args.use_gpu = bool(args.use_gpu and torch.cuda.is_available())
     if args.use_gpu and args.use_multi_gpu:
         args.devices = args.devices.replace(" ", "")
         args.device_ids = [int(item) for item in args.devices.split(",")]
         args.gpu = args.device_ids[0]
 
-    for iteration in range(args.itr):
+    print("\n" + "=" * 88)
+    print(f"Seeds: {seed_values}")
+    print(f"Log file: {log_path}")
+    print("Full parameter configuration:")
+    print(pformat(vars(args), sort_dicts=True, width=100))
+    print("=" * 88)
+
+    for run_index, seed in enumerate(seed_values):
+        set_random_seed(seed)
+        args.seed = seed
         if args.protocol == "sit":
             train_frequency = val_frequency = test_frequency = 1
             protocol_frequency = 1
@@ -481,7 +513,7 @@ def main():
             f"_rw{args.regret_weight:g}_kw{args.ktr_weight:g}"
             f"_ka{args.ktr_tail_alpha:g}_kp{args.ktr_pressure_scale:g}"
             f"_pw{args.prediction_weight}"
-            f"_seq{int(args.sequential_state)}_{iteration}"
+            f"_seq{int(args.sequential_state)}_seed{seed}"
         )
         if args.entropy_regularization != 0.0:
             setting = setting.replace(
@@ -497,12 +529,8 @@ def main():
                 f"directory name to {len(setting.encode('utf-8'))} bytes: {setting}"
             )
         print("\n" + "=" * 88)
-        print(f"Experiment {iteration + 1}/{args.itr}")
+        print(f"Experiment {run_index + 1}/{len(seed_values)} (seed={seed})")
         print(f"Setting: {setting}")
-        print(f"Log file: {log_path}")
-        print("Full parameter configuration:")
-        print(pformat(vars(args), sort_dicts=True, width=100))
-        print("=" * 88)
         print(f">>>>>>> start training: {setting} >>>>>>>>>")
         experiment = EXP_KKT(args)
         experiment.train(setting)
