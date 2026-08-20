@@ -5,7 +5,7 @@ set -euo pipefail
 # Run this script from the KKTFormer repository root:
 #   bash runfile/kkt_test_40.sh
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 
 # -----------------------------------------------------------------------------
 # Experiment paths and protocol
@@ -130,12 +130,12 @@ forecast_weight=0.0
 # Training and hardware
 # -----------------------------------------------------------------------------
 learning_rate=1e-3
-lradj="type1"
-train_epochs=15
-batch_size=128
-patience=5
+lradj="type3"
+train_epochs=30
+batch_size=64
+patience=10
 num_workers=0
-seed="${KKT_SEED:-2023,2024,2025}"
+seed="${KKT_SEED:-2023,2024,2025,2026,2027}"
 
 use_gpu=1
 gpu=0

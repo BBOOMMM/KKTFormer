@@ -209,16 +209,6 @@ class Model(nn.Module):
             nn.GELU(),
             nn.Linear(gate_width, scale_count),
         )
-        # Warm-start the multi-scale gate toward the empirically stable
-        # decision-scale route while retaining a trainable gate for 40/60-day
-        # regimes.  This avoids replacing the causal prior with an arbitrary
-        # random convex mixture at the first end-to-end update.
-        if scale_count > 1:
-            scale_bias = torch.zeros(scale_count)
-            for index, window in enumerate(self.risk_scale_windows):
-                scale_bias[index] = -0.06 * float(window - min(self.risk_scale_windows))
-            with torch.no_grad():
-                self.risk_scale_gate[-1].bias.copy_(scale_bias)
         self.risk_signal_gate = nn.Sequential(
             nn.LayerNorm(self.d_model + 3),
             nn.Linear(self.d_model + 3, gate_width),
@@ -237,17 +227,21 @@ class Model(nn.Module):
             nn.GELU(),
             nn.Linear(gate_width, 1),
         )
-        # Start with a balanced prior/residual mixture.  The gate is trained
-        # per asset and per horizon token instead of fixing the old 0.005
-        # residual coefficient globally.
-        nn.init.constant_(self.risk_prior_gate[-1].bias, self.risk_prior_bias)
-        nn.init.constant_(self.risk_forecast_gate[-1].bias, -0.5)
-        # A stable warm start: trend remains the main route, while the two
-        # additional routes can be learned from the end-to-end objective.
-        with torch.no_grad():
-            self.risk_signal_gate[-1].bias.copy_(
-                torch.tensor([1.0, -0.25, -1.0])
-            )
+        # The gate hidden layers remain expressive, but their output layers
+        # start at zero.  Thus every seed begins with the same neutral gate:
+        # uniform scale/signal mixing and 0.5 sigmoid weights for prior and
+        # forecast routes.  The first optimizer step learns only the output
+        # projection; hidden gate parameters become active after that update.
+        # This removes an otherwise large source of seed-dependent portfolio
+        # rankings at initialization.
+        for gate in (
+            self.risk_scale_gate,
+            self.risk_signal_gate,
+            self.risk_prior_gate,
+            self.risk_forecast_gate,
+        ):
+            nn.init.zeros_(gate[-1].weight)
+            nn.init.zeros_(gate[-1].bias)
 
     def encode_inputs(
         self, log_return_path: torch.Tensor, date_feats: torch.Tensor
@@ -681,6 +675,11 @@ class DecisionAwareModel(nn.Module):
             nn.GELU(),
             nn.Linear(gate_width, 1),
         )
+        # Keep the KKT gate deterministic at initialization as well.  A zero
+        # sigmoid logit gives a fixed 0.5 injection gate; its asset-dependent
+        # modulation is learned only after the output layer receives a
+        # gradient.
+        nn.init.zeros_(self.kkt_risk_gate[-1].weight)
         nn.init.zeros_(self.kkt_risk_gate[-1].bias)
 
     def initial_forward(

@@ -8,7 +8,7 @@ set -euo pipefail
 # validated 40/50-pool scripts; only dataset-sensitive geometry and capacity
 # values differ.
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 
 # -----------------------------------------------------------------------------
 # Experiment paths and protocol
@@ -134,12 +134,12 @@ forecast_weight=0.0
 # Training and hardware
 # -----------------------------------------------------------------------------
 learning_rate=1e-3
-lradj="type1"
-train_epochs=15                   # training-only adjustment; model capacity unchanged
-batch_size=128
-patience=5
+lradj="type3"
+train_epochs=30                   # training-only adjustment; model capacity unchanged
+batch_size=64
+patience=30
 num_workers=0
-seed="${KKT_SEED:-2024,2025}"
+seed="${KKT_SEED:-2025}"
 
 use_gpu=1
 gpu=0
