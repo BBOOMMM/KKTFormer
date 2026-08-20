@@ -776,9 +776,16 @@ class EXP_KKT(Exp_Basic):
                 )
         return total_loss, mu_hat, weights, state, future_returns, details
 
-    def _validation_loss(self, loader, epoch: int) -> float:
+    def _validation_metrics(self, loader, epoch: int) -> Dict[str, float]:
+        """Backtest validation decisions and return portfolio-level metrics.
+
+        Validation contexts overlap by ``horizon`` observations.  Match the
+        SIT evaluation protocol by retaining the first prediction for each
+        date, then holding each selected position for one horizon rather than
+        counting the same realized return once per overlapping context.
+        """
         self.model.eval()
-        losses = []
+        event_records = {}
         self._sequential_previous = None
         with torch.no_grad():
             progress = tqdm(
@@ -789,16 +796,86 @@ class EXP_KKT(Exp_Basic):
                 leave=False,
             )
             for batch in progress:
+                batch_size = int(batch["future_returns"].shape[0])
+                execution_date_batch = self._decode_date_batch(
+                    batch["future_dates"], batch_size
+                )
                 previous = self._sequential_previous if self.sequential_state else None
-                _, _, weights, _, _, details = self._forward_batch(
+                _, _, weights, _, future_returns, _ = self._forward_batch(
                     batch, w_prev_override=previous
                 )
-                losses.append(float(details["total_loss"].item()))
+                for sample_index, execution_dates in enumerate(execution_date_batch):
+                    for token_index, execution_date in enumerate(execution_dates):
+                        if execution_date in event_records:
+                            continue
+                        event_records[execution_date] = (
+                            weights[sample_index, token_index].detach().cpu().numpy(),
+                            future_returns[sample_index, token_index]
+                            .detach()
+                            .cpu()
+                            .numpy(),
+                        )
                 if self.sequential_state:
                     self._sequential_previous = weights[:, 0].detach()
-        if not losses:
+        if not event_records:
             raise RuntimeError("validation loader is empty")
-        return float(np.mean(losses))
+
+        sorted_dates = sorted(event_records, key=pd.to_datetime)
+        if self.protocol == "sit":
+            # SIT test decisions are spaced by one prediction horizon.  The
+            # first daily position initializes the path; the next observation
+            # starts the regular 20-trading-day rebalance grid.
+            rebalance_interval = int(self.args.horizon)
+            rebalance_offset = 1 if len(sorted_dates) > 1 else 0
+        else:
+            configured = getattr(self.args, "val_rebalance_frequency", None)
+            rebalance_interval = int(
+                configured
+                if configured is not None
+                else getattr(self.args, "rebalance_frequency", self.args.horizon)
+            )
+            rebalance_offset = 0
+        if rebalance_interval <= 0:
+            raise ValueError("validation rebalance interval must be positive")
+
+        transaction_cost_bps = float(
+            getattr(self.args, "trade_cost_bps", 0.0)
+            if getattr(self.args, "transaction_cost_bps", None) is None
+            else self.args.transaction_cost_bps
+        )
+        cost_rate = transaction_cost_bps * 1e-4
+        current_weights = None
+        previous_weights = np.zeros(self.args.data_pool, dtype=float)
+        realized_portfolio_returns = []
+        realized_dates = []
+
+        for date_index, execution_date in enumerate(sorted_dates):
+            predicted_weights, realized_asset_returns = event_records[execution_date]
+            should_rebalance = current_weights is None or (
+                date_index >= rebalance_offset
+                and (date_index - rebalance_offset) % rebalance_interval == 0
+            )
+            transaction_cost = 0.0
+            if should_rebalance:
+                current_weights = predicted_weights.astype(float)
+                turnover = float(np.abs(current_weights - previous_weights).sum())
+                transaction_cost = cost_rate * turnover
+                previous_weights = current_weights.copy()
+            portfolio_return = (
+                float(np.dot(current_weights, realized_asset_returns))
+                - transaction_cost
+            )
+            if not math.isfinite(portfolio_return) or portfolio_return <= -1.0:
+                raise RuntimeError("invalid validation portfolio return")
+            realized_dates.append(pd.Timestamp(execution_date))
+            realized_portfolio_returns.append(portfolio_return)
+
+        daily_series = pd.Series(
+            realized_portfolio_returns,
+            index=pd.DatetimeIndex(realized_dates),
+            dtype=float,
+        )
+        return self._portfolio_metrics(daily_series)
 
     def train(self, setting):
         train_data, train_loader = self._get_data("train")
@@ -810,6 +887,8 @@ class EXP_KKT(Exp_Basic):
         early_stopping = EarlyStopping(
             patience=self.args.patience,
             verbose=True,
+            mode="max",
+            metric_name="Validation Sharpe",
         )
         model_optimizer = optim.Adam(
             self.model.parameters(), lr=self.args.learning_rate
@@ -857,7 +936,7 @@ class EXP_KKT(Exp_Basic):
                 ktr_losses.append(float(details["ktr_loss"].item()))
                 progress.set_postfix(loss=f"{train_losses[-1]:.6f}")
 
-            val_loss = self._validation_loss(val_loader, epoch)
+            val_metrics = self._validation_metrics(val_loader, epoch)
             train_loss = float(np.mean(train_losses)) if train_losses else math.nan
             print(
                 f"[Epoch {epoch + 1}] mode={self.loss_mode} "
@@ -867,9 +946,14 @@ class EXP_KKT(Exp_Basic):
                 f"train_cvar={np.mean(cvar_losses):.8f} "
                 f"train_regret={np.mean(regret_losses):.8f} "
                 f"train_ktr={np.mean(ktr_losses):.8f} "
-                f"val_loss={val_loss:.8f}"
+                f"val_sharpe={val_metrics['Sharpe']:.8f} "
+                f"val_sortino={val_metrics['Sortino']:.8f} "
+                f"val_max_drawdown={val_metrics['MaxDrawdown']:.8f} "
+                f"val_wealth_factor={val_metrics['FinalWealthFactor']:.8f}"
             )
-            early_stopping(val_loss, self.model, str(checkpoint_dir))
+            early_stopping(
+                val_metrics["Sharpe"], self.model, str(checkpoint_dir)
+            )
             if early_stopping.early_stop:
                 print("Early stopping triggered.")
                 break

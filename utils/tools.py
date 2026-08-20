@@ -57,35 +57,54 @@ def adjust_learning_rate(optimizer, epoch, args, current_step=None, total_steps=
 
 
 class EarlyStopping:
-    def __init__(self, patience=7, verbose=False, delta=0):
+    def __init__(
+        self,
+        patience=7,
+        verbose=False,
+        delta=0,
+        mode='min',
+        metric_name='Validation loss',
+    ):
+        if mode not in {'min', 'max'}:
+            raise ValueError("mode must be 'min' or 'max'")
         self.patience = patience
         self.verbose = verbose
         self.counter = 0
-        self.best_score = None
         self.early_stop = False
-        self.val_loss_min = np.inf
         self.delta = delta
+        self.mode = mode
+        self.metric_name = metric_name
+        self.best_value = np.inf if mode == 'min' else -np.inf
+        # Preserve the legacy public attribute for callers that inspect it.
+        self.val_loss_min = np.inf
 
-    def __call__(self, val_loss, model, path):
-        score = -val_loss
-        if self.best_score is None:
-            self.best_score = score
-            self.save_checkpoint(val_loss, model, path)
-        elif score < self.best_score + self.delta:
+    def __call__(self, value, model, path):
+        if not np.isfinite(value):
+            raise ValueError(f'{self.metric_name} must be finite')
+        improved = (
+            value <= self.best_value - self.delta
+            if self.mode == 'min'
+            else value >= self.best_value + self.delta
+        )
+        if improved:
+            self.save_checkpoint(value, model, path)
+            self.counter = 0
+        else:
             self.counter += 1
             print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
             if self.counter >= self.patience:
                 self.early_stop = True
-        else:
-            self.best_score = score
-            self.save_checkpoint(val_loss, model, path)
-            self.counter = 0
 
-    def save_checkpoint(self, val_loss, model, path):
+    def save_checkpoint(self, value, model, path):
         if self.verbose:
-            print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
+            direction = 'decreased' if self.mode == 'min' else 'increased'
+            print(
+                f'{self.metric_name} {direction} '
+                f'({self.best_value:.6f} --> {value:.6f}).  Saving model ...'
+            )
         torch.save(model.state_dict(), path + '/' + 'checkpoint.pth')
-        self.val_loss_min = val_loss
+        self.best_value = value
+        self.val_loss_min = value
 
 
 class dotdict(dict):

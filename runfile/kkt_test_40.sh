@@ -131,9 +131,9 @@ forecast_weight=0.0
 # -----------------------------------------------------------------------------
 learning_rate=1e-3
 lradj="type1"
-train_epochs=2
+train_epochs=15
 batch_size=128
-patience=4
+patience=5
 num_workers=0
 seed="${KKT_SEED:-2023,2024,2025}"
 

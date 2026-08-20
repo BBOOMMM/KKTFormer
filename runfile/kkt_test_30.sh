@@ -135,11 +135,11 @@ forecast_weight=0.0
 # -----------------------------------------------------------------------------
 learning_rate=1e-3
 lradj="type1"
-train_epochs=5                   # training-only adjustment; model capacity unchanged
+train_epochs=15                   # training-only adjustment; model capacity unchanged
 batch_size=128
-patience=6
+patience=5
 num_workers=0
-seed="${KKT_SEED:-2023,2024,2025}"
+seed="${KKT_SEED:-2024,2025}"
 
 use_gpu=1
 gpu=0
