@@ -8,7 +8,7 @@ set -euo pipefail
 # validated 40/50-pool scripts; only dataset-sensitive geometry and capacity
 # values differ.
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES="${KKT_CUDA_VISIBLE_DEVICES:-1}"
 
 # -----------------------------------------------------------------------------
 # Experiment paths and protocol
@@ -54,12 +54,13 @@ transaction_cost_bps=""           # empty: use trade_cost_bps
 transaction_cost_smoothing=1e-4
 turnover_penalty=0.02
 turnover_smoothing=1.0
+mean_return_weight="${KKT_MEAN_RETURN_WEIGHT:-0.0}"
 
 # Entropy regularization in the optimizer and KKT state:
 #   tau * sum_i [(w_i + epsilon) log(w_i + epsilon) - epsilon log(epsilon)]
 # tau=0 disables it; positive tau encourages a more diversified portfolio.
 # Supported by every feedback mode.
-entropy_regularization=0              # keep the KKT risk signal unperturbed
+entropy_regularization="${KKT_ENTROPY_REGULARIZATION:-0.0001}"
 entropy_epsilon=1e-4              # numerical smoothing near w_i=0
 
 max_turnover=""                   # e.g. 0.5; empty disables it
@@ -77,16 +78,17 @@ sequential_state=0                # 1 adds --sequential_state
 input_dim=1
 factor_dim=3
 feedback_mode="dual"                 # same primal-dual attention feedback as 40/50
-decision_layer="risk_budget"          # same KKT-aware policy as 40/50
+decision_layer="${KKT_DECISION_LAYER:-softmax}"
 active_tolerance=1e-5
 
-log_return_embed_dim=32
-date_embed_dim=8
-asset_embed_dim=8
-d_model=32                        # same Transformer width as the 40/50 scripts
-n_heads=4
+log_return_embed_dim="${KKT_LOG_RETURN_EMBED_DIM:-32}"
+date_embed_dim="${KKT_DATE_EMBED_DIM:-8}"
+asset_embed_dim="${KKT_ASSET_EMBED_DIM:-8}"
+asset_embedding_scale="${KKT_ASSET_EMBEDDING_SCALE:-1.0}"
+d_model="${KKT_D_MODEL:-32}"     # same Transformer width as the 40/50 scripts
+n_heads="${KKT_N_HEADS:-4}"
 num_layers=1
-ff_dim=64
+ff_dim="${KKT_FF_DIM:-64}"
 dropout=0.0
 
 # -----------------------------------------------------------------------------
@@ -97,31 +99,38 @@ probe_optimizer_iterations=30
 projection_iterations=64
 constraint_projection_iterations=20
 
-loss_mode="ktr"                   # KTR tail ranking + detached decision regret
-regret_weight=1.0                  # stabilizes the KTR decision policy
+loss_mode="${KKT_LOSS_MODE:-cvar}" # end-to-end portfolio CVaR by default
+regret_weight="${KKT_REGRET_WEIGHT:-0.0}"
 prediction_loss="NONE"             # prediction route explicitly disabled
-cvar_alpha=0.95
-cvar_variant="sit"                # sit | smooth
-cvar_temperature=1e-3
-ktr_weight=0.001
+cvar_alpha="${KKT_CVAR_ALPHA:-0.80}"
+cvar_variant="${KKT_CVAR_VARIANT:-sit}" # sit | smooth
+cvar_temperature="${KKT_CVAR_TEMPERATURE:-1e-3}"
+ktr_weight="${KKT_KTR_WEIGHT:-0.0}"
 ktr_tail_alpha=0.80                # wider tail coverage than one H=20 step
 ktr_pressure_scale=1.0
 ktr_ranking_temperature=1.0
 ktr_pressure_clip=5.0
 kkt_bias_rank=3
 prediction_weight=0.0
-temperature=1.0
+temperature="${KKT_TEMPERATURE:-1.3}"
+simplex_anchor_weight="${KKT_SIMPLEX_ANCHOR_WEIGHT:-0.56}"
+# Causal 20-day momentum simplex prior; the Transformer learns only a
+# portfolio-decision residual around this seed-invariant anchor.
+momentum_anchor_weight="${KKT_MOMENTUM_ANCHOR_WEIGHT:-0.45}"
+momentum_anchor_lookback="${KKT_MOMENTUM_ANCHOR_LOOKBACK:-20}"
+momentum_anchor_temperature="${KKT_MOMENTUM_ANCHOR_TEMPERATURE:-1.0}"
 risk_momentum_lookback=60
 risk_scale_windows="20,40,60"
 risk_score_normalization="raw"
 risk_score_epsilon=1e-4
 risk_multiscale_residual_weight=0.001
 risk_defensive_gate_floor=0.95
-risk_momentum_short_weight=0.0
-risk_momentum_residual_weight=0.5
-risk_forecast_weight=0.0
-risk_contrarian_weight=1.0
-risk_defensive_weight=0.25
+risk_momentum_short_weight="${KKT_SHORT_WEIGHT:-0.15}"
+risk_momentum_residual_weight="${KKT_RESIDUAL_WEIGHT:-0.0}"
+risk_gate_logit_scale="${KKT_GATE_LOGIT_SCALE:-0.1}"
+risk_forecast_weight="${KKT_FORECAST_WEIGHT:-0.0}"
+risk_contrarian_weight="${KKT_CONTRARIAN_WEIGHT:-1.0}"
+risk_defensive_weight="${KKT_DEFENSIVE_WEIGHT:-0.25}"
 risk_prior_bias=-0.8
 risk_turnover_aversion=0.0
 risk_downside_weight=0.25
@@ -133,16 +142,19 @@ forecast_weight=0.0
 # -----------------------------------------------------------------------------
 # Training and hardware
 # -----------------------------------------------------------------------------
-learning_rate=1e-3
+learning_rate="${KKT_LEARNING_RATE:-1e-3}"
+weight_decay="${KKT_WEIGHT_DECAY:-0.0003}"
 lradj="type3"
-train_epochs=30                   # training-only adjustment; model capacity unchanged
+train_epochs="${KKT_TRAIN_EPOCHS:-3}" # validated seed-stable stopping horizon
+checkpoint_metric="${KKT_CHECKPOINT_METRIC:-objective}"
+ema_decay="${KKT_EMA_DECAY:-0.0}"
 batch_size=64
 patience=30
 num_workers=0
 seed="${KKT_SEED:-2025}"
 
 use_gpu=1
-gpu=0
+gpu="${KKT_GPU:-0}"
 use_multi_gpu=0                   # 1 adds --use_multi_gpu
 devices="0,1"
 
@@ -183,6 +195,7 @@ cmd=(
   --trade_cost_bps "$trade_cost_bps"
   --transaction_cost_smoothing "$transaction_cost_smoothing"
   --turnover_penalty "$turnover_penalty"
+  --mean_return_weight "$mean_return_weight"
   --turnover_smoothing "$turnover_smoothing"
   --risk_turnover_aversion "$risk_turnover_aversion"
   --entropy_regularization "$entropy_regularization"
@@ -200,6 +213,7 @@ cmd=(
   --log_return_embed_dim "$log_return_embed_dim"
   --date_embed_dim "$date_embed_dim"
   --asset_embed_dim "$asset_embed_dim"
+  --asset_embedding_scale "$asset_embedding_scale"
   --d_model "$d_model"
   --n_heads "$n_heads"
   --num_layers "$num_layers"
@@ -230,9 +244,14 @@ cmd=(
   --kkt_risk_scale "$kkt_risk_scale"
   --prediction_weight "$prediction_weight"
   --temperature "$temperature"
+  --simplex_anchor_weight "$simplex_anchor_weight"
+  --momentum_anchor_weight "$momentum_anchor_weight"
+  --momentum_anchor_lookback "$momentum_anchor_lookback"
+  --momentum_anchor_temperature "$momentum_anchor_temperature"
   --risk_momentum_lookback "$risk_momentum_lookback"
   --risk_momentum_short_weight "$risk_momentum_short_weight"
   --risk_momentum_residual_weight "$risk_momentum_residual_weight"
+  --risk_gate_logit_scale "$risk_gate_logit_scale"
   --risk_forecast_weight "$risk_forecast_weight"
   --risk_contrarian_weight "$risk_contrarian_weight"
   --risk_defensive_weight "$risk_defensive_weight"
@@ -241,8 +260,11 @@ cmd=(
   --risk_drawdown_weight "$risk_drawdown_weight"
   --risk_smoothing_temperature "$risk_smoothing_temperature"
   --learning_rate "$learning_rate"
+  --weight_decay "$weight_decay"
   --lradj "$lradj"
   --train_epochs "$train_epochs"
+  --checkpoint_metric "$checkpoint_metric"
+  --ema_decay "$ema_decay"
   --batch_size "$batch_size"
   --patience "$patience"
   --num_workers "$num_workers"
@@ -265,7 +287,7 @@ cmd=(
 
 echo "Running with model_id: $model_id"
 printf 'Command:'
-printf ' %q' "${cmd[@]}"
+printf ' %s' "${cmd[@]}"
 printf '\n'
 
 "${cmd[@]}"

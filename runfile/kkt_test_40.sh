@@ -5,7 +5,7 @@ set -euo pipefail
 # Run this script from the KKTFormer repository root:
 #   bash runfile/kkt_test_40.sh
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES="${KKT_CUDA_VISIBLE_DEVICES:-0}"
 
 # -----------------------------------------------------------------------------
 # Experiment paths and protocol
@@ -49,13 +49,14 @@ trade_cost_bps=0.0
 transaction_cost_bps=""           # empty: use trade_cost_bps
 transaction_cost_smoothing=1e-4
 turnover_penalty=0.02
+mean_return_weight="${KKT_MEAN_RETURN_WEIGHT:-0.0}"
 turnover_smoothing=1.0
 
 # Entropy regularization in the optimizer and KKT state:
 #   tau * sum_i [(w_i + epsilon) log(w_i + epsilon) - epsilon log(epsilon)]
 # tau=0 disables it; positive tau encourages a more diversified portfolio.
 # Supported by every feedback mode.
-entropy_regularization=0             # keep the KKT risk signal unperturbed
+entropy_regularization="${KKT_ENTROPY_REGULARIZATION:-0.001}"
 entropy_epsilon=1e-4              # numerical smoothing near w_i=0
 
 max_turnover=""                   # e.g. 0.5; empty disables it
@@ -73,7 +74,7 @@ sequential_state=0                # 1 adds --sequential_state
 input_dim=1
 factor_dim=3
 feedback_mode="dual"             # 40-pool stable primal-dual attention feedback
-decision_layer="risk_budget"      # KKT-aware differentiable risk-budget policy
+decision_layer="${KKT_DECISION_LAYER:-risk_budget}"
 active_tolerance=1e-5
 
 log_return_embed_dim=32
@@ -93,9 +94,9 @@ probe_optimizer_iterations=30
 projection_iterations=64
 constraint_projection_iterations=20
 
-loss_mode="ktr"                   # CVaR + detached decision-regret + KTR
-regret_weight=0.12                 # validated 40-pool decision-policy weight
-ktr_weight=0.0001                  # small scale: KTR is added to the CVaR/regret objective
+loss_mode="${KKT_LOSS_MODE:-ktr}" # CVaR + detached decision-regret + optional KTR
+regret_weight="${KKT_REGRET_WEIGHT:-0.12}"
+ktr_weight="${KKT_KTR_WEIGHT:-0.0001}"
 ktr_tail_alpha=0.80
 ktr_pressure_scale=1.0
 ktr_ranking_temperature=1.0
@@ -106,18 +107,23 @@ cvar_variant="sit"                # sit | smooth
 cvar_temperature=1e-3
 kkt_bias_rank=3
 prediction_weight=0.0
-temperature=0.22                  # validated 40-pool risk-budget temperature
+temperature="${KKT_TEMPERATURE:-1.0}" # risk-budget temperature
+simplex_anchor_weight="${KKT_SIMPLEX_ANCHOR_WEIGHT:-0.0}"
+momentum_anchor_weight="${KKT_MOMENTUM_ANCHOR_WEIGHT:-0.0}"
+momentum_anchor_lookback="${KKT_MOMENTUM_ANCHOR_LOOKBACK:-20}"
+momentum_anchor_temperature="${KKT_MOMENTUM_ANCHOR_TEMPERATURE:-1.0}"
 risk_momentum_lookback=60
 risk_scale_windows="20,40,60"
 risk_score_normalization="raw"
 risk_score_epsilon=1e-4
 risk_multiscale_residual_weight=0.001
 risk_defensive_gate_floor=0.95
-risk_momentum_short_weight=0.15
-risk_momentum_residual_weight=0.5
-risk_forecast_weight=0.0
-risk_contrarian_weight=1.0
-risk_defensive_weight=0.25
+risk_momentum_short_weight="${KKT_SHORT_WEIGHT:-0.15}"
+risk_momentum_residual_weight="${KKT_RESIDUAL_WEIGHT:-0.05}"
+risk_gate_logit_scale="${KKT_GATE_LOGIT_SCALE:-0.1}"
+risk_forecast_weight="${KKT_FORECAST_WEIGHT:-0.0}"
+risk_contrarian_weight="${KKT_CONTRARIAN_WEIGHT:-1.0}"
+risk_defensive_weight="${KKT_DEFENSIVE_WEIGHT:-0.25}"
 risk_prior_bias=-0.8
 risk_turnover_aversion=0.0
 risk_downside_weight=0.25
@@ -131,14 +137,15 @@ forecast_weight=0.0
 # -----------------------------------------------------------------------------
 learning_rate=1e-3
 lradj="type3"
-train_epochs=30
+train_epochs="${KKT_TRAIN_EPOCHS:-30}"
+ema_decay="${KKT_EMA_DECAY:-0.0}"
 batch_size=64
 patience=10
 num_workers=0
 seed="${KKT_SEED:-2023,2024,2025,2026,2027}"
 
 use_gpu=1
-gpu=0
+gpu="${KKT_GPU:-0}"
 use_multi_gpu=0                   # 1 adds --use_multi_gpu
 devices="0,1"
 
@@ -177,6 +184,7 @@ cmd=(
   --trade_cost_bps "$trade_cost_bps"
   --transaction_cost_smoothing "$transaction_cost_smoothing"
   --turnover_penalty "$turnover_penalty"
+  --mean_return_weight "$mean_return_weight"
   --turnover_smoothing "$turnover_smoothing"
   --risk_turnover_aversion "$risk_turnover_aversion"
   --entropy_regularization "$entropy_regularization"
@@ -224,9 +232,14 @@ cmd=(
   --kkt_risk_scale "$kkt_risk_scale"
   --prediction_weight "$prediction_weight"
   --temperature "$temperature"
+  --simplex_anchor_weight "$simplex_anchor_weight"
+  --momentum_anchor_weight "$momentum_anchor_weight"
+  --momentum_anchor_lookback "$momentum_anchor_lookback"
+  --momentum_anchor_temperature "$momentum_anchor_temperature"
   --risk_momentum_lookback "$risk_momentum_lookback"
   --risk_momentum_short_weight "$risk_momentum_short_weight"
   --risk_momentum_residual_weight "$risk_momentum_residual_weight"
+  --risk_gate_logit_scale "$risk_gate_logit_scale"
   --risk_forecast_weight "$risk_forecast_weight"
   --risk_contrarian_weight "$risk_contrarian_weight"
   --risk_defensive_weight "$risk_defensive_weight"
@@ -237,6 +250,7 @@ cmd=(
   --learning_rate "$learning_rate"
   --lradj "$lradj"
   --train_epochs "$train_epochs"
+  --ema_decay "$ema_decay"
   --batch_size "$batch_size"
   --patience "$patience"
   --num_workers "$num_workers"
@@ -259,7 +273,7 @@ cmd=(
 
 echo "Running with model_id: $model_id"
 printf 'Command:'
-printf ' %q' "${cmd[@]}"
+printf ' %s' "${cmd[@]}"
 printf '\n'
 
 "${cmd[@]}"

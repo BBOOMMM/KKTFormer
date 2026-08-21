@@ -28,6 +28,13 @@ def set_random_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    # Keep CUDA kernels reproducible while comparing seeds.  We deliberately
+    # avoid ``torch.use_deterministic_algorithms(True)`` here because some
+    # optional constrained-optimizer kernels do not provide deterministic
+    # implementations on every supported PyTorch/CUDA pair.
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
@@ -160,6 +167,15 @@ def parse_args():
     parser.add_argument("--transaction_cost_smoothing", type=float, default=1e-4)
     parser.add_argument("--turnover_penalty", type=float, default=0.0)
     parser.add_argument(
+        "--mean_return_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "portfolio-level mean-return utility weight in "
+            "CVaR - weight * mean(sum_i w_i r_i); no asset prediction target"
+        ),
+    )
+    parser.add_argument(
         "--turnover_smoothing",
         type=float,
         default=1.0,
@@ -227,6 +243,15 @@ def parse_args():
         type=int,
         default=32,
         help="width of the learned asset embedding",
+    )
+    parser.add_argument(
+        "--asset_embedding_scale",
+        type=float,
+        default=1.0,
+        help=(
+            "scale of learned asset identity embeddings; 0 gives a "
+            "permutation-equivariant ablation"
+        ),
     )
     parser.add_argument("--d_model", type=int, default=32)
     parser.add_argument("--n_heads", type=int, default=4)
@@ -310,14 +335,14 @@ def parse_args():
     parser.add_argument(
         "--prediction_weight",
         type=float,
-        default=0.1,
-        help="prediction-loss weight for hybrid regret training",
+        default=0.0,
+        help="deprecated compatibility option; prediction supervision is disabled",
     )
     parser.add_argument(
         "--forecast_weight",
         type=float,
         default=0.0,
-        help="weight of the cross-sectional next-day forecast-ranking loss",
+        help="must be 0; cross-sectional return prediction loss is disabled",
     )
     parser.add_argument(
         "--temperature",
@@ -325,6 +350,26 @@ def parse_args():
         default=1.0,
         help="fixed temperature of the final softmax allocation head",
     )
+    parser.add_argument(
+        "--simplex_anchor_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "differentiable shrinkage of the final long-only policy toward "
+            "the equal-weight simplex anchor"
+        ),
+    )
+    parser.add_argument(
+        "--momentum_anchor_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "differentiable residual-policy shrinkage toward a causal "
+            "momentum simplex prior"
+        ),
+    )
+    parser.add_argument("--momentum_anchor_lookback", type=int, default=20)
+    parser.add_argument("--momentum_anchor_temperature", type=float, default=1.3)
     parser.add_argument(
         "--risk_momentum_lookback",
         type=int,
@@ -381,6 +426,15 @@ def parse_args():
         help="learned Transformer allocation residual added to risk prior",
     )
     parser.add_argument(
+        "--risk_gate_logit_scale",
+        type=float,
+        default=1.0,
+        help=(
+            "scale for learned risk-route gate logits; values below one keep "
+            "the causal prior dominant and reduce seed sensitivity"
+        ),
+    )
+    parser.add_argument(
         "--risk_forecast_weight",
         type=float,
         default=0.0,
@@ -418,6 +472,31 @@ def parse_args():
         help="type3: 10%% linear warmup, then cosine decay to 0.1x initial LR",
     )
     parser.add_argument("--train_epochs", type=int, default=10)
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=0.0,
+        help="L2 regularization applied by Adam to policy parameters",
+    )
+    parser.add_argument(
+        "--checkpoint_metric",
+        type=str,
+        choices=("objective", "sharpe"),
+        default="objective",
+        help=(
+            "validation criterion used for checkpoint selection; objective "
+            "uses the same end-to-end portfolio loss as training"
+        ),
+    )
+    parser.add_argument(
+        "--ema_decay",
+        type=float,
+        default=0.0,
+        help=(
+            "optional exponential moving average of policy parameters used "
+            "for validation/checkpointing; 0 disables it"
+        ),
+    )
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument(
         "--test_batch_size",
@@ -492,12 +571,20 @@ def main():
             f"_rb{protocol_frequency}"
             f"_trb{train_frequency}_vrb{val_frequency}_teb{test_frequency}"
             f"_lre{args.log_return_embed_dim}_de{args.date_embed_dim}"
-            f"_ae{args.asset_embed_dim}_dm{args.d_model}"
+            f"_ae{args.asset_embed_dim}_aes{args.asset_embedding_scale:g}_dm{args.d_model}"
             f"_nh{args.n_heads}_nl{args.num_layers}"
             f"_oi{args.optimizer_iterations}_fb{args.feedback_mode}"
             f"_dl{args.decision_layer}_tp{args.temperature:g}"
+            f"_saw{args.simplex_anchor_weight:g}"
+            f"_maw{args.momentum_anchor_weight:g}"
+            f"_mal{args.momentum_anchor_lookback}"
+            f"_mat{args.momentum_anchor_temperature:g}"
             f"_rml{args.risk_momentum_lookback}_rms{args.risk_momentum_short_weight:g}"
             f"_rmr{args.risk_momentum_residual_weight:g}"
+            f"_rgs{args.risk_gate_logit_scale:g}"
+            f"_ema{args.ema_decay:g}"
+            f"_cm{args.checkpoint_metric}"
+            f"_wd{args.weight_decay:g}"
             f"_rfw{args.risk_forecast_weight:g}_fpw{args.forecast_weight:g}"
             f"_rcw{args.risk_contrarian_weight:g}_rdw{args.risk_defensive_weight:g}"
             f"_rmsw{args.risk_scale_windows.replace(',', '-')}"
@@ -505,11 +592,13 @@ def main():
             f"_rse{args.risk_score_epsilon:g}"
             f"_rta{args.risk_turnover_aversion:g}"
             f"_ts{args.turnover_smoothing:g}"
+            f"_mrw{args.mean_return_weight:g}"
             f"_cr{args.covariance_robustness:g}_cd{args.covariance_decay:g}"
             f"_krs{args.kkt_risk_scale:g}"
             f"_plb{args.probe_lower_bound:g}_pub{args.probe_upper_bound:g}"
             f"_sn{args.signal_normalization}_ss{args.signal_scale:g}"
             f"_lm{args.loss_mode}_cv{args.cvar_variant}"
+            f"_ca{args.cvar_alpha:g}_ct{args.cvar_temperature:g}"
             f"_rw{args.regret_weight:g}_kw{args.ktr_weight:g}"
             f"_ka{args.ktr_tail_alpha:g}_kp{args.ktr_pressure_scale:g}"
             f"_pw{args.prediction_weight}"

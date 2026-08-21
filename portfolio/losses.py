@@ -263,6 +263,7 @@ def portfolio_cvar_loss(
     transaction_cost_rate: Optional[torch.Tensor] = None,
     turnover_penalty: float = 0.0,
     transaction_cost_smoothing: float = 1e-4,
+    mean_return_weight: float = 0.0,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Compute CVaR over the future return path.
 
@@ -341,12 +342,23 @@ def portfolio_cvar_loss(
     )
     if turnover_penalty < 0:
         raise ValueError("turnover_penalty cannot be negative")
+    if not torch.isfinite(torch.as_tensor(mean_return_weight)) or mean_return_weight < 0:
+        raise ValueError("mean_return_weight must be finite and non-negative")
     if transaction_cost_smoothing <= 0:
         raise ValueError("transaction_cost_smoothing must be positive")
     transaction_cost = turnover * cost_rate
     smooth_transaction_cost = cost_rate * smooth_norm
     quadratic_turnover = 0.5 * float(turnover_penalty) * quadratic_norm
-    total = cvar.reshape(batch_size) + smooth_transaction_cost + quadratic_turnover
+    mean_return = portfolio_returns.mean(dim=-1).reshape(batch_size)
+    # This is a portfolio-level utility term: gradients flow through the
+    # realized portfolio return ``sum_i w_i r_i`` only.  It is deliberately
+    # not an asset-wise forecast or cross-sectional prediction objective.
+    total = (
+        cvar.reshape(batch_size)
+        + smooth_transaction_cost
+        + quadratic_turnover
+        - float(mean_return_weight) * mean_return
+    )
     components = {
         "var": var.reshape(batch_size),
         "cvar": cvar.reshape(batch_size),
@@ -354,6 +366,8 @@ def portfolio_cvar_loss(
         "transaction_cost": transaction_cost,
         "smooth_transaction_cost": smooth_transaction_cost,
         "turnover_penalty": quadratic_turnover,
+        "mean_return": mean_return,
+        "mean_return_utility": float(mean_return_weight) * mean_return,
         "total_loss": total,
     }
     return total, components

@@ -49,13 +49,14 @@ trade_cost_bps=0.0
 transaction_cost_bps=""           # empty: use trade_cost_bps
 transaction_cost_smoothing=1e-4
 turnover_penalty=0.02             # smooth path-level turnover objective
+mean_return_weight="${KKT_MEAN_RETURN_WEIGHT:-0.0}"
 turnover_smoothing=1.0            # preserve the first causal risk-budget decision
 
 # Entropy regularization in the optimizer and KKT state:
 #   tau * sum_i [(w_i + epsilon) log(w_i + epsilon) - epsilon log(epsilon)]
 # tau=0 disables it; positive tau encourages a more diversified portfolio.
 # Supported by every feedback mode.
-entropy_regularization=0               # probe retains KKT risk; final QP stays non-negative
+entropy_regularization="${KKT_ENTROPY_REGULARIZATION:-0.001}"
 entropy_epsilon=1e-4              # numerical smoothing near w_i=0
 
 max_turnover=""                    # risk-budget allocator uses causal policy proposals
@@ -73,7 +74,7 @@ sequential_state=0                # 1 adds --sequential_state
 input_dim=1
 factor_dim=3
 feedback_mode="dual"             # KKT context and low-rank bias paths together
-decision_layer="risk_budget"      # KKT-aware differentiable risk-budget policy
+decision_layer="${KKT_DECISION_LAYER:-risk_budget}"
 active_tolerance=1e-5
 
 log_return_embed_dim=32
@@ -106,7 +107,11 @@ ktr_pressure_scale="${KKT_KTR_PRESSURE_SCALE:-1.0}"
 ktr_ranking_temperature="${KKT_KTR_RANKING_TEMPERATURE:-1.0}"
 ktr_pressure_clip="${KKT_KTR_PRESSURE_CLIP:-5.0}"
 kkt_bias_rank=3
-temperature="${KKT_TEMPERATURE:-0.02}" # avoid GPU-sensitive near-corner allocation jumps
+temperature="${KKT_TEMPERATURE:-1.0}" # avoid GPU-sensitive near-corner allocation jumps
+simplex_anchor_weight="${KKT_SIMPLEX_ANCHOR_WEIGHT:-0.0}"
+momentum_anchor_weight="${KKT_MOMENTUM_ANCHOR_WEIGHT:-0.0}"
+momentum_anchor_lookback="${KKT_MOMENTUM_ANCHOR_LOOKBACK:-20}"
+momentum_anchor_temperature="${KKT_MOMENTUM_ANCHOR_TEMPERATURE:-1.0}"
 risk_momentum_lookback=60         # do not introduce a hidden >60-day lookback
 risk_scale_windows="20,40,60"        # trainable multi-scale gate within W=60
 risk_score_normalization="raw"   # preserve return/volatility scale for temperature-aware allocation
@@ -115,7 +120,8 @@ risk_multiscale_residual_weight=0.001 # bounded correction around the 20d base s
 risk_defensive_gate_floor=0.95      # small but genuine learned downside modulation
 risk_momentum_short_weight="${KKT_RISK_SHORT_WEIGHT:-0.15}" # short-horizon trend correction
 risk_momentum_residual_weight="${KKT_RISK_RESIDUAL_WEIGHT:-0.05}" # bounded learned Transformer allocation residual
-risk_forecast_weight=0.0           # prediction route disabled for end-to-end policy
+risk_gate_logit_scale="${KKT_GATE_LOGIT_SCALE:-0.1}" # keep route gates near the causal prior
+risk_forecast_weight="${KKT_FORECAST_WEIGHT:-0.0}" # bounded learned return route
 risk_prior_bias=-0.8                # former successful baseline
 risk_turnover_aversion=0.0
 risk_downside_weight=0.25
@@ -132,13 +138,14 @@ risk_defensive_weight="${KKT_RISK_DEFENSIVE_WEIGHT:-1.0}" # learned downside-ris
 learning_rate="${KKT_LEARNING_RATE:-1e-3}"
 lradj="type1"
 train_epochs="${KKT_TRAIN_EPOCHS:-2}" # decision-policy training, no prediction pretext task
+ema_decay="${KKT_EMA_DECAY:-0.0}"
 batch_size="${KKT_BATCH_SIZE:-128}"
 patience="${KKT_PATIENCE:-4}"
 num_workers=0
 seed="${KKT_SEED:-2023,2024,2025}"
 
 use_gpu=1
-gpu=0
+gpu="${KKT_GPU:-0}"
 use_multi_gpu=0                   # 1 adds --use_multi_gpu
 devices="0,1"
 
@@ -177,6 +184,7 @@ cmd=(
   --trade_cost_bps "$trade_cost_bps"
   --transaction_cost_smoothing "$transaction_cost_smoothing"
   --turnover_penalty "$turnover_penalty"
+  --mean_return_weight "$mean_return_weight"
   --turnover_smoothing "$turnover_smoothing"
   --risk_turnover_aversion "$risk_turnover_aversion"
   --entropy_regularization "$entropy_regularization"
@@ -219,6 +227,10 @@ cmd=(
   --kkt_risk_scale "$kkt_risk_scale"
   --prediction_weight "$prediction_weight"
   --temperature "$temperature"
+  --simplex_anchor_weight "$simplex_anchor_weight"
+  --momentum_anchor_weight "$momentum_anchor_weight"
+  --momentum_anchor_lookback "$momentum_anchor_lookback"
+  --momentum_anchor_temperature "$momentum_anchor_temperature"
   --risk_momentum_lookback "$risk_momentum_lookback"
   --risk_scale_windows "$risk_scale_windows"
   --risk_score_normalization "$risk_score_normalization"
@@ -227,6 +239,7 @@ cmd=(
   --risk_defensive_gate_floor "$risk_defensive_gate_floor"
   --risk_momentum_short_weight "$risk_momentum_short_weight"
   --risk_momentum_residual_weight "$risk_momentum_residual_weight"
+  --risk_gate_logit_scale "$risk_gate_logit_scale"
   --risk_forecast_weight "$risk_forecast_weight"
   --risk_contrarian_weight "$risk_contrarian_weight"
   --risk_defensive_weight "$risk_defensive_weight"
@@ -237,6 +250,7 @@ cmd=(
   --learning_rate "$learning_rate"
   --lradj "$lradj"
   --train_epochs "$train_epochs"
+  --ema_decay "$ema_decay"
   --batch_size "$batch_size"
   --patience "$patience"
   --num_workers "$num_workers"
@@ -259,7 +273,7 @@ cmd=(
 
 echo "Running with model_id: $model_id"
 printf 'Command:'
-printf ' %q' "${cmd[@]}"
+printf ' %s' "${cmd[@]}"
 printf '\n'
 
 "${cmd[@]}"

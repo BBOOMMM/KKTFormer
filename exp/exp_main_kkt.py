@@ -53,7 +53,7 @@ def ensure_feasible_probe_upper_bound(args) -> float:
 
 
 class EXP_KKT(Exp_Basic):
-    """KKTFormer-v0 experiment: prediction loss + constrained allocation."""
+    """KKTFormer-v0 experiment with end-to-end portfolio objectives only."""
 
     def __init__(self, args):
         ensure_feasible_probe_upper_bound(args)
@@ -90,6 +90,35 @@ class EXP_KKT(Exp_Basic):
         self.temperature = float(getattr(args, "temperature", 1.0))
         if not math.isfinite(self.temperature) or self.temperature <= 0.0:
             raise ValueError("temperature must be finite and positive")
+        self.simplex_anchor_weight = float(
+            getattr(args, "simplex_anchor_weight", 0.0)
+        )
+        if (
+            not math.isfinite(self.simplex_anchor_weight)
+            or not 0.0 <= self.simplex_anchor_weight < 1.0
+        ):
+            raise ValueError("simplex_anchor_weight must be in [0, 1)")
+        self.momentum_anchor_weight = float(
+            getattr(args, "momentum_anchor_weight", 0.0)
+        )
+        self.momentum_anchor_lookback = int(
+            getattr(args, "momentum_anchor_lookback", 20)
+        )
+        self.momentum_anchor_temperature = float(
+            getattr(args, "momentum_anchor_temperature", 1.3)
+        )
+        if (
+            not math.isfinite(self.momentum_anchor_weight)
+            or not 0.0 <= self.momentum_anchor_weight < 1.0
+        ):
+            raise ValueError("momentum_anchor_weight must be in [0, 1)")
+        if self.momentum_anchor_lookback <= 0:
+            raise ValueError("momentum_anchor_lookback must be positive")
+        if (
+            not math.isfinite(self.momentum_anchor_temperature)
+            or self.momentum_anchor_temperature <= 0.0
+        ):
+            raise ValueError("momentum_anchor_temperature must be finite and positive")
         super().__init__(args)
         problem_rebalance_frequency = (
             1 if self.protocol == "sit" else args.rebalance_frequency
@@ -148,6 +177,11 @@ class EXP_KKT(Exp_Basic):
         self.risk_turnover_aversion = float(
             getattr(args, "risk_turnover_aversion", 0.0)
         )
+        self.mean_return_weight = float(
+            getattr(args, "mean_return_weight", 0.0)
+        )
+        if not math.isfinite(self.mean_return_weight) or self.mean_return_weight < 0.0:
+            raise ValueError("mean_return_weight must be finite and non-negative")
         self.risk_allocator = RiskBudgetedAllocator(
             temperature=self.temperature,
             turnover_aversion=self.risk_turnover_aversion,
@@ -179,19 +213,21 @@ class EXP_KKT(Exp_Basic):
         if not math.isfinite(self.ktr_weight) or self.ktr_weight < 0.0:
             raise ValueError("ktr_weight must be finite and non-negative")
         self.prediction_weight = float(
-            getattr(args, "prediction_weight", 0.1)
+            getattr(args, "prediction_weight", 0.0)
         )
+        if not math.isfinite(self.prediction_weight) or self.prediction_weight != 0.0:
+            raise ValueError(
+                "prediction_weight must remain 0: auxiliary return prediction "
+                "is disabled for end-to-end allocation"
+            )
         self.forecast_weight = float(
             getattr(args, "forecast_weight", 0.0)
         )
-        if not math.isfinite(self.forecast_weight) or self.forecast_weight < 0.0:
-            raise ValueError("forecast_weight must be finite and non-negative")
-
-    @staticmethod
-    def _cross_sectional_zscore(value):
-        centered = value - value.mean(dim=-1, keepdim=True)
-        scale = value.std(dim=-1, unbiased=False, keepdim=True)
-        return centered / scale.clamp_min(1e-6)
+        if not math.isfinite(self.forecast_weight) or self.forecast_weight != 0.0:
+            raise ValueError(
+                "forecast_weight must remain 0: cross-sectional return "
+                "prediction supervision is disabled for end-to-end allocation"
+            )
 
     def _build_model(self):
         model_module = self.model_dict["KKTFormer"]
@@ -208,6 +244,24 @@ class EXP_KKT(Exp_Basic):
 
     def _get_data(self, flag):
         return data_provider_kkt(self.args, flag)
+
+    def _momentum_anchor(self, log_return_path: torch.Tensor) -> torch.Tensor:
+        """Build a causal simplex prior from the recent realized path.
+
+        The first path element is the fixed zero sentinel used by the SIT
+        representation, so it is excluded.  This module consumes no future
+        return and creates no prediction target: it simply gives the learned
+        policy a seed-invariant portfolio around which to learn a residual.
+        """
+
+        realized_returns = torch.expm1(log_return_path[..., 1:])
+        lookback = min(self.momentum_anchor_lookback, realized_returns.shape[-1])
+        score = realized_returns[..., -lookback:].sum(dim=-1)
+        score = score - score.mean(dim=-1, keepdim=True)
+        score = score / score.std(
+            dim=-1, unbiased=False, keepdim=True
+        ).clamp_min(1e-6)
+        return torch.softmax(score / self.momentum_anchor_temperature, dim=-1)
 
     @staticmethod
     def _parse_bound(value):
@@ -519,6 +573,17 @@ class EXP_KKT(Exp_Basic):
                 allocation_hidden
             )
             weights = torch.softmax(allocation_logits / self.temperature, dim=-1)
+            if self.simplex_anchor_weight > 0.0:
+                weights = (
+                    (1.0 - self.simplex_anchor_weight) * weights
+                    + self.simplex_anchor_weight / float(num_assets)
+                )
+            if self.momentum_anchor_weight > 0.0:
+                momentum_anchor = self._momentum_anchor(log_return_path)
+                weights = (
+                    (1.0 - self.momentum_anchor_weight) * weights
+                    + self.momentum_anchor_weight * momentum_anchor
+                )
             weights_flat = weights.reshape(batch_size * horizon, num_assets)
             state = reshape_state(
                 self._softmax_state(
@@ -536,6 +601,17 @@ class EXP_KKT(Exp_Basic):
                 w_prev=w_prev,
                 max_turnover=self.max_turnover,
             )
+            if self.simplex_anchor_weight > 0.0:
+                weights_flat = (
+                    (1.0 - self.simplex_anchor_weight) * weights_flat
+                    + self.simplex_anchor_weight / float(num_assets)
+                )
+            if self.momentum_anchor_weight > 0.0:
+                momentum_anchor = self._momentum_anchor(log_return_path)
+                weights_flat = (
+                    (1.0 - self.momentum_anchor_weight) * weights_flat
+                    + self.momentum_anchor_weight * momentum_anchor
+                )
             weights = weights_flat
             weights_flat = weights.reshape(batch_size * horizon, num_assets)
             state = reshape_state(
@@ -608,15 +684,12 @@ class EXP_KKT(Exp_Basic):
                 0.0 if self.protocol == "sit" else self.turnover_penalty
             ),
             transaction_cost_smoothing=self.transaction_cost_smoothing,
+            mean_return_weight=self.mean_return_weight,
         )
         cvar_loss = cvar_batch.mean()
-        # Train the return head on the same next-day cross section that is
-        # executed by the SIT evaluator. Standardization removes the
-        # arbitrary scale of the head and turns this into an alpha-ranking
-        # objective rather than a volatility-magnitude objective.
-        forecast_target = self._cross_sectional_zscore(future_returns)
-        forecast_prediction = self._cross_sectional_zscore(raw_mu_hat)
-        forecast_loss = (forecast_prediction - forecast_target).square().mean()
+        # No asset-return prediction target is constructed.  Every trainable
+        # route receives gradients only through realized portfolio decisions.
+        forecast_loss = cvar_loss.detach() * 0.0
         risk_budget_loss = cvar_loss.detach() * 0.0
         risk_budget_components = None
         if self.loss_mode == "risk_budget":
@@ -703,11 +776,17 @@ class EXP_KKT(Exp_Basic):
             ktr_loss = ktr_batch.mean()
 
         objective_loss = risk_budget_loss if self.loss_mode == "risk_budget" else cvar_loss
+        # ``entropy_regularization`` used to be reported in diagnostics but
+        # was absent from the optimization objective for the softmax/risk-
+        # budget path.  Include the differentiable final-policy term here so
+        # the requested diversification actually suppresses corner solutions
+        # and makes the learned ranking less seed-sensitive.
+        entropy_loss = state["entropy_penalty"].mean()
         total_loss = (
             objective_loss
             + self.regret_weight * regret_loss
             + self.ktr_weight * ktr_loss
-            + self.forecast_weight * forecast_loss
+            + entropy_loss
         )
         zero = total_loss.detach() * 0.0
 
@@ -716,6 +795,8 @@ class EXP_KKT(Exp_Basic):
             "prediction_loss": zero,
             "utility_loss": zero,
             "cvar_loss": cvar_loss,
+            "mean_return": cvar_components["mean_return"].mean(),
+            "mean_return_utility": cvar_components["mean_return_utility"].mean(),
             "forecast_loss": forecast_loss,
             "risk_budget_loss": risk_budget_loss,
             "regret_loss": regret_loss,
@@ -727,6 +808,7 @@ class EXP_KKT(Exp_Basic):
             "risk_loss": zero,
             "entropy": state["entropy"].mean(),
             "entropy_penalty": state["entropy_penalty"].mean(),
+            "entropy_loss": entropy_loss,
             "transaction_cost": cvar_components["transaction_cost"].mean(),
             "cvar_var": cvar_components["var"].mean(),
             "oracle_objective": oracle_objective,
@@ -786,6 +868,8 @@ class EXP_KKT(Exp_Basic):
         """
         self.model.eval()
         event_records = {}
+        objective_sum = 0.0
+        objective_count = 0
         self._sequential_previous = None
         with torch.no_grad():
             progress = tqdm(
@@ -801,9 +885,11 @@ class EXP_KKT(Exp_Basic):
                     batch["future_dates"], batch_size
                 )
                 previous = self._sequential_previous if self.sequential_state else None
-                _, _, weights, _, future_returns, _ = self._forward_batch(
+                _, _, weights, _, future_returns, details = self._forward_batch(
                     batch, w_prev_override=previous
                 )
+                objective_sum += float(details["total_loss"].item()) * batch_size
+                objective_count += batch_size
                 for sample_index, execution_dates in enumerate(execution_date_batch):
                     for token_index, execution_date in enumerate(execution_dates):
                         if execution_date in event_records:
@@ -875,7 +961,9 @@ class EXP_KKT(Exp_Basic):
             index=pd.DatetimeIndex(realized_dates),
             dtype=float,
         )
-        return self._portfolio_metrics(daily_series)
+        metrics = self._portfolio_metrics(daily_series)
+        metrics["ObjectiveLoss"] = objective_sum / max(objective_count, 1)
+        return metrics
 
     def train(self, setting):
         train_data, train_loader = self._get_data("train")
@@ -884,15 +972,35 @@ class EXP_KKT(Exp_Basic):
 
         checkpoint_dir = Path(self.args.checkpoints) / setting
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_metric = str(
+            getattr(self.args, "checkpoint_metric", "objective")
+        ).lower()
+        if checkpoint_metric not in {"objective", "sharpe"}:
+            raise ValueError("checkpoint_metric must be objective or sharpe")
         early_stopping = EarlyStopping(
             patience=self.args.patience,
             verbose=True,
-            mode="max",
-            metric_name="Validation Sharpe",
+            mode="min" if checkpoint_metric == "objective" else "max",
+            metric_name=(
+                "Validation portfolio objective"
+                if checkpoint_metric == "objective"
+                else "Validation Sharpe"
+            ),
         )
         model_optimizer = optim.Adam(
-            self.model.parameters(), lr=self.args.learning_rate
+            self.model.parameters(),
+            lr=self.args.learning_rate,
+            weight_decay=float(getattr(self.args, "weight_decay", 0.0)),
         )
+        ema_decay = float(getattr(self.args, "ema_decay", 0.0))
+        if not math.isfinite(ema_decay) or not 0.0 <= ema_decay < 1.0:
+            raise ValueError("ema_decay must be in [0, 1)")
+        ema_state = None
+        if ema_decay > 0.0:
+            ema_state = {
+                name: value.detach().clone()
+                for name, value in self.model.state_dict().items()
+            }
         total_steps = self.args.train_epochs * len(train_loader)
 
         for epoch in range(self.args.train_epochs):
@@ -926,6 +1034,15 @@ class EXP_KKT(Exp_Basic):
                     total_steps=total_steps,
                 )
                 model_optimizer.step()
+                if ema_state is not None:
+                    with torch.no_grad():
+                        for name, value in self.model.state_dict().items():
+                            if torch.is_floating_point(value):
+                                ema_state[name].mul_(ema_decay).add_(
+                                    value.detach(), alpha=1.0 - ema_decay
+                                )
+                            else:
+                                ema_state[name] = value.detach().clone()
                 if self.sequential_state:
                     self._sequential_previous = weights[:, 0].detach()
                 train_losses.append(float(loss.item()))
@@ -936,6 +1053,13 @@ class EXP_KKT(Exp_Basic):
                 ktr_losses.append(float(details["ktr_loss"].item()))
                 progress.set_postfix(loss=f"{train_losses[-1]:.6f}")
 
+            current_state = None
+            if ema_state is not None:
+                current_state = {
+                    name: value.detach().clone()
+                    for name, value in self.model.state_dict().items()
+                }
+                self.model.load_state_dict(ema_state, strict=True)
             val_metrics = self._validation_metrics(val_loader, epoch)
             train_loss = float(np.mean(train_losses)) if train_losses else math.nan
             print(
@@ -946,14 +1070,20 @@ class EXP_KKT(Exp_Basic):
                 f"train_cvar={np.mean(cvar_losses):.8f} "
                 f"train_regret={np.mean(regret_losses):.8f} "
                 f"train_ktr={np.mean(ktr_losses):.8f} "
+                f"val_objective={val_metrics['ObjectiveLoss']:.8f} "
                 f"val_sharpe={val_metrics['Sharpe']:.8f} "
                 f"val_sortino={val_metrics['Sortino']:.8f} "
                 f"val_max_drawdown={val_metrics['MaxDrawdown']:.8f} "
                 f"val_wealth_factor={val_metrics['FinalWealthFactor']:.8f}"
             )
-            early_stopping(
-                val_metrics["Sharpe"], self.model, str(checkpoint_dir)
+            checkpoint_value = (
+                val_metrics["ObjectiveLoss"]
+                if checkpoint_metric == "objective"
+                else val_metrics["Sharpe"]
             )
+            early_stopping(checkpoint_value, self.model, str(checkpoint_dir))
+            if current_state is not None:
+                self.model.load_state_dict(current_state, strict=True)
             if early_stopping.early_stop:
                 print("Early stopping triggered.")
                 break
@@ -1379,13 +1509,26 @@ class EXP_KKT(Exp_Basic):
             "LossMode": self.loss_mode,
             "DecisionLayer": self.decision_layer,
             "SoftmaxTemperature": self.temperature,
+            "SimplexAnchorWeight": self.simplex_anchor_weight,
+            "MomentumAnchorWeight": self.momentum_anchor_weight,
+            "MomentumAnchorLookback": self.momentum_anchor_lookback,
+            "MomentumAnchorTemperature": self.momentum_anchor_temperature,
+            "RiskMomentumResidualWeight": float(
+                getattr(self.args, "risk_momentum_residual_weight", 0.0)
+            ),
+            "RiskGateLogitScale": float(
+                getattr(self.args, "risk_gate_logit_scale", 1.0)
+            ),
+            "EMADecay": float(getattr(self.args, "ema_decay", 0.0)),
             "RegretWeight": self.regret_weight,
             "KTRWeight": self.ktr_weight,
             "KTRTailAlpha": float(getattr(self.args, "ktr_tail_alpha", 0.95)),
             "KTRPressureScale": float(
                 getattr(self.args, "ktr_pressure_scale", 1.0)
             ),
+            "CVaRAlpha": float(getattr(self.args, "cvar_alpha", 0.95)),
             "CVaRVariant": str(getattr(self.args, "cvar_variant", "sit")),
+            "WeightDecay": float(getattr(self.args, "weight_decay", 0.0)),
             "EntropyRegularization": self.entropy_regularization,
             "EntropyEpsilon": self.entropy_epsilon,
             "ProbeLowerBound": float(self.probe_problem.lower_bounds[0]),

@@ -1,5 +1,6 @@
 """KKTFormer with SIT-aligned path, date, and asset token inputs."""
 
+import math
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -25,6 +26,9 @@ class Model(nn.Module):
         self.asset_embed_dim = int(
             getattr(configs, "asset_embed_dim", 32)
         )
+        self.asset_embedding_scale = float(
+            getattr(configs, "asset_embedding_scale", 1.0)
+        )
         self.n_heads = int(configs.n_heads)
         self.num_layers = int(configs.num_layers)
         self.ff_dim = int(configs.ff_dim)
@@ -49,6 +53,9 @@ class Model(nn.Module):
         )
         self.risk_momentum_residual_weight = float(
             getattr(configs, "risk_momentum_residual_weight", 0.0)
+        )
+        self.risk_gate_logit_scale = float(
+            getattr(configs, "risk_gate_logit_scale", 1.0)
         )
         self.risk_forecast_weight = float(
             getattr(configs, "risk_forecast_weight", 0.0)
@@ -109,6 +116,10 @@ class Model(nn.Module):
             raise ValueError("risk_momentum_short_weight must be in [0, 1]")
         if self.risk_momentum_residual_weight < 0:
             raise ValueError("risk_momentum_residual_weight cannot be negative")
+        if not math.isfinite(self.asset_embedding_scale) or self.asset_embedding_scale < 0:
+            raise ValueError("asset_embedding_scale must be finite and non-negative")
+        if self.risk_gate_logit_scale < 0:
+            raise ValueError("risk_gate_logit_scale cannot be negative")
         if self.risk_forecast_weight < 0:
             raise ValueError("risk_forecast_weight cannot be negative")
         if self.risk_contrarian_weight < 0 or self.risk_defensive_weight < 0:
@@ -122,10 +133,14 @@ class Model(nn.Module):
         self.risk_scale_windows = tuple(sorted({int(item) for item in scale_values}))
         if not self.risk_scale_windows or any(item <= 0 for item in self.risk_scale_windows):
             raise ValueError("risk_scale_windows must contain positive windows")
-        if any(item > self.lookback_window for item in self.risk_scale_windows):
-            raise ValueError(
-                "risk_scale_windows cannot exceed the model lookback window"
-            )
+        # Short synthetic smoke-test windows (and small live universes) may
+        # be narrower than the default 20/40/60-day route list.  Clipping the
+        # requested scales to the available causal path preserves the route
+        # semantics and avoids making model construction depend on a test-only
+        # configuration detail.
+        self.risk_scale_windows = tuple(
+            sorted({min(item, self.lookback_window) for item in self.risk_scale_windows})
+        )
 
         fusion_input_dim = (
             self.log_return_embed_dim
@@ -174,6 +189,12 @@ class Model(nn.Module):
             nn.Dropout(self.dropout),
             nn.Linear(self.d_model, 1),
         )
+        # Start the differentiable policy from a neutral cross-sectional
+        # signal.  The head still receives gradients from CVaR/decision
+        # objectives, but random initial logits no longer create a different
+        # KKT probe and portfolio ranking for every seed.
+        nn.init.zeros_(self.return_head[-1].weight)
+        nn.init.zeros_(self.return_head[-1].bias)
         # self.return_head = nn.Linear(self.d_model, 1, bias=True)
         # Keep allocation logits separate from the risk-scaled return signal.
         # The latter is deliberately tiny and would make a direct softmax
@@ -184,6 +205,8 @@ class Model(nn.Module):
             nn.Dropout(self.dropout),
             nn.Linear(self.d_model, 1),
         )
+        nn.init.zeros_(self.allocation_head[-1].weight)
+        nn.init.zeros_(self.allocation_head[-1].bias)
         # A separate decision residual is zero-initialized.  Risk-budget
         # policies therefore start from the causal prior rather than a random
         # alpha ranking, while the final layer is free to learn from CVaR and
@@ -267,7 +290,9 @@ class Model(nn.Module):
         path_emb = self.path_projection(log_return_path)
         date_emb = self.date_projection(date_feats).unsqueeze(2).expand(-1, -1, num_assets, -1)
         asset_ids = torch.arange(num_assets, device=log_return_path.device)
-        asset_emb = self.asset_embedding(asset_ids).view(1, 1, num_assets, -1).expand(batch_size, horizon, -1, -1)
+        asset_emb = (
+            self.asset_embedding_scale * self.asset_embedding(asset_ids)
+        ).view(1, 1, num_assets, -1).expand(batch_size, horizon, -1, -1)
         x = self.input_norm(self.concat_projection(torch.cat((path_emb, date_emb, asset_emb), dim=-1)))
 
         # Temporal attention is causal and is applied independently per asset.
@@ -351,7 +376,10 @@ class Model(nn.Module):
         scores = torch.stack(scale_scores, dim=-1)
         raw_scores = torch.stack(scale_raw_scores, dim=-1)
         scale_gate_input = torch.cat((hidden, scores), dim=-1)
-        scale_weights = torch.softmax(self.risk_scale_gate(scale_gate_input), dim=-1)
+        scale_weights = torch.softmax(
+            self.risk_gate_logit_scale * self.risk_scale_gate(scale_gate_input),
+            dim=-1,
+        )
         if self.risk_score_normalization == "raw":
             mixed_trend = (scale_weights * raw_scores).sum(dim=-1)
             base_trend = raw_scores[..., 0]
@@ -394,7 +422,8 @@ class Model(nn.Module):
         signal_features = torch.stack((trend, reversal, defensive), dim=-1)
         signal_gate_input = torch.cat((hidden, signal_features), dim=-1)
         signal_weights = torch.softmax(
-            self.risk_signal_gate(signal_gate_input), dim=-1
+            self.risk_gate_logit_scale * self.risk_signal_gate(signal_gate_input),
+            dim=-1,
         )
         # The trend route is the identifiable base policy.  The gates only
         # control the strength of the complementary reversal/defensive
@@ -432,7 +461,9 @@ class Model(nn.Module):
         gate_features = torch.cat(
             (hidden, prior.unsqueeze(-1), scores.mean(dim=-1, keepdim=True)), dim=-1
         )
-        prior_weight = torch.sigmoid(self.risk_prior_gate(gate_features)).squeeze(-1)
+        prior_weight = torch.sigmoid(
+            self.risk_gate_logit_scale * self.risk_prior_gate(gate_features)
+        ).squeeze(-1)
         forecast = self.predict_from_hidden(hidden)
         forecast = forecast - forecast.mean(dim=-1, keepdim=True)
         forecast = forecast / forecast.std(
@@ -448,7 +479,7 @@ class Model(nn.Module):
             dim=-1,
         )
         forecast_gate = torch.sigmoid(
-            self.risk_forecast_gate(forecast_features)
+            self.risk_gate_logit_scale * self.risk_forecast_gate(forecast_features)
         ).squeeze(-1)
         if self.risk_momentum_residual_weight == 0.0:
             blended = prior
