@@ -54,7 +54,12 @@ transaction_cost_bps=""           # empty: use trade_cost_bps
 transaction_cost_smoothing=1e-4
 turnover_penalty=0.02
 turnover_smoothing=1.0
-mean_return_weight="${KKT_MEAN_RETURN_WEIGHT:-0.0}"
+mean_return_weight="${KKT_MEAN_RETURN_WEIGHT:-1.0}"
+sharpe_weight="${KKT_SHARPE_WEIGHT:-0.0}"
+sortino_weight="${KKT_SORTINO_WEIGHT:-0.01}"
+sortino_temperature="${KKT_SORTINO_TEMPERATURE:-0.01}"
+sortino_epsilon="${KKT_SORTINO_EPSILON:-0.0001}"
+portfolio_statistic_scope="${KKT_PORTFOLIO_STATISTIC_SCOPE:-context}"
 
 # Entropy regularization in the optimizer and KKT state:
 #   tau * sum_i [(w_i + epsilon) log(w_i + epsilon) - epsilon log(epsilon)]
@@ -77,7 +82,7 @@ sequential_state=0                # 1 adds --sequential_state
 # -----------------------------------------------------------------------------
 input_dim=1
 factor_dim=3
-feedback_mode="dual"                 # same primal-dual attention feedback as 40/50
+feedback_mode="${KKT_FEEDBACK_MODE:-dual}" # shared primal-dual feedback family
 decision_layer="${KKT_DECISION_LAYER:-softmax}"
 active_tolerance=1e-5
 
@@ -85,6 +90,35 @@ log_return_embed_dim="${KKT_LOG_RETURN_EMBED_DIM:-32}"
 date_embed_dim="${KKT_DATE_EMBED_DIM:-8}"
 asset_embed_dim="${KKT_ASSET_EMBED_DIM:-8}"
 asset_embedding_scale="${KKT_ASSET_EMBEDDING_SCALE:-1.0}"
+asset_embedding_init="${KKT_ASSET_EMBEDDING_INIT:-random}"
+model_init_seed="${KKT_MODEL_INIT_SEED:-0}"
+portfolio_heads="${KKT_PORTFOLIO_HEADS:-1}"
+policy_experts="${KKT_POLICY_EXPERTS:-1}"
+portfolio_aggregation="${KKT_PORTFOLIO_AGGREGATION:-logit_mean}"
+policy_head_consistency_weight="${KKT_POLICY_HEAD_CONSISTENCY_WEIGHT:-0.0}"
+spectral_policy_filters="${KKT_SPECTRAL_POLICY_FILTERS:-8}"
+spectral_policy_hidden="${KKT_SPECTRAL_POLICY_HIDDEN:-0}"
+spectral_policy_scale="${KKT_SPECTRAL_POLICY_SCALE:-1.0}"
+tail_policy_filters="${KKT_TAIL_POLICY_FILTERS:-16}"
+tail_policy_hidden="${KKT_TAIL_POLICY_HIDDEN:-32}"
+tail_policy_scale="${KKT_TAIL_POLICY_SCALE:-5.0}"
+tail_policy_windows="${KKT_TAIL_POLICY_WINDOWS:-5,10,20,60}"
+ordered_policy_bins="${KKT_ORDERED_POLICY_BINS:-8}"
+ordered_policy_scale="${KKT_ORDERED_POLICY_SCALE:-0.0}"
+ordered_policy_windows="${KKT_ORDERED_POLICY_WINDOWS:-5,10,20,60}"
+policy_refinement_steps="${KKT_POLICY_REFINEMENT_STEPS:-0}"
+policy_refinement_scale="${KKT_POLICY_REFINEMENT_SCALE:-0.0}"
+policy_refinement_window="${KKT_POLICY_REFINEMENT_WINDOW:-60}"
+policy_refinement_risk="${KKT_POLICY_REFINEMENT_RISK:-variance}"
+policy_refinement_tail_temperature="${KKT_POLICY_REFINEMENT_TAIL_TEMPERATURE:-0.01}"
+lpm_geometry_scale="${KKT_LPM_GEOMETRY_SCALE:-0.0}"
+lpm_geometry_window="${KKT_LPM_GEOMETRY_WINDOW:-10}"
+lpm_geometry_init="${KKT_LPM_GEOMETRY_INIT:-2.5}"
+lpm_geometry_epsilon="${KKT_LPM_GEOMETRY_EPSILON:-0.0001}"
+relation_attention_scale="${KKT_RELATION_ATTENTION_SCALE:-0.0}"
+relation_attention_hidden="${KKT_RELATION_ATTENTION_HIDDEN:-16}"
+use_asset_policy_bias="${KKT_USE_ASSET_POLICY_BIAS:-1}"
+asset_policy_bias_scale="${KKT_ASSET_POLICY_BIAS_SCALE:-1.0}"
 d_model="${KKT_D_MODEL:-32}"     # same Transformer width as the 40/50 scripts
 n_heads="${KKT_N_HEADS:-4}"
 num_layers=1
@@ -102,8 +136,8 @@ constraint_projection_iterations=20
 loss_mode="${KKT_LOSS_MODE:-cvar}" # end-to-end portfolio CVaR by default
 regret_weight="${KKT_REGRET_WEIGHT:-0.0}"
 prediction_loss="NONE"             # prediction route explicitly disabled
-cvar_alpha="${KKT_CVAR_ALPHA:-0.80}"
-cvar_variant="${KKT_CVAR_VARIANT:-sit}" # sit | smooth
+cvar_alpha="${KKT_CVAR_ALPHA:-0.95}"
+cvar_variant="${KKT_CVAR_VARIANT:-smooth}" # sit | smooth
 cvar_temperature="${KKT_CVAR_TEMPERATURE:-1e-3}"
 ktr_weight="${KKT_KTR_WEIGHT:-0.0}"
 ktr_tail_alpha=0.80                # wider tail coverage than one H=20 step
@@ -113,12 +147,17 @@ ktr_pressure_clip=5.0
 kkt_bias_rank=3
 prediction_weight=0.0
 temperature="${KKT_TEMPERATURE:-1.3}"
-simplex_anchor_weight="${KKT_SIMPLEX_ANCHOR_WEIGHT:-0.56}"
-# Causal 20-day momentum simplex prior; the Transformer learns only a
-# portfolio-decision residual around this seed-invariant anchor.
-momentum_anchor_weight="${KKT_MOMENTUM_ANCHOR_WEIGHT:-0.45}"
+# Paper configuration: no hand-crafted portfolio anchor may directly replace
+# any fraction of the Transformer decision. Risk information must enter only
+# through differentiable portfolio objectives or constraints.
+simplex_anchor_weight=0.0
+momentum_anchor_weight=0.0
 momentum_anchor_lookback="${KKT_MOMENTUM_ANCHOR_LOOKBACK:-20}"
 momentum_anchor_temperature="${KKT_MOMENTUM_ANCHOR_TEMPERATURE:-1.0}"
+downside_anchor_weight=0.0
+downside_anchor_lookback="${KKT_DOWNSIDE_ANCHOR_LOOKBACK:-10}"
+downside_anchor_power="${KKT_DOWNSIDE_ANCHOR_POWER:-2.0}"
+downside_anchor_epsilon="${KKT_DOWNSIDE_ANCHOR_EPSILON:-0.0001}"
 risk_momentum_lookback=60
 risk_scale_windows="20,40,60"
 risk_score_normalization="raw"
@@ -128,6 +167,7 @@ risk_defensive_gate_floor=0.95
 risk_momentum_short_weight="${KKT_SHORT_WEIGHT:-0.15}"
 risk_momentum_residual_weight="${KKT_RESIDUAL_WEIGHT:-0.0}"
 risk_gate_logit_scale="${KKT_GATE_LOGIT_SCALE:-0.1}"
+risk_gate_init="${KKT_RISK_GATE_INIT:-neutral}"
 risk_forecast_weight="${KKT_FORECAST_WEIGHT:-0.0}"
 risk_contrarian_weight="${KKT_CONTRARIAN_WEIGHT:-1.0}"
 risk_defensive_weight="${KKT_DEFENSIVE_WEIGHT:-0.25}"
@@ -151,7 +191,7 @@ ema_decay="${KKT_EMA_DECAY:-0.0}"
 batch_size=64
 patience=30
 num_workers=0
-seed="${KKT_SEED:-2025}"
+seed="${KKT_SEED:-2023,2024,2025,2026,2027}"
 
 use_gpu=1
 gpu="${KKT_GPU:-0}"
@@ -196,6 +236,11 @@ cmd=(
   --transaction_cost_smoothing "$transaction_cost_smoothing"
   --turnover_penalty "$turnover_penalty"
   --mean_return_weight "$mean_return_weight"
+  --sharpe_weight "$sharpe_weight"
+  --sortino_weight "$sortino_weight"
+  --sortino_temperature "$sortino_temperature"
+  --sortino_epsilon "$sortino_epsilon"
+  --portfolio_statistic_scope "$portfolio_statistic_scope"
   --turnover_smoothing "$turnover_smoothing"
   --risk_turnover_aversion "$risk_turnover_aversion"
   --entropy_regularization "$entropy_regularization"
@@ -214,6 +259,35 @@ cmd=(
   --date_embed_dim "$date_embed_dim"
   --asset_embed_dim "$asset_embed_dim"
   --asset_embedding_scale "$asset_embedding_scale"
+  --asset_embedding_init "$asset_embedding_init"
+  --model_init_seed "$model_init_seed"
+  --portfolio_heads "$portfolio_heads"
+  --policy_experts "$policy_experts"
+  --portfolio_aggregation "$portfolio_aggregation"
+  --policy_head_consistency_weight "$policy_head_consistency_weight"
+  --spectral_policy_filters "$spectral_policy_filters"
+  --spectral_policy_hidden "$spectral_policy_hidden"
+  --spectral_policy_scale "$spectral_policy_scale"
+  --tail_policy_filters "$tail_policy_filters"
+  --tail_policy_hidden "$tail_policy_hidden"
+  --tail_policy_scale "$tail_policy_scale"
+  --tail_policy_windows "$tail_policy_windows"
+  --ordered_policy_bins "$ordered_policy_bins"
+  --ordered_policy_scale "$ordered_policy_scale"
+  --ordered_policy_windows "$ordered_policy_windows"
+  --policy_refinement_steps "$policy_refinement_steps"
+  --policy_refinement_scale "$policy_refinement_scale"
+  --policy_refinement_window "$policy_refinement_window"
+  --policy_refinement_risk "$policy_refinement_risk"
+  --policy_refinement_tail_temperature "$policy_refinement_tail_temperature"
+  --lpm_geometry_scale "$lpm_geometry_scale"
+  --lpm_geometry_window "$lpm_geometry_window"
+  --lpm_geometry_init "$lpm_geometry_init"
+  --lpm_geometry_epsilon "$lpm_geometry_epsilon"
+  --relation_attention_scale "$relation_attention_scale"
+  --relation_attention_hidden "$relation_attention_hidden"
+  --use_asset_policy_bias "$use_asset_policy_bias"
+  --asset_policy_bias_scale "$asset_policy_bias_scale"
   --d_model "$d_model"
   --n_heads "$n_heads"
   --num_layers "$num_layers"
@@ -248,10 +322,15 @@ cmd=(
   --momentum_anchor_weight "$momentum_anchor_weight"
   --momentum_anchor_lookback "$momentum_anchor_lookback"
   --momentum_anchor_temperature "$momentum_anchor_temperature"
+  --downside_anchor_weight "$downside_anchor_weight"
+  --downside_anchor_lookback "$downside_anchor_lookback"
+  --downside_anchor_power "$downside_anchor_power"
+  --downside_anchor_epsilon "$downside_anchor_epsilon"
   --risk_momentum_lookback "$risk_momentum_lookback"
   --risk_momentum_short_weight "$risk_momentum_short_weight"
   --risk_momentum_residual_weight "$risk_momentum_residual_weight"
   --risk_gate_logit_scale "$risk_gate_logit_scale"
+  --risk_gate_init "$risk_gate_init"
   --risk_forecast_weight "$risk_forecast_weight"
   --risk_contrarian_weight "$risk_contrarian_weight"
   --risk_defensive_weight "$risk_defensive_weight"

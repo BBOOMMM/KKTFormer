@@ -264,6 +264,11 @@ def portfolio_cvar_loss(
     turnover_penalty: float = 0.0,
     transaction_cost_smoothing: float = 1e-4,
     mean_return_weight: float = 0.0,
+    sharpe_weight: float = 0.0,
+    sortino_weight: float = 0.0,
+    sortino_temperature: float = 1e-2,
+    sortino_epsilon: float = 1e-4,
+    statistic_scope: str = "context",
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Compute CVaR over the future return path.
 
@@ -280,6 +285,9 @@ def portfolio_cvar_loss(
         raise ValueError("variant must be one of sit or smooth")
     if variant == "smooth" and smooth_temperature <= 0:
         raise ValueError("smooth_temperature must be positive")
+    statistic_scope = str(statistic_scope).lower()
+    if statistic_scope not in {"context", "batch"}:
+        raise ValueError("statistic_scope must be context or batch")
     sequence_weights = weights.shape == future_returns.shape
     static_weights = weights.shape[:-1] == future_returns.shape[:-2]
     if not (sequence_weights or static_weights):
@@ -290,19 +298,42 @@ def portfolio_cvar_loss(
     else:
         portfolio_returns = torch.einsum("...hn,...n->...h", future_returns, weights)
     portfolio_losses = -portfolio_returns
+    batch_size = int(
+        future_returns.numel()
+        // (future_returns.shape[-2] * future_returns.shape[-1])
+    )
+    # A 95% tail estimate over an individual H=20 decision path is effectively
+    # controlled by a single return.  Pooling portfolio returns across the
+    # mini-batch provides a substantially lower-variance empirical tail while
+    # preserving the end-to-end decision path: only realized returns of the
+    # final portfolio enter this statistic, never asset-wise prediction labels.
+    statistic_losses = (
+        portfolio_losses.reshape(1, -1)
+        if statistic_scope == "batch"
+        else portfolio_losses
+    )
     if variant == "sit":
-        var = torch.quantile(portfolio_losses, alpha, dim=-1, keepdim=True)
-        excess = F.relu(portfolio_losses - var)
+        statistic_var = torch.quantile(
+            statistic_losses, alpha, dim=-1, keepdim=True
+        )
+        excess = F.relu(statistic_losses - statistic_var)
     else:
-        var = torch.quantile(
-            portfolio_losses.detach(), alpha, dim=-1, keepdim=True
+        statistic_var = torch.quantile(
+            statistic_losses.detach(), alpha, dim=-1, keepdim=True
         )
         excess = smooth_temperature * F.softplus(
-            (portfolio_losses - var) / smooth_temperature
+            (statistic_losses - statistic_var) / smooth_temperature
         )
-    cvar = var.squeeze(-1) + excess.mean(dim=-1) / (1.0 - alpha)
+    statistic_cvar = (
+        statistic_var.squeeze(-1) + excess.mean(dim=-1) / (1.0 - alpha)
+    )
+    if statistic_scope == "batch":
+        var = statistic_var.reshape(1).expand(batch_size)
+        cvar = statistic_cvar.reshape(1).expand(batch_size)
+    else:
+        var = statistic_var.reshape(batch_size)
+        cvar = statistic_cvar.reshape(batch_size)
 
-    batch_size = int(future_returns.numel() // (future_returns.shape[-2] * future_returns.shape[-1]))
     if sequence_weights:
         if w_prev is None:
             first_delta = torch.zeros_like(weights[..., 0, :])
@@ -344,30 +375,58 @@ def portfolio_cvar_loss(
         raise ValueError("turnover_penalty cannot be negative")
     if not torch.isfinite(torch.as_tensor(mean_return_weight)) or mean_return_weight < 0:
         raise ValueError("mean_return_weight must be finite and non-negative")
+    if not torch.isfinite(torch.as_tensor(sortino_weight)) or sortino_weight < 0:
+        raise ValueError("sortino_weight must be finite and non-negative")
+    if not torch.isfinite(torch.as_tensor(sharpe_weight)) or sharpe_weight < 0:
+        raise ValueError("sharpe_weight must be finite and non-negative")
+    if sortino_temperature <= 0 or sortino_epsilon <= 0:
+        raise ValueError("sortino smoothing parameters must be positive")
     if transaction_cost_smoothing <= 0:
         raise ValueError("transaction_cost_smoothing must be positive")
     transaction_cost = turnover * cost_rate
     smooth_transaction_cost = cost_rate * smooth_norm
     quadratic_turnover = 0.5 * float(turnover_penalty) * quadratic_norm
-    mean_return = portfolio_returns.mean(dim=-1).reshape(batch_size)
+    statistic_returns = (
+        portfolio_returns.reshape(1, -1)
+        if statistic_scope == "batch"
+        else portfolio_returns
+    )
+    mean_return = statistic_returns.mean(dim=-1)
+    return_deviation = statistic_returns.std(dim=-1, unbiased=False)
+    smooth_sharpe = mean_return / return_deviation.add(sortino_epsilon)
+    smooth_downside = sortino_temperature * F.softplus(
+        -statistic_returns / sortino_temperature
+    )
+    downside_deviation = smooth_downside.square().mean(dim=-1).sqrt()
+    smooth_sortino = mean_return / downside_deviation.add(sortino_epsilon)
+    if statistic_scope == "batch":
+        mean_return = mean_return.expand(batch_size)
+        smooth_sharpe = smooth_sharpe.expand(batch_size)
+        smooth_sortino = smooth_sortino.expand(batch_size)
     # This is a portfolio-level utility term: gradients flow through the
     # realized portfolio return ``sum_i w_i r_i`` only.  It is deliberately
     # not an asset-wise forecast or cross-sectional prediction objective.
     total = (
-        cvar.reshape(batch_size)
+        cvar
         + smooth_transaction_cost
         + quadratic_turnover
         - float(mean_return_weight) * mean_return
+        - float(sharpe_weight) * smooth_sharpe
+        - float(sortino_weight) * smooth_sortino
     )
     components = {
-        "var": var.reshape(batch_size),
-        "cvar": cvar.reshape(batch_size),
+        "var": var,
+        "cvar": cvar,
         "turnover": turnover,
         "transaction_cost": transaction_cost,
         "smooth_transaction_cost": smooth_transaction_cost,
         "turnover_penalty": quadratic_turnover,
         "mean_return": mean_return,
         "mean_return_utility": float(mean_return_weight) * mean_return,
+        "smooth_sharpe": smooth_sharpe,
+        "sharpe_utility": float(sharpe_weight) * smooth_sharpe,
+        "smooth_sortino": smooth_sortino,
+        "sortino_utility": float(sortino_weight) * smooth_sortino,
         "total_loss": total,
     }
     return total, components

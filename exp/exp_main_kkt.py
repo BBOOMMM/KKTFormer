@@ -119,6 +119,52 @@ class EXP_KKT(Exp_Basic):
             or self.momentum_anchor_temperature <= 0.0
         ):
             raise ValueError("momentum_anchor_temperature must be finite and positive")
+        self.downside_anchor_weight = float(
+            getattr(args, "downside_anchor_weight", 0.0)
+        )
+        self.downside_anchor_lookback = int(
+            getattr(args, "downside_anchor_lookback", 10)
+        )
+        self.downside_anchor_power = float(
+            getattr(args, "downside_anchor_power", 2.0)
+        )
+        self.downside_anchor_epsilon = float(
+            getattr(args, "downside_anchor_epsilon", 1e-4)
+        )
+        if (
+            not math.isfinite(self.downside_anchor_weight)
+            or not 0.0 <= self.downside_anchor_weight < 1.0
+        ):
+            raise ValueError("downside_anchor_weight must be in [0, 1)")
+        if self.downside_anchor_lookback <= 0:
+            raise ValueError("downside_anchor_lookback must be positive")
+        if (
+            not math.isfinite(self.downside_anchor_power)
+            or self.downside_anchor_power <= 0.0
+        ):
+            raise ValueError("downside_anchor_power must be finite and positive")
+        if (
+            not math.isfinite(self.downside_anchor_epsilon)
+            or self.downside_anchor_epsilon <= 0.0
+        ):
+            raise ValueError("downside_anchor_epsilon must be finite and positive")
+        # The 30-asset paper route is deliberately a pure learned policy.
+        # Keep the legacy anchor arguments available for historical 40/50
+        # ablations, but make it impossible for a 30-pool run to silently
+        # blend an equal-weight, momentum, or inverse-downside portfolio into
+        # the Transformer decision.
+        if int(getattr(args, "data_pool", 0)) == 30 and any(
+            weight != 0.0
+            for weight in (
+                self.simplex_anchor_weight,
+                self.momentum_anchor_weight,
+                self.downside_anchor_weight,
+            )
+        ):
+            raise ValueError(
+                "30-asset runs require simplex, momentum, and downside "
+                "anchor weights to be exactly zero"
+            )
         super().__init__(args)
         problem_rebalance_frequency = (
             1 if self.protocol == "sit" else args.rebalance_frequency
@@ -182,6 +228,16 @@ class EXP_KKT(Exp_Basic):
         )
         if not math.isfinite(self.mean_return_weight) or self.mean_return_weight < 0.0:
             raise ValueError("mean_return_weight must be finite and non-negative")
+        self.policy_head_consistency_weight = float(
+            getattr(args, "policy_head_consistency_weight", 0.0)
+        )
+        if (
+            not math.isfinite(self.policy_head_consistency_weight)
+            or self.policy_head_consistency_weight < 0.0
+        ):
+            raise ValueError(
+                "policy_head_consistency_weight must be finite and non-negative"
+            )
         self.risk_allocator = RiskBudgetedAllocator(
             temperature=self.temperature,
             turnover_aversion=self.risk_turnover_aversion,
@@ -228,16 +284,53 @@ class EXP_KKT(Exp_Basic):
                 "forecast_weight must remain 0: cross-sectional return "
                 "prediction supervision is disabled for end-to-end allocation"
             )
+        prediction_route = str(getattr(args, "prediction_loss", "NONE")).strip().upper()
+        if int(getattr(args, "data_pool", 0)) == 30 and prediction_route not in {
+            "",
+            "NONE",
+        }:
+            raise ValueError(
+                "30-asset runs require prediction_loss=NONE: cross-sectional "
+                "return prediction is disabled"
+            )
 
     def _build_model(self):
         model_module = self.model_dict["KKTFormer"]
-        if self.feedback_mode == "none":
-            model = model_module.Model(self.args).float()
-        else:
-            model = model_module.DecisionAwareModel(
-                self.args,
-                feedback_mode=self.feedback_mode,
-            ).float()
+        # Model initialization can otherwise dominate the small-sample
+        # portfolio gradient and send different seeds to distinct policy
+        # basins.  ``model_init_seed`` provides a reproducible, seed-neutral
+        # initialization while preserving the experiment seed for data order
+        # and all subsequent optimizer randomness.  A negative value keeps
+        # the historical seed-dependent initialization.
+        init_seed = int(getattr(self.args, "model_init_seed", -1))
+        rng_context = torch.random.fork_rng(
+            devices=list(range(torch.cuda.device_count()))
+        ) if init_seed >= 0 else None
+        if rng_context is not None:
+            rng_context.__enter__()
+            torch.manual_seed(init_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(init_seed)
+        try:
+            if self.feedback_mode == "none":
+                if int(getattr(self.args, "policy_experts", 1)) > 1:
+                    raise ValueError(
+                        "policy_experts > 1 currently requires decision-aware feedback"
+                    )
+                model = model_module.Model(self.args).float()
+            elif int(getattr(self.args, "policy_experts", 1)) > 1:
+                model = model_module.DecisionAwarePolicyEnsemble(
+                    self.args,
+                    feedback_mode=self.feedback_mode,
+                ).float()
+            else:
+                model = model_module.DecisionAwareModel(
+                    self.args,
+                    feedback_mode=self.feedback_mode,
+                ).float()
+        finally:
+            if rng_context is not None:
+                rng_context.__exit__(None, None, None)
         if self.args.use_multi_gpu and self.args.use_gpu:
             model = nn.DataParallel(model, device_ids=self.args.device_ids)
         return model
@@ -262,6 +355,26 @@ class EXP_KKT(Exp_Basic):
             dim=-1, unbiased=False, keepdim=True
         ).clamp_min(1e-6)
         return torch.softmax(score / self.momentum_anchor_temperature, dim=-1)
+
+    def _downside_anchor(self, log_return_path: torch.Tensor) -> torch.Tensor:
+        """Return a causal inverse-semideviation simplex allocation.
+
+        This pathwise risk allocator uses only realized returns preceding the
+        decision.  It is differentiable, creates no asset-return target, and
+        leaves ``1 - downside_anchor_weight`` of the final portfolio to the
+        Transformer policy trained through the portfolio objective.
+        """
+
+        realized_returns = torch.expm1(log_return_path[..., 1:])
+        lookback = min(self.downside_anchor_lookback, realized_returns.shape[-1])
+        recent_returns = realized_returns[..., -lookback:]
+        downside_deviation = torch.sqrt(
+            torch.mean(torch.relu(-recent_returns).square(), dim=-1)
+        )
+        inverse_risk = downside_deviation.add(
+            self.downside_anchor_epsilon
+        ).pow(-self.downside_anchor_power)
+        return inverse_risk / inverse_risk.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
     @staticmethod
     def _parse_bound(value):
@@ -569,10 +682,15 @@ class EXP_KKT(Exp_Basic):
             initial_weights = probe_weights
 
         if self.decision_layer == "softmax":
-            allocation_logits = model_core.allocation_logits_from_hidden(
-                allocation_hidden
+            weights, policy_head_weights = model_core.allocation_weights_from_hidden(
+                allocation_hidden,
+                self.temperature,
+                log_return_path=log_return_path,
             )
-            weights = torch.softmax(allocation_logits / self.temperature, dim=-1)
+            # This effective logit representation exactly maps back to the
+            # averaged learned policy and keeps optional logit diagnostics
+            # compatible with the single-head route.
+            allocation_logits = self.temperature * weights.clamp_min(1e-12).log()
             if self.simplex_anchor_weight > 0.0:
                 weights = (
                     (1.0 - self.simplex_anchor_weight) * weights
@@ -583,6 +701,12 @@ class EXP_KKT(Exp_Basic):
                 weights = (
                     (1.0 - self.momentum_anchor_weight) * weights
                     + self.momentum_anchor_weight * momentum_anchor
+                )
+            if self.downside_anchor_weight > 0.0:
+                downside_anchor = self._downside_anchor(log_return_path)
+                weights = (
+                    (1.0 - self.downside_anchor_weight) * weights
+                    + self.downside_anchor_weight * downside_anchor
                 )
             weights_flat = weights.reshape(batch_size * horizon, num_assets)
             state = reshape_state(
@@ -611,6 +735,12 @@ class EXP_KKT(Exp_Basic):
                 weights_flat = (
                     (1.0 - self.momentum_anchor_weight) * weights_flat
                     + self.momentum_anchor_weight * momentum_anchor
+                )
+            if self.downside_anchor_weight > 0.0:
+                downside_anchor = self._downside_anchor(log_return_path)
+                weights_flat = (
+                    (1.0 - self.downside_anchor_weight) * weights_flat
+                    + self.downside_anchor_weight * downside_anchor
                 )
             weights = weights_flat
             weights_flat = weights.reshape(batch_size * horizon, num_assets)
@@ -685,6 +815,15 @@ class EXP_KKT(Exp_Basic):
             ),
             transaction_cost_smoothing=self.transaction_cost_smoothing,
             mean_return_weight=self.mean_return_weight,
+            sharpe_weight=float(getattr(self.args, "sharpe_weight", 0.0)),
+            sortino_weight=float(getattr(self.args, "sortino_weight", 0.0)),
+            sortino_temperature=float(
+                getattr(self.args, "sortino_temperature", 1e-2)
+            ),
+            sortino_epsilon=float(getattr(self.args, "sortino_epsilon", 1e-4)),
+            statistic_scope=str(
+                getattr(self.args, "portfolio_statistic_scope", "context")
+            ),
         )
         cvar_loss = cvar_batch.mean()
         # No asset-return prediction target is constructed.  Every trainable
@@ -776,6 +915,19 @@ class EXP_KKT(Exp_Basic):
             ktr_loss = ktr_batch.mean()
 
         objective_loss = risk_budget_loss if self.loss_mode == "risk_budget" else cvar_loss
+        policy_head_consistency_loss = cvar_loss.detach() * 0.0
+        if self.decision_layer == "softmax" and policy_head_weights.shape[-2] > 1:
+            # Jensen-Shannon disagreement is label-free and portfolio-level:
+            # it controls expert variance without introducing a target
+            # allocation or an asset-return prediction objective.
+            policy_mean = policy_head_weights.mean(dim=-2, keepdim=True)
+            policy_head_consistency_loss = (
+                policy_head_weights
+                * (
+                    policy_head_weights.clamp_min(1e-12).log()
+                    - policy_mean.clamp_min(1e-12).log()
+                )
+            ).sum(dim=-1).mean()
         # ``entropy_regularization`` used to be reported in diagnostics but
         # was absent from the optimization objective for the softmax/risk-
         # budget path.  Include the differentiable final-policy term here so
@@ -787,6 +939,8 @@ class EXP_KKT(Exp_Basic):
             + self.regret_weight * regret_loss
             + self.ktr_weight * ktr_loss
             + entropy_loss
+            + self.policy_head_consistency_weight
+            * policy_head_consistency_loss
         )
         zero = total_loss.detach() * 0.0
 
@@ -797,6 +951,10 @@ class EXP_KKT(Exp_Basic):
             "cvar_loss": cvar_loss,
             "mean_return": cvar_components["mean_return"].mean(),
             "mean_return_utility": cvar_components["mean_return_utility"].mean(),
+            "smooth_sharpe": cvar_components["smooth_sharpe"].mean(),
+            "sharpe_utility": cvar_components["sharpe_utility"].mean(),
+            "smooth_sortino": cvar_components["smooth_sortino"].mean(),
+            "sortino_utility": cvar_components["sortino_utility"].mean(),
             "forecast_loss": forecast_loss,
             "risk_budget_loss": risk_budget_loss,
             "regret_loss": regret_loss,
@@ -809,6 +967,11 @@ class EXP_KKT(Exp_Basic):
             "entropy": state["entropy"].mean(),
             "entropy_penalty": state["entropy_penalty"].mean(),
             "entropy_loss": entropy_loss,
+            "policy_head_consistency_loss": policy_head_consistency_loss,
+            "weighted_policy_head_consistency_loss": (
+                self.policy_head_consistency_weight
+                * policy_head_consistency_loss
+            ),
             "transaction_cost": cvar_components["transaction_cost"].mean(),
             "cvar_var": cvar_components["var"].mean(),
             "oracle_objective": oracle_objective,
@@ -1504,15 +1667,106 @@ class EXP_KKT(Exp_Basic):
         # metrics.  KKT-specific diagnostics are written separately so they
         # do not change the baseline comparison table.
         metrics = self._portfolio_metrics(daily_series)
+        model_core = (
+            self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        )
+        learned_lpm_geometry_power = float(
+            (
+                float(getattr(self.args, "lpm_geometry_scale", 0.0))
+                * torch.nn.functional.softplus(
+                    model_core.backbone.lpm_geometry_raw_power
+                )
+            ).detach().cpu()
+        )
         diagnostics = {
             "Protocol": self.protocol,
             "LossMode": self.loss_mode,
             "DecisionLayer": self.decision_layer,
             "SoftmaxTemperature": self.temperature,
+            "AssetEmbeddingInit": str(
+                getattr(self.args, "asset_embedding_init", "random")
+            ),
+            "ModelInitSeed": int(getattr(self.args, "model_init_seed", -1)),
+            "PortfolioHeads": int(getattr(self.args, "portfolio_heads", 1)),
+            "PolicyExperts": int(getattr(self.args, "policy_experts", 1)),
+            "SpectralPolicyFilters": int(
+                getattr(self.args, "spectral_policy_filters", 0)
+            ),
+            "SpectralPolicyScale": float(
+                getattr(self.args, "spectral_policy_scale", 1.0)
+            ),
+            "TailPolicyFilters": int(
+                getattr(self.args, "tail_policy_filters", 0)
+            ),
+            "TailPolicyScale": float(
+                getattr(self.args, "tail_policy_scale", 1.0)
+            ),
+            "OrderedPolicyBins": int(
+                getattr(self.args, "ordered_policy_bins", 8)
+            ),
+            "OrderedPolicyScale": float(
+                getattr(self.args, "ordered_policy_scale", 0.0)
+            ),
+            "OrderedPolicyWindows": str(
+                getattr(self.args, "ordered_policy_windows", "5,10,20,60")
+            ),
+            "PolicyRefinementSteps": int(
+                getattr(self.args, "policy_refinement_steps", 0)
+            ),
+            "PolicyRefinementScale": float(
+                getattr(self.args, "policy_refinement_scale", 0.0)
+            ),
+            "PolicyRefinementWindow": int(
+                getattr(self.args, "policy_refinement_window", 60)
+            ),
+            "PolicyRefinementRisk": str(
+                getattr(self.args, "policy_refinement_risk", "variance")
+            ),
+            "PolicyRefinementTailTemperature": float(
+                getattr(self.args, "policy_refinement_tail_temperature", 0.01)
+            ),
+            "LPMGeometryScale": float(
+                getattr(self.args, "lpm_geometry_scale", 0.0)
+            ),
+            "LPMGeometryWindow": int(
+                getattr(self.args, "lpm_geometry_window", 10)
+            ),
+            "LPMGeometryInitialPower": float(
+                getattr(self.args, "lpm_geometry_init", 2.5)
+            ),
+            "LPMGeometryLearnedPower": learned_lpm_geometry_power,
+            "LPMGeometryEpsilon": float(
+                getattr(self.args, "lpm_geometry_epsilon", 1e-4)
+            ),
+            "RelationAttentionScale": float(
+                getattr(self.args, "relation_attention_scale", 0.0)
+            ),
+            "RelationAttentionHidden": int(
+                getattr(self.args, "relation_attention_hidden", 16)
+            ),
+            "UseAssetPolicyBias": int(
+                getattr(self.args, "use_asset_policy_bias", 0)
+            ),
+            "AssetPolicyBiasScale": float(
+                getattr(self.args, "asset_policy_bias_scale", 1.0)
+            ),
+            "SortinoWeight": float(getattr(self.args, "sortino_weight", 0.0)),
+            "SharpeWeight": float(getattr(self.args, "sharpe_weight", 0.0)),
+            "MeanReturnWeight": float(
+                getattr(self.args, "mean_return_weight", 0.0)
+            ),
+            "PortfolioAggregation": str(
+                getattr(self.args, "portfolio_aggregation", "probability_mean")
+            ),
+            "PolicyHeadConsistencyWeight": self.policy_head_consistency_weight,
             "SimplexAnchorWeight": self.simplex_anchor_weight,
             "MomentumAnchorWeight": self.momentum_anchor_weight,
             "MomentumAnchorLookback": self.momentum_anchor_lookback,
             "MomentumAnchorTemperature": self.momentum_anchor_temperature,
+            "DownsideAnchorWeight": self.downside_anchor_weight,
+            "DownsideAnchorLookback": self.downside_anchor_lookback,
+            "DownsideAnchorPower": self.downside_anchor_power,
+            "DownsideAnchorEpsilon": self.downside_anchor_epsilon,
             "RiskMomentumResidualWeight": float(
                 getattr(self.args, "risk_momentum_residual_weight", 0.0)
             ),
@@ -1528,6 +1782,9 @@ class EXP_KKT(Exp_Basic):
             ),
             "CVaRAlpha": float(getattr(self.args, "cvar_alpha", 0.95)),
             "CVaRVariant": str(getattr(self.args, "cvar_variant", "sit")),
+            "PortfolioStatisticScope": str(
+                getattr(self.args, "portfolio_statistic_scope", "context")
+            ),
             "WeightDecay": float(getattr(self.args, "weight_decay", 0.0)),
             "EntropyRegularization": self.entropy_regularization,
             "EntropyEpsilon": self.entropy_epsilon,

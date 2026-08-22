@@ -29,6 +29,101 @@ class Model(nn.Module):
         self.asset_embedding_scale = float(
             getattr(configs, "asset_embedding_scale", 1.0)
         )
+        self.asset_embedding_init = str(
+            getattr(configs, "asset_embedding_init", "random")
+        ).lower()
+        self.portfolio_heads = int(getattr(configs, "portfolio_heads", 1))
+        self.portfolio_aggregation = str(
+            getattr(configs, "portfolio_aggregation", "probability_mean")
+        ).lower()
+        self.spectral_policy_filters = int(
+            getattr(configs, "spectral_policy_filters", 0)
+        )
+        self.spectral_policy_hidden = int(
+            getattr(configs, "spectral_policy_hidden", max(8, self.d_model // 2))
+        )
+        self.spectral_policy_scale = float(
+            getattr(configs, "spectral_policy_scale", 1.0)
+        )
+        self.tail_policy_filters = int(
+            getattr(configs, "tail_policy_filters", 0)
+        )
+        self.tail_policy_hidden = int(
+            getattr(configs, "tail_policy_hidden", max(8, self.d_model // 2))
+        )
+        self.tail_policy_scale = float(
+            getattr(configs, "tail_policy_scale", 1.0)
+        )
+        self.ordered_policy_bins = int(
+            getattr(configs, "ordered_policy_bins", 8)
+        )
+        self.ordered_policy_scale = float(
+            getattr(configs, "ordered_policy_scale", 0.0)
+        )
+        self.policy_refinement_steps = int(
+            getattr(configs, "policy_refinement_steps", 0)
+        )
+        self.policy_refinement_scale = float(
+            getattr(configs, "policy_refinement_scale", 0.0)
+        )
+        self.policy_refinement_window = int(
+            getattr(configs, "policy_refinement_window", self.lookback_window - 1)
+        )
+        self.policy_refinement_risk = str(
+            getattr(configs, "policy_refinement_risk", "variance")
+        ).lower()
+        self.policy_refinement_tail_temperature = float(
+            getattr(configs, "policy_refinement_tail_temperature", 1e-2)
+        )
+        self.lpm_geometry_scale = float(
+            getattr(configs, "lpm_geometry_scale", 0.0)
+        )
+        self.lpm_geometry_window = int(
+            getattr(configs, "lpm_geometry_window", 10)
+        )
+        self.lpm_geometry_init = float(
+            getattr(configs, "lpm_geometry_init", 2.5)
+        )
+        self.lpm_geometry_epsilon = float(
+            getattr(configs, "lpm_geometry_epsilon", 1e-4)
+        )
+        self.relation_attention_scale = float(
+            getattr(configs, "relation_attention_scale", 0.0)
+        )
+        self.relation_attention_hidden = int(
+            getattr(configs, "relation_attention_hidden", 16)
+        )
+        raw_tail_windows = getattr(configs, "tail_policy_windows", "5,10,20,60")
+        if isinstance(raw_tail_windows, str):
+            tail_windows = [
+                item.strip() for item in raw_tail_windows.split(",") if item.strip()
+            ]
+        else:
+            tail_windows = list(raw_tail_windows)
+        genuine_window = max(1, self.lookback_window - 1)
+        self.tail_policy_windows = tuple(
+            sorted({min(int(item), genuine_window) for item in tail_windows})
+        )
+        raw_ordered_windows = getattr(
+            configs, "ordered_policy_windows", "5,10,20,60"
+        )
+        if isinstance(raw_ordered_windows, str):
+            ordered_windows = [
+                item.strip()
+                for item in raw_ordered_windows.split(",")
+                if item.strip()
+            ]
+        else:
+            ordered_windows = list(raw_ordered_windows)
+        self.ordered_policy_windows = tuple(
+            sorted({min(int(item), genuine_window) for item in ordered_windows})
+        )
+        self.use_asset_policy_bias = bool(
+            int(getattr(configs, "use_asset_policy_bias", 0))
+        )
+        self.asset_policy_bias_scale = float(
+            getattr(configs, "asset_policy_bias_scale", 1.0)
+        )
         self.n_heads = int(configs.n_heads)
         self.num_layers = int(configs.num_layers)
         self.ff_dim = int(configs.ff_dim)
@@ -57,6 +152,9 @@ class Model(nn.Module):
         self.risk_gate_logit_scale = float(
             getattr(configs, "risk_gate_logit_scale", 1.0)
         )
+        self.risk_gate_init = str(
+            getattr(configs, "risk_gate_init", "neutral")
+        ).lower()
         self.risk_forecast_weight = float(
             getattr(configs, "risk_forecast_weight", 0.0)
         )
@@ -118,8 +216,107 @@ class Model(nn.Module):
             raise ValueError("risk_momentum_residual_weight cannot be negative")
         if not math.isfinite(self.asset_embedding_scale) or self.asset_embedding_scale < 0:
             raise ValueError("asset_embedding_scale must be finite and non-negative")
+        if self.asset_embedding_init not in {"random", "deterministic", "orthogonal"}:
+            raise ValueError(
+                "asset_embedding_init must be random, deterministic, or orthogonal"
+            )
+        if self.portfolio_heads <= 0:
+            raise ValueError("portfolio_heads must be positive")
+        if self.portfolio_aggregation not in {"probability_mean", "logit_mean"}:
+            raise ValueError(
+                "portfolio_aggregation must be probability_mean or logit_mean"
+            )
+        if self.spectral_policy_filters < 0:
+            raise ValueError("spectral_policy_filters cannot be negative")
+        if self.spectral_policy_filters > 0 and self.spectral_policy_hidden < 0:
+            raise ValueError("spectral_policy_hidden cannot be negative")
+        if (
+            not math.isfinite(self.spectral_policy_scale)
+            or self.spectral_policy_scale < 0
+        ):
+            raise ValueError("spectral_policy_scale must be finite and non-negative")
+        if self.tail_policy_filters < 0:
+            raise ValueError("tail_policy_filters cannot be negative")
+        if self.tail_policy_filters > 0 and self.tail_policy_hidden < 0:
+            raise ValueError("tail_policy_hidden cannot be negative")
+        if not math.isfinite(self.tail_policy_scale) or self.tail_policy_scale < 0:
+            raise ValueError("tail_policy_scale must be finite and non-negative")
+        if self.ordered_policy_bins <= 0:
+            raise ValueError("ordered_policy_bins must be positive")
+        if (
+            not math.isfinite(self.ordered_policy_scale)
+            or self.ordered_policy_scale < 0
+        ):
+            raise ValueError(
+                "ordered_policy_scale must be finite and non-negative"
+            )
+        if self.policy_refinement_steps < 0:
+            raise ValueError("policy_refinement_steps cannot be negative")
+        if (
+            not math.isfinite(self.policy_refinement_scale)
+            or self.policy_refinement_scale < 0
+        ):
+            raise ValueError(
+                "policy_refinement_scale must be finite and non-negative"
+            )
+        if self.policy_refinement_window <= 1:
+            raise ValueError("policy_refinement_window must be greater than one")
+        if self.policy_refinement_risk not in {"variance", "cvar", "lpm"}:
+            raise ValueError(
+                "policy_refinement_risk must be variance, cvar, or lpm"
+            )
+        if (
+            not math.isfinite(self.policy_refinement_tail_temperature)
+            or self.policy_refinement_tail_temperature <= 0.0
+        ):
+            raise ValueError(
+                "policy_refinement_tail_temperature must be finite and positive"
+            )
+        if (
+            not math.isfinite(self.lpm_geometry_scale)
+            or self.lpm_geometry_scale < 0.0
+        ):
+            raise ValueError("lpm_geometry_scale must be finite and non-negative")
+        if self.lpm_geometry_window <= 1:
+            raise ValueError("lpm_geometry_window must be greater than one")
+        if (
+            not math.isfinite(self.lpm_geometry_init)
+            or self.lpm_geometry_init <= 0.0
+        ):
+            raise ValueError("lpm_geometry_init must be finite and positive")
+        if (
+            not math.isfinite(self.lpm_geometry_epsilon)
+            or self.lpm_geometry_epsilon <= 0.0
+        ):
+            raise ValueError("lpm_geometry_epsilon must be finite and positive")
+        if (
+            not math.isfinite(self.relation_attention_scale)
+            or self.relation_attention_scale < 0
+        ):
+            raise ValueError(
+                "relation_attention_scale must be finite and non-negative"
+            )
+        if self.relation_attention_hidden <= 0:
+            raise ValueError("relation_attention_hidden must be positive")
+        if not self.tail_policy_windows or any(
+            item <= 0 for item in self.tail_policy_windows
+        ):
+            raise ValueError("tail_policy_windows must contain positive windows")
+        if not self.ordered_policy_windows or any(
+            item <= 0 for item in self.ordered_policy_windows
+        ):
+            raise ValueError("ordered_policy_windows must contain positive windows")
+        if (
+            not math.isfinite(self.asset_policy_bias_scale)
+            or self.asset_policy_bias_scale < 0
+        ):
+            raise ValueError(
+                "asset_policy_bias_scale must be finite and non-negative"
+            )
         if self.risk_gate_logit_scale < 0:
             raise ValueError("risk_gate_logit_scale cannot be negative")
+        if self.risk_gate_init not in {"neutral", "decision"}:
+            raise ValueError("risk_gate_init must be neutral or decision")
         if self.risk_forecast_weight < 0:
             raise ValueError("risk_forecast_weight cannot be negative")
         if self.risk_contrarian_weight < 0 or self.risk_defensive_weight < 0:
@@ -154,6 +351,54 @@ class Model(nn.Module):
         self.asset_embedding = nn.Embedding(
             self.num_assets, self.asset_embed_dim
         )
+        if self.asset_embedding_init == "orthogonal":
+            # A categorical identity basis avoids imposing an arbitrary
+            # similarity ordering on assets. With enough channels it is an
+            # exact one-hot code; narrower ablations use orthogonal cosine
+            # columns. The embedding remains trainable.
+            row = torch.arange(self.num_assets, dtype=self.asset_embedding.weight.dtype)
+            column = torch.arange(
+                self.asset_embed_dim, dtype=self.asset_embedding.weight.dtype
+            )
+            if self.asset_embed_dim >= self.num_assets:
+                codes = torch.zeros_like(self.asset_embedding.weight)
+                codes[:, : self.num_assets] = torch.eye(
+                    self.num_assets, dtype=codes.dtype
+                )
+                codes = codes * math.sqrt(float(self.asset_embed_dim))
+            else:
+                codes = torch.cos(
+                    math.pi
+                    * (row.unsqueeze(1) + 0.5)
+                    * column.unsqueeze(0)
+                    / float(self.num_assets)
+                )
+                codes = codes / codes.square().mean(
+                    dim=-1, keepdim=True
+                ).sqrt().clamp_min(1e-6)
+            with torch.no_grad():
+                self.asset_embedding.weight.copy_(codes)
+        elif self.asset_embedding_init == "deterministic":
+            # Asset identity is categorical, so the code deliberately avoids
+            # an ordinal ramp. Irrational Fourier phases give every asset a
+            # distinct, bounded starting code while remaining identical across
+            # experiment seeds. The table remains fully trainable afterwards.
+            asset_index = torch.arange(
+                1, self.num_assets + 1, dtype=self.asset_embedding.weight.dtype
+            ).unsqueeze(1)
+            channel_index = torch.arange(
+                1, self.asset_embed_dim + 1,
+                dtype=self.asset_embedding.weight.dtype,
+            ).unsqueeze(0)
+            codes = torch.sin(math.sqrt(2.0) * asset_index * channel_index)
+            codes = codes + torch.cos(
+                math.sqrt(3.0) * asset_index * (channel_index + 0.5)
+            )
+            codes = codes / codes.square().mean(dim=-1, keepdim=True).sqrt().clamp_min(
+                1e-6
+            )
+            with torch.no_grad():
+                self.asset_embedding.weight.copy_(codes)
         self.concat_projection = nn.Linear(fusion_input_dim, self.d_model)
         self.input_norm = nn.LayerNorm(self.d_model)
 
@@ -169,6 +414,23 @@ class Model(nn.Module):
         self.temporal_encoder = nn.TransformerEncoder(
             temporal_layer, num_layers=self.num_layers
         )
+
+        # Causal path relations condition asset-attention scores rather than
+        # directly constructing positions. Signed correlation, correlation
+        # magnitude, and downside co-movement are transformed by a learned
+        # per-head kernel trained only through realized portfolio outcomes.
+        relation_rng_state = torch.get_rng_state()
+        self.relation_attention_head = nn.Sequential(
+            nn.LayerNorm(3),
+            nn.Linear(3, self.relation_attention_hidden),
+            nn.GELU(),
+            nn.Linear(self.relation_attention_hidden, self.n_heads),
+        )
+        nn.init.zeros_(self.relation_attention_head[-1].weight)
+        nn.init.zeros_(self.relation_attention_head[-1].bias)
+        self.relation_attention_gain = nn.Parameter(torch.zeros(self.n_heads))
+        # A disabled relation route must not perturb the common backbone.
+        torch.set_rng_state(relation_rng_state)
 
         asset_layer = nn.TransformerEncoderLayer(
             d_model=self.d_model,
@@ -199,14 +461,130 @@ class Model(nn.Module):
         # Keep allocation logits separate from the risk-scaled return signal.
         # The latter is deliberately tiny and would make a direct softmax
         # nearly uniform; this head is free to learn the concentration scale.
-        self.allocation_head = nn.Sequential(
-            nn.Linear(self.d_model, self.d_model),
-            nn.GELU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(self.d_model, 1),
+        # Independent decision experts share the Transformer representation
+        # but not their allocation projections. Each expert produces a full
+        # learned simplex portfolio and the policy averages those portfolios,
+        # rather than shrinking toward an externally specified allocation.
+        self.allocation_heads = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(self.d_model, self.d_model),
+                    nn.GELU(),
+                    nn.Dropout(self.dropout),
+                    nn.Linear(self.d_model, 1),
+                )
+                for _ in range(self.portfolio_heads)
+            ]
         )
-        nn.init.zeros_(self.allocation_head[-1].weight)
-        nn.init.zeros_(self.allocation_head[-1].bias)
+        for head in self.allocation_heads:
+            nn.init.zeros_(head[-1].weight)
+            nn.init.zeros_(head[-1].bias)
+        if self.use_asset_policy_bias:
+            self.asset_policy_bias = nn.Parameter(
+                torch.zeros(self.portfolio_heads, self.num_assets)
+            )
+        else:
+            self.register_parameter("asset_policy_bias", None)
+        # Optional representation branches must not change the initialization
+        # of the common Transformer/KKT policy that follows them.  This keeps
+        # architecture-matched 30/40 ablations comparable even when a branch's
+        # strength is zero.
+        policy_feature_rng_state = torch.get_rng_state()
+        if self.spectral_policy_filters > 0:
+            # A trainable DCT bank supplies a deterministic, asset-shared
+            # temporal coordinate system. It is a generic path representation,
+            # not a momentum/risk allocation: the zero-start decision MLP must
+            # learn all portfolio logits from the portfolio objective.
+            genuine_window = self.lookback_window - 1
+            time_index = torch.arange(genuine_window, dtype=torch.float32) + 0.5
+            frequency = torch.arange(
+                self.spectral_policy_filters, dtype=torch.float32
+            ).unsqueeze(1)
+            basis = torch.cos(
+                math.pi * frequency * time_index.unsqueeze(0) / genuine_window
+            )
+            basis = basis / basis.square().sum(dim=-1, keepdim=True).sqrt().clamp_min(
+                1e-6
+            )
+            self.spectral_policy_bank = nn.Parameter(basis)
+            if self.spectral_policy_hidden == 0:
+                self.spectral_policy_head = nn.Sequential(
+                    nn.LayerNorm(self.spectral_policy_filters),
+                    nn.Linear(self.spectral_policy_filters, self.portfolio_heads),
+                )
+            else:
+                self.spectral_policy_head = nn.Sequential(
+                    nn.LayerNorm(self.spectral_policy_filters),
+                    nn.Linear(
+                        self.spectral_policy_filters, self.spectral_policy_hidden
+                    ),
+                    nn.GELU(),
+                    nn.Linear(self.spectral_policy_hidden, self.portfolio_heads),
+                )
+            nn.init.zeros_(self.spectral_policy_head[-1].weight)
+            nn.init.zeros_(self.spectral_policy_head[-1].bias)
+        else:
+            self.register_parameter("spectral_policy_bank", None)
+            self.spectral_policy_head = None
+        if self.tail_policy_filters > 0:
+            # Learnable distributional pooling exposes the whole empirical
+            # return distribution to the end-to-end policy. Negative queries
+            # initially inspect adverse observations, positive queries inspect
+            # upside observations, and every query is subsequently learned
+            # only through the realized portfolio objective. This is a feature
+            # encoder, not a target portfolio or a hand-crafted allocation.
+            queries = torch.linspace(-3.0, 3.0, self.tail_policy_filters)
+            self.tail_policy_queries = nn.Parameter(queries)
+            tail_feature_dim = (
+                2 * self.tail_policy_filters * len(self.tail_policy_windows)
+            )
+            if self.tail_policy_hidden == 0:
+                self.tail_policy_head = nn.Sequential(
+                    nn.Identity(),
+                    nn.Linear(tail_feature_dim, self.portfolio_heads),
+                )
+            else:
+                self.tail_policy_head = nn.Sequential(
+                    nn.Identity(),
+                    nn.Linear(tail_feature_dim, self.tail_policy_hidden),
+                    nn.GELU(),
+                    nn.Linear(self.tail_policy_hidden, self.portfolio_heads),
+                )
+            nn.init.zeros_(self.tail_policy_head[-1].weight)
+            nn.init.zeros_(self.tail_policy_head[-1].bias)
+        else:
+            self.register_parameter("tail_policy_queries", None)
+            self.tail_policy_head = None
+        # The ordered-distribution branch is shared by every pool size.  Its
+        # zero-initialized kernel learns an unrestricted signed weighting over
+        # empirical return quantiles and lookback scales.  No quantile is
+        # labelled as desirable, no target portfolio is supplied, and the
+        # branch is optimized exclusively through the realized portfolio
+        # objective.  This gives the softmax policy a low-variance path
+        # distribution coordinate without encoding an inverse-risk rule.
+        ordered_feature_dim = (
+            self.ordered_policy_bins * len(self.ordered_policy_windows)
+        )
+        self.ordered_policy_head = nn.Linear(
+            ordered_feature_dim, self.portfolio_heads, bias=False
+        )
+        nn.init.zeros_(self.ordered_policy_head.weight)
+        # A learned mirror-descent coefficient lets the policy decide how
+        # much causal covariance geometry should refine its own logits.  The
+        # signed gain starts at zero, so this module is neither a fixed
+        # minimum-variance allocation nor an external portfolio anchor.
+        self.policy_refinement_gain = nn.Parameter(
+            torch.zeros(self.portfolio_heads)
+        )
+        # Positive risk aversion of the causal LPM geometry.  This scalar is
+        # optimized only through the realized portfolio objective.  The
+        # inverse-softplus initialization makes the user-facing value the
+        # actual initial power while avoiding a positivity projection.
+        lpm_raw_init = math.log(math.expm1(self.lpm_geometry_init))
+        self.lpm_geometry_raw_power = nn.Parameter(
+            torch.tensor(lpm_raw_init, dtype=torch.float32)
+        )
+        torch.set_rng_state(policy_feature_rng_state)
         # A separate decision residual is zero-initialized.  Risk-budget
         # policies therefore start from the causal prior rather than a random
         # alpha ranking, while the final layer is free to learn from CVaR and
@@ -250,21 +628,35 @@ class Model(nn.Module):
             nn.GELU(),
             nn.Linear(gate_width, 1),
         )
-        # The gate hidden layers remain expressive, but their output layers
-        # start at zero.  Thus every seed begins with the same neutral gate:
-        # uniform scale/signal mixing and 0.5 sigmoid weights for prior and
-        # forecast routes.  The first optimizer step learns only the output
-        # projection; hidden gate parameters become active after that update.
-        # This removes an otherwise large source of seed-dependent portfolio
-        # rankings at initialization.
-        for gate in (
-            self.risk_scale_gate,
-            self.risk_signal_gate,
-            self.risk_prior_gate,
-            self.risk_forecast_gate,
-        ):
-            nn.init.zeros_(gate[-1].weight)
-            nn.init.zeros_(gate[-1].bias)
+        # Both initializations are deterministic across experiment seeds.  The
+        # neutral option is appropriate for the direct softmax policy; the
+        # decision warm start retains the validated multi-scale KKT policy's
+        # initial geometry while all gates remain end-to-end trainable.
+        if self.risk_gate_init == "neutral":
+            for gate in (
+                self.risk_scale_gate,
+                self.risk_signal_gate,
+                self.risk_prior_gate,
+                self.risk_forecast_gate,
+            ):
+                nn.init.zeros_(gate[-1].weight)
+                nn.init.zeros_(gate[-1].bias)
+        else:
+            with torch.no_grad():
+                minimum_window = min(self.risk_scale_windows)
+                self.risk_scale_gate[-1].bias.copy_(
+                    torch.tensor(
+                        [
+                            -0.06 * float(window - minimum_window)
+                            for window in self.risk_scale_windows
+                        ]
+                    )
+                )
+                self.risk_signal_gate[-1].bias.copy_(
+                    torch.tensor([1.0, -0.25, -1.0])
+                )
+                self.risk_prior_gate[-1].bias.fill_(self.risk_prior_bias)
+                self.risk_forecast_gate[-1].bias.fill_(-0.5)
 
     def encode_inputs(
         self, log_return_path: torch.Tensor, date_feats: torch.Tensor
@@ -303,6 +695,55 @@ class Model(nn.Module):
         x = self.temporal_encoder(x, mask=causal_mask)
         x = x.reshape(batch_size, num_assets, horizon, self.d_model).permute(0, 2, 1, 3)
 
+        # A learned relational message-passing step conditions the token
+        # representation before ordinary Transformer asset attention. The
+        # zero-start gain keeps the unconditioned backbone as the exact
+        # initialization, while avoiding unstable gradients through a
+        # sample-specific PyTorch attention mask.
+        if self.relation_attention_scale > 0.0:
+            returns = torch.expm1(log_return_path[..., 1:])
+            centered = returns - returns.mean(dim=-1, keepdim=True)
+            normalized = centered / centered.square().sum(
+                dim=-1, keepdim=True
+            ).clamp_min(self.signal_normalization_epsilon**2).sqrt()
+            correlation = torch.einsum(
+                "...it,...jt->...ij", normalized, normalized
+            ).clamp(-1.0, 1.0)
+            downside = torch.relu(-returns)
+            downside_normalized = downside / downside.square().sum(
+                dim=-1, keepdim=True
+            ).clamp_min(self.signal_normalization_epsilon**2).sqrt()
+            downside_comovement = torch.einsum(
+                "...it,...jt->...ij",
+                downside_normalized,
+                downside_normalized,
+            ).clamp(0.0, 1.0)
+            relation_features = torch.stack(
+                (correlation, correlation.abs(), downside_comovement), dim=-1
+            )
+            relation_scores = self.relation_attention_head(
+                relation_features
+            ).movedim(-1, -3)
+            relation_weights = torch.softmax(relation_scores, dim=-1)
+            head_dim = self.d_model // self.n_heads
+            x_heads = x.reshape(
+                batch_size, horizon, num_assets, self.n_heads, head_dim
+            ).permute(0, 1, 3, 2, 4)
+            relation_context = torch.einsum(
+                "btkij,btkjd->btkid", relation_weights, x_heads
+            )
+            gain = torch.tanh(self.relation_attention_gain).view(
+                1, 1, self.n_heads, 1, 1
+            )
+            x = (
+                x_heads
+                + self.relation_attention_scale
+                * gain
+                * (relation_context - x_heads)
+            ).permute(0, 1, 3, 2, 4).reshape(
+                batch_size, horizon, num_assets, self.d_model
+            )
+
         # Asset attention is applied independently at every horizon position.
         x = x.reshape(batch_size * horizon, num_assets, self.d_model)
         x = self.final_norm(self.asset_encoder(x))
@@ -331,7 +772,288 @@ class Model(nn.Module):
             raise ValueError(
                 "hidden must have trailing shape (num_assets, d_model)"
             )
-        return self.allocation_head(hidden).squeeze(-1)
+        return self.allocation_head_logits_from_hidden(hidden).mean(dim=-2)
+
+    def allocation_head_logits_from_hidden(
+        self,
+        hidden: torch.Tensor,
+        log_return_path: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return independent policy-expert logits as ``(..., K, N)``."""
+
+        if hidden.ndim < 3 or hidden.shape[-2:] != (
+            self.num_assets,
+            self.d_model,
+        ):
+            raise ValueError(
+                "hidden must have trailing shape (num_assets, d_model)"
+            )
+        logits = torch.stack(
+            [head(hidden).squeeze(-1) for head in self.allocation_heads],
+            dim=-2,
+        )
+        if self.asset_policy_bias is not None:
+            logits = logits + self.asset_policy_bias_scale * self.asset_policy_bias
+        if self.spectral_policy_head is not None:
+            if log_return_path is None:
+                raise ValueError(
+                    "log_return_path is required when spectral policy is enabled"
+                )
+            if log_return_path.shape[:-1] != hidden.shape[:-1] or (
+                log_return_path.shape[-1] != self.lookback_window
+            ):
+                raise ValueError("log_return_path and hidden have incompatible shapes")
+            spectral_features = torch.einsum(
+                "...w,fw->...f",
+                log_return_path[..., 1:],
+                self.spectral_policy_bank,
+            )
+            spectral_logits = self.spectral_policy_head(spectral_features).movedim(
+                -1, -2
+            )
+            logits = logits + self.spectral_policy_scale * spectral_logits
+        if self.tail_policy_head is not None:
+            if log_return_path is None:
+                raise ValueError(
+                    "log_return_path is required when tail policy is enabled"
+                )
+            if log_return_path.shape[:-1] != hidden.shape[:-1] or (
+                log_return_path.shape[-1] != self.lookback_window
+            ):
+                raise ValueError("log_return_path and hidden have incompatible shapes")
+            all_returns = torch.expm1(log_return_path[..., 1:])
+            distribution_features = []
+            for window in self.tail_policy_windows:
+                returns = all_returns[..., -window:]
+                centered = returns - returns.mean(dim=-1, keepdim=True)
+                standardized = centered / returns.std(
+                    dim=-1, unbiased=False, keepdim=True
+                ).clamp_min(self.signal_normalization_epsilon)
+                attention = torch.softmax(
+                    standardized.unsqueeze(-2)
+                    * self.tail_policy_queries.view(
+                        *((1,) * (standardized.ndim - 1)), -1, 1
+                    ),
+                    dim=-1,
+                )
+                pooled_return = (attention * returns.unsqueeze(-2)).sum(dim=-1)
+                pooled_scale = (
+                    attention * centered.unsqueeze(-2).square()
+                ).sum(dim=-1).clamp_min(1e-12).sqrt()
+                distribution_features.extend((pooled_return, pooled_scale))
+            tail_features = torch.cat(distribution_features, dim=-1)
+            # Normalize each learned distribution coordinate across assets,
+            # not across coordinates within one asset. This preserves the
+            # relative magnitude of downside dispersion that a per-asset
+            # LayerNorm would erase, while remaining permutation equivariant
+            # and free of any target allocation.
+            tail_features = tail_features - tail_features.mean(
+                dim=-2, keepdim=True
+            )
+            tail_features = tail_features / tail_features.std(
+                dim=-2, unbiased=False, keepdim=True
+            ).clamp_min(self.signal_normalization_epsilon)
+            tail_logits = self.tail_policy_head(tail_features).movedim(-1, -2)
+            logits = logits + self.tail_policy_scale * tail_logits
+        if self.ordered_policy_scale > 0.0:
+            if log_return_path is None:
+                raise ValueError(
+                    "log_return_path is required when ordered policy is enabled"
+                )
+            if log_return_path.shape[:-1] != hidden.shape[:-1] or (
+                log_return_path.shape[-1] != self.lookback_window
+            ):
+                raise ValueError("log_return_path and hidden have incompatible shapes")
+            all_returns = torch.expm1(log_return_path[..., 1:])
+            ordered_features = []
+            for window in self.ordered_policy_windows:
+                ordered = all_returns[..., -window:].sort(dim=-1).values
+                # Fixed evenly spaced ranks define only a coordinate system;
+                # their signed importance is fully learned.  Rounding keeps
+                # every selected value an exact order statistic and therefore
+                # differentiable with respect to the observed return.
+                rank_index = torch.linspace(
+                    0,
+                    window - 1,
+                    self.ordered_policy_bins,
+                    device=ordered.device,
+                ).round().long()
+                quantiles = ordered.index_select(-1, rank_index)
+                quantiles = quantiles - quantiles.mean(dim=-2, keepdim=True)
+                quantiles = quantiles / quantiles.std(
+                    dim=-2, unbiased=False, keepdim=True
+                ).clamp_min(self.signal_normalization_epsilon)
+                ordered_features.append(quantiles)
+            ordered_features = torch.cat(ordered_features, dim=-1)
+            ordered_logits = self.ordered_policy_head(
+                ordered_features
+            ).movedim(-1, -2)
+            # Dimension normalization makes the residual scale comparable
+            # when the number of quantile coordinates is changed.
+            ordered_logits = ordered_logits / math.sqrt(
+                float(ordered_features.shape[-1])
+            )
+            logits = logits + self.ordered_policy_scale * ordered_logits
+        return logits
+
+    def allocation_weights_from_hidden(
+        self,
+        hidden: torch.Tensor,
+        temperature: float,
+        log_return_path: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Average fully learned expert portfolios on the probability simplex."""
+
+        if not math.isfinite(temperature) or temperature <= 0.0:
+            raise ValueError("temperature must be finite and positive")
+        head_logits = self.allocation_head_logits_from_hidden(
+            hidden, log_return_path=log_return_path
+        )
+        head_logits = self.refine_policy_logits(
+            head_logits,
+            log_return_path=log_return_path,
+            temperature=temperature,
+        )
+        head_weights = torch.softmax(head_logits / temperature, dim=-1)
+        if self.portfolio_aggregation == "logit_mean":
+            weights = torch.softmax(head_logits.mean(dim=-2) / temperature, dim=-1)
+        else:
+            weights = head_weights.mean(dim=-2)
+        return weights, head_weights
+
+    def refine_policy_logits(
+        self,
+        head_logits: torch.Tensor,
+        log_return_path: Optional[torch.Tensor],
+        temperature: float,
+    ) -> torch.Tensor:
+        """End-to-end mirror refinement of learned policy logits.
+
+        The Transformer logits remain the optimization state.  At each
+        unrolled step their current softmax portfolio is mapped through a
+        causal covariance operator, and a signed coefficient learned from the
+        portfolio objective updates the logits.  No return label, target
+        position, or fixed risk allocation is introduced.
+        """
+
+        geometry_enabled = self.lpm_geometry_scale > 0.0
+        refinement_enabled = (
+            self.policy_refinement_steps > 0
+            and self.policy_refinement_scale > 0.0
+        )
+        if not geometry_enabled and not refinement_enabled:
+            return head_logits
+        if log_return_path is None:
+            raise ValueError(
+                "log_return_path is required when policy geometry or refinement is enabled"
+            )
+        if log_return_path.shape[:-2] != head_logits.shape[:-2] or (
+            log_return_path.shape[-2] != self.num_assets
+            or log_return_path.shape[-1] != self.lookback_window
+        ):
+            raise ValueError("log_return_path and policy logits are incompatible")
+        all_returns = torch.expm1(log_return_path[..., 1:])
+        refined = head_logits
+        if geometry_enabled:
+            geometry_window = min(
+                self.lpm_geometry_window, all_returns.shape[-1]
+            )
+            geometry_returns = all_returns[..., -geometry_window:]
+            downside_scale = torch.mean(
+                torch.relu(-geometry_returns).square(), dim=-1
+            ).sqrt().add(self.lpm_geometry_epsilon)
+            log_geometry = downside_scale.log()
+            log_geometry = log_geometry - log_geometry.mean(
+                dim=-1, keepdim=True
+            )
+            geometry_power = self.lpm_geometry_scale * torch.nn.functional.softplus(
+                self.lpm_geometry_raw_power
+            )
+            # This is the closed-form KL-proximal policy update
+            #   argmin_w KL(w || softmax(z/T)) + p <w, log(s)>,
+            # where s is the causal diagonal LPM metric.  It does not blend a
+            # target allocation: every Transformer logit remains in the final
+            # softmax and the positive power p is learned end to end.
+            refined = refined - (
+                temperature
+                * geometry_power
+                * log_geometry.unsqueeze(-2)
+            )
+        if not refinement_enabled:
+            return refined
+        returns = all_returns
+        refinement_window = min(
+            self.policy_refinement_window, returns.shape[-1]
+        )
+        returns = returns[..., -refinement_window:]
+        covariance = None
+        if self.policy_refinement_risk == "variance":
+            centered = returns - returns.mean(dim=-1, keepdim=True)
+            covariance = torch.einsum(
+                "...it,...jt->...ij", centered, centered
+            ) / float(centered.shape[-1])
+            covariance_scale = covariance.diagonal(
+                dim1=-2, dim2=-1
+            ).mean(dim=-1, keepdim=True).clamp_min(
+                self.signal_normalization_epsilon
+            )
+            covariance = covariance / covariance_scale.unsqueeze(-1)
+        gain = self.policy_refinement_scale * torch.tanh(
+            self.policy_refinement_gain
+        )
+        gain = gain.view(*((1,) * (head_logits.ndim - 2)), -1, 1)
+        for _ in range(self.policy_refinement_steps):
+            weights = torch.softmax(refined / temperature, dim=-1)
+            if covariance is not None:
+                marginal_risk = torch.einsum(
+                    "...ij,...kj->...ki", covariance, weights
+                )
+            elif self.policy_refinement_risk == "cvar":
+                portfolio_returns = torch.einsum(
+                    "...kn,...nt->...kt", weights, returns
+                )
+                tail_attention = torch.softmax(
+                    -portfolio_returns
+                    / self.policy_refinement_tail_temperature,
+                    dim=-1,
+                )
+                # Gradient of the smooth historical tail loss with respect
+                # to each asset weight.  Tail scenarios depend on the current
+                # Transformer portfolio, unlike an asset-wise risk anchor.
+                marginal_risk = -torch.einsum(
+                    "...kt,...nt->...kn", tail_attention, returns
+                )
+            else:
+                # Gradient of a smooth lower-partial-moment objective.  The
+                # downside scenarios are selected by the *current portfolio*
+                # return, so this is a genuinely portfolio-level optimization
+                # step rather than an asset-wise inverse-risk allocation.  In
+                # particular, changing any Transformer logit changes both the
+                # portfolio and the scenario weights used by the next step.
+                portfolio_returns = torch.einsum(
+                    "...kn,...nt->...kt", weights, returns
+                )
+                scaled_loss = (
+                    -portfolio_returns
+                    / self.policy_refinement_tail_temperature
+                )
+                smooth_downside = (
+                    self.policy_refinement_tail_temperature
+                    * torch.nn.functional.softplus(scaled_loss)
+                )
+                downside_slope = torch.sigmoid(scaled_loss)
+                scenario_weight = smooth_downside * downside_slope
+                marginal_risk = -torch.einsum(
+                    "...kt,...nt->...kn", scenario_weight, returns
+                ) / float(returns.shape[-1])
+            marginal_risk = marginal_risk - marginal_risk.mean(
+                dim=-1, keepdim=True
+            )
+            marginal_risk = marginal_risk / marginal_risk.std(
+                dim=-1, unbiased=False, keepdim=True
+            ).clamp_min(self.signal_normalization_epsilon)
+            refined = refined - gain * marginal_risk
+        return refined
 
     def risk_budget_logits(
         self,
@@ -710,8 +1432,9 @@ class DecisionAwareModel(nn.Module):
         # sigmoid logit gives a fixed 0.5 injection gate; its asset-dependent
         # modulation is learned only after the output layer receives a
         # gradient.
-        nn.init.zeros_(self.kkt_risk_gate[-1].weight)
-        nn.init.zeros_(self.kkt_risk_gate[-1].bias)
+        if self.backbone.risk_gate_init == "neutral":
+            nn.init.zeros_(self.kkt_risk_gate[-1].weight)
+            nn.init.zeros_(self.kkt_risk_gate[-1].bias)
 
     def initial_forward(
         self, log_return_path: torch.Tensor, date_feats: torch.Tensor
@@ -726,6 +1449,25 @@ class DecisionAwareModel(nn.Module):
 
     def allocation_logits_from_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.backbone.allocation_logits_from_hidden(hidden)
+
+    def allocation_head_logits_from_hidden(
+        self,
+        hidden: torch.Tensor,
+        log_return_path: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self.backbone.allocation_head_logits_from_hidden(
+            hidden, log_return_path=log_return_path
+        )
+
+    def allocation_weights_from_hidden(
+        self,
+        hidden: torch.Tensor,
+        temperature: float,
+        log_return_path: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.backbone.allocation_weights_from_hidden(
+            hidden, temperature, log_return_path=log_return_path
+        )
 
     def risk_budget_logits(
         self,
@@ -850,3 +1592,122 @@ class DecisionAwareModel(nn.Module):
         hidden0, mu0 = self.initial_forward(log_return_path, date_feats)
         hidden1, mu1 = self.refine(hidden0, kkt_state)
         return hidden0, mu0, hidden1, mu1
+
+
+class DecisionAwarePolicyEnsemble(nn.Module):
+    """Jointly trained ensemble of complete decision-aware policy experts.
+
+    Unlike checkpoint ensembling, every expert participates in the same
+    end-to-end portfolio objective during training. Their allocation evidence
+    is fused inside the model, before the final portfolio is evaluated. This
+    averages independent representation and KKT-attention uncertainty without
+    injecting any externally specified position.
+    """
+
+    def __init__(self, configs, feedback_mode: str = "dual"):
+        super().__init__()
+        self.policy_experts = int(getattr(configs, "policy_experts", 1))
+        if self.policy_experts <= 1:
+            raise ValueError("DecisionAwarePolicyEnsemble requires policy_experts > 1")
+        self.portfolio_aggregation = str(
+            getattr(configs, "portfolio_aggregation", "probability_mean")
+        ).lower()
+        if self.portfolio_aggregation not in {"probability_mean", "logit_mean"}:
+            raise ValueError(
+                "portfolio_aggregation must be probability_mean or logit_mean"
+            )
+        self.experts = nn.ModuleList(
+            [
+                DecisionAwareModel(configs, feedback_mode=feedback_mode)
+                for _ in range(self.policy_experts)
+            ]
+        )
+        self.num_assets = self.experts[0].num_assets
+        self.d_model = self.experts[0].d_model
+
+    def initial_forward(
+        self, log_return_path: torch.Tensor, date_feats: torch.Tensor
+    ) -> Tuple[Tuple[torch.Tensor, ...], torch.Tensor]:
+        outputs = [
+            expert.initial_forward(log_return_path, date_feats)
+            for expert in self.experts
+        ]
+        hidden = tuple(item[0] for item in outputs)
+        mu_hat = torch.stack([item[1] for item in outputs], dim=0).mean(dim=0)
+        return hidden, mu_hat
+
+    def refine(
+        self,
+        hidden: Tuple[torch.Tensor, ...],
+        kkt_state: Dict[str, torch.Tensor],
+    ) -> Tuple[Tuple[torch.Tensor, ...], torch.Tensor]:
+        if not isinstance(hidden, (tuple, list)) or len(hidden) != len(self.experts):
+            raise ValueError("hidden must contain one representation per policy expert")
+        outputs = [
+            expert.refine(expert_hidden, kkt_state)
+            for expert, expert_hidden in zip(self.experts, hidden)
+        ]
+        refined = tuple(item[0] for item in outputs)
+        mu_hat = torch.stack([item[1] for item in outputs], dim=0).mean(dim=0)
+        return refined, mu_hat
+
+    def normalize_signal(
+        self, raw_signal: torch.Tensor, sigma: torch.Tensor
+    ) -> torch.Tensor:
+        return self.experts[0].normalize_signal(raw_signal, sigma)
+
+    def _allocation_head_logits(
+        self,
+        hidden: Tuple[torch.Tensor, ...],
+        log_return_path: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if not isinstance(hidden, (tuple, list)) or len(hidden) != len(self.experts):
+            raise ValueError("hidden must contain one representation per policy expert")
+        return torch.cat(
+            [
+                expert.allocation_head_logits_from_hidden(
+                    expert_hidden, log_return_path=log_return_path
+                )
+                for expert, expert_hidden in zip(self.experts, hidden)
+            ],
+            dim=-2,
+        )
+
+    def allocation_logits_from_hidden(
+        self, hidden: Tuple[torch.Tensor, ...]
+    ) -> torch.Tensor:
+        return self._allocation_head_logits(hidden).mean(dim=-2)
+
+    def allocation_weights_from_hidden(
+        self,
+        hidden: Tuple[torch.Tensor, ...],
+        temperature: float,
+        log_return_path: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not math.isfinite(temperature) or temperature <= 0.0:
+            raise ValueError("temperature must be finite and positive")
+        head_logits = self._allocation_head_logits(
+            hidden, log_return_path=log_return_path
+        )
+        head_weights = torch.softmax(head_logits / temperature, dim=-1)
+        if self.portfolio_aggregation == "logit_mean":
+            weights = torch.softmax(head_logits.mean(dim=-2) / temperature, dim=-1)
+        else:
+            weights = head_weights.mean(dim=-2)
+        return weights, head_weights
+
+    def risk_budget_logits(
+        self,
+        log_return_path: torch.Tensor,
+        hidden: Tuple[torch.Tensor, ...],
+        kkt_state: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        if not isinstance(hidden, (tuple, list)) or len(hidden) != len(self.experts):
+            raise ValueError("hidden must contain one representation per policy expert")
+        logits = [
+            expert.risk_budget_logits(
+                log_return_path, expert_hidden, kkt_state=kkt_state
+            )
+            for expert, expert_hidden in zip(self.experts, hidden)
+        ]
+        return torch.stack(logits, dim=0).mean(dim=0)

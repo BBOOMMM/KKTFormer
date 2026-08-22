@@ -175,6 +175,17 @@ def parse_args():
             "CVaR - weight * mean(sum_i w_i r_i); no asset prediction target"
         ),
     )
+    parser.add_argument("--sortino_weight", type=float, default=0.0)
+    parser.add_argument("--sharpe_weight", type=float, default=0.0)
+    parser.add_argument(
+        "--portfolio_statistic_scope",
+        type=str,
+        default="context",
+        choices=["context", "batch"],
+        help="estimate CVaR and return ratios per context or across a mini-batch",
+    )
+    parser.add_argument("--sortino_temperature", type=float, default=1e-2)
+    parser.add_argument("--sortino_epsilon", type=float, default=1e-4)
     parser.add_argument(
         "--turnover_smoothing",
         type=float,
@@ -253,6 +264,99 @@ def parse_args():
             "permutation-equivariant ablation"
         ),
     )
+    parser.add_argument(
+        "--asset_embedding_init",
+        type=str,
+        choices=["random", "deterministic", "orthogonal"],
+        default="random",
+        help="trainable asset-code initialization; deterministic removes seed relabelling",
+    )
+    parser.add_argument(
+        "--model_init_seed",
+        type=int,
+        default=-1,
+        help=(
+            "fixed seed used only for model parameter initialization; negative "
+            "preserves seed-dependent initialization"
+        ),
+    )
+    parser.add_argument(
+        "--portfolio_heads",
+        type=int,
+        default=1,
+        help="number of fully learned simplex policy experts",
+    )
+    parser.add_argument(
+        "--policy_experts",
+        type=int,
+        default=1,
+        help="number of complete decision-aware experts trained through one portfolio loss",
+    )
+    parser.add_argument(
+        "--portfolio_aggregation",
+        type=str,
+        choices=["probability_mean", "logit_mean"],
+        default="probability_mean",
+        help="fuse learned policy experts before or after the simplex map",
+    )
+    parser.add_argument(
+        "--policy_head_consistency_weight",
+        type=float,
+        default=0.0,
+        help="label-free Jensen-Shannon consistency weight across policy experts",
+    )
+    parser.add_argument("--spectral_policy_filters", type=int, default=0)
+    parser.add_argument("--spectral_policy_hidden", type=int, default=16)
+    parser.add_argument("--spectral_policy_scale", type=float, default=1.0)
+    parser.add_argument(
+        "--tail_policy_filters",
+        type=int,
+        default=0,
+        help="number of learnable distributional path queries; 0 disables the branch",
+    )
+    parser.add_argument("--tail_policy_hidden", type=int, default=16)
+    parser.add_argument("--tail_policy_scale", type=float, default=1.0)
+    parser.add_argument("--tail_policy_windows", type=str, default="5,10,20,60")
+    parser.add_argument(
+        "--ordered_policy_bins",
+        type=int,
+        default=8,
+        help="number of learned empirical-quantile coordinates per lookback",
+    )
+    parser.add_argument(
+        "--ordered_policy_scale",
+        type=float,
+        default=0.0,
+        help="scale of the end-to-end learned ordered-distribution logits",
+    )
+    parser.add_argument(
+        "--ordered_policy_windows", type=str, default="5,10,20,60"
+    )
+    parser.add_argument("--policy_refinement_steps", type=int, default=0)
+    parser.add_argument("--policy_refinement_scale", type=float, default=0.0)
+    parser.add_argument("--policy_refinement_window", type=int, default=60)
+    parser.add_argument(
+        "--policy_refinement_risk",
+        choices=["variance", "cvar", "lpm"],
+        default="variance",
+    )
+    parser.add_argument(
+        "--policy_refinement_tail_temperature", type=float, default=0.01
+    )
+    parser.add_argument("--lpm_geometry_scale", type=float, default=0.0)
+    parser.add_argument("--lpm_geometry_window", type=int, default=10)
+    parser.add_argument("--lpm_geometry_init", type=float, default=2.5)
+    parser.add_argument("--lpm_geometry_epsilon", type=float, default=1e-4)
+    parser.add_argument("--relation_attention_scale", type=float, default=0.0)
+    parser.add_argument("--relation_attention_hidden", type=int, default=16)
+    parser.add_argument(
+        "--use_asset_policy_bias",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="zero-start asset memory learned only through the portfolio objective",
+    )
+    parser.add_argument("--asset_policy_bias_scale", type=float, default=1.0)
     parser.add_argument("--d_model", type=int, default=32)
     parser.add_argument("--n_heads", type=int, default=4)
     parser.add_argument("--num_layers", type=int, default=1)
@@ -371,6 +475,18 @@ def parse_args():
     parser.add_argument("--momentum_anchor_lookback", type=int, default=20)
     parser.add_argument("--momentum_anchor_temperature", type=float, default=1.3)
     parser.add_argument(
+        "--downside_anchor_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "differentiable shrinkage toward a causal inverse-downside-risk "
+            "simplex prior"
+        ),
+    )
+    parser.add_argument("--downside_anchor_lookback", type=int, default=10)
+    parser.add_argument("--downside_anchor_power", type=float, default=2.0)
+    parser.add_argument("--downside_anchor_epsilon", type=float, default=1e-4)
+    parser.add_argument(
         "--risk_momentum_lookback",
         type=int,
         default=60,
@@ -433,6 +549,13 @@ def parse_args():
             "scale for learned risk-route gate logits; values below one keep "
             "the causal prior dominant and reduce seed sensitivity"
         ),
+    )
+    parser.add_argument(
+        "--risk_gate_init",
+        type=str,
+        default="neutral",
+        choices=["neutral", "decision"],
+        help="deterministic initialization of the learned multi-route risk gates",
     )
     parser.add_argument(
         "--risk_forecast_weight",
@@ -572,6 +695,32 @@ def main():
             f"_trb{train_frequency}_vrb{val_frequency}_teb{test_frequency}"
             f"_lre{args.log_return_embed_dim}_de{args.date_embed_dim}"
             f"_ae{args.asset_embed_dim}_aes{args.asset_embedding_scale:g}_dm{args.d_model}"
+            f"_aei{args.asset_embedding_init}_ph{args.portfolio_heads}"
+            f"_mis{args.model_init_seed}"
+            f"_pe{args.policy_experts}"
+            f"_pha{args.portfolio_aggregation}"
+            f"_phc{args.policy_head_consistency_weight:g}"
+            f"_spf{args.spectral_policy_filters}_sph{args.spectral_policy_hidden}"
+            f"_sps{args.spectral_policy_scale:g}"
+            f"_tpf{args.tail_policy_filters}_tph{args.tail_policy_hidden}"
+            f"_tps{args.tail_policy_scale:g}"
+            f"_tpw{args.tail_policy_windows.replace(',', '-')}"
+            f"_opb{args.ordered_policy_bins}"
+            f"_ops{args.ordered_policy_scale:g}"
+            f"_opw{args.ordered_policy_windows.replace(',', '-')}"
+            f"_prs{args.policy_refinement_steps}"
+            f"_prc{args.policy_refinement_scale:g}"
+            f"_prw{args.policy_refinement_window}"
+            f"_prr{args.policy_refinement_risk}"
+            f"_prt{args.policy_refinement_tail_temperature:g}"
+            f"_lgs{args.lpm_geometry_scale:g}"
+            f"_lgw{args.lpm_geometry_window}"
+            f"_lgi{args.lpm_geometry_init:g}"
+            f"_lge{args.lpm_geometry_epsilon:g}"
+            f"_ras{args.relation_attention_scale:g}"
+            f"_rah{args.relation_attention_hidden}"
+            f"_apb{args.use_asset_policy_bias}"
+            f"_apbs{args.asset_policy_bias_scale:g}"
             f"_nh{args.n_heads}_nl{args.num_layers}"
             f"_oi{args.optimizer_iterations}_fb{args.feedback_mode}"
             f"_dl{args.decision_layer}_tp{args.temperature:g}"
@@ -579,9 +728,14 @@ def main():
             f"_maw{args.momentum_anchor_weight:g}"
             f"_mal{args.momentum_anchor_lookback}"
             f"_mat{args.momentum_anchor_temperature:g}"
+            f"_daw{args.downside_anchor_weight:g}"
+            f"_dal{args.downside_anchor_lookback}"
+            f"_dap{args.downside_anchor_power:g}"
+            f"_dae{args.downside_anchor_epsilon:g}"
             f"_rml{args.risk_momentum_lookback}_rms{args.risk_momentum_short_weight:g}"
             f"_rmr{args.risk_momentum_residual_weight:g}"
             f"_rgs{args.risk_gate_logit_scale:g}"
+            f"_rgi{args.risk_gate_init}"
             f"_ema{args.ema_decay:g}"
             f"_cm{args.checkpoint_metric}"
             f"_wd{args.weight_decay:g}"
@@ -593,6 +747,9 @@ def main():
             f"_rta{args.risk_turnover_aversion:g}"
             f"_ts{args.turnover_smoothing:g}"
             f"_mrw{args.mean_return_weight:g}"
+            f"_sow{args.sortino_weight:g}"
+            f"_shw{args.sharpe_weight:g}"
+            f"_pss{args.portfolio_statistic_scope}"
             f"_cr{args.covariance_robustness:g}_cd{args.covariance_decay:g}"
             f"_krs{args.kkt_risk_scale:g}"
             f"_plb{args.probe_lower_bound:g}_pub{args.probe_upper_bound:g}"
